@@ -431,6 +431,23 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" })
     return res.end(uiHtml || "<h1>UI not found</h1>")
   }
+  if (req.method === "GET" && p.startsWith("/assets/")) {
+    const file = path.join(__dirname, "assets", path.basename(p))
+    try {
+      const data = fs.readFileSync(file)
+      const types = {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".svg": "image/svg+xml", ".webp": "image/webp", ".gif": "image/gif", ".ico": "image/x-icon",
+      }
+      res.writeHead(200, {
+        "content-type": types[path.extname(file).toLowerCase()] ?? "application/octet-stream",
+        "cache-control": "public, max-age=3600",
+      })
+      return res.end(data)
+    } catch {
+      return json(res, 404, { error: "not found" })
+    }
+  }
   if (req.method === "GET" && p === "/health") return json(res, 200, { ok: true, upstream: config.upstream })
 
   if (p.startsWith("/api/")) {
