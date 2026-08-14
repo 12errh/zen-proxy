@@ -9,6 +9,22 @@
 anonymous free tier &nbsp;◦&nbsp; no accounts &nbsp;◦&nbsp; no keys &nbsp;◦&nbsp; any openai-compatible agent &nbsp;◦&nbsp; 100% local
 </div>
 
+> **Zen Proxy** is a zero-dependency, locally-run OpenAI-compatible proxy that unlocks opencode's Zen free tier **for any coding agent — not just opencode**.
+>
+> opencode gives you free models like `deepseek-v4-flash-free`, `hy3-free`, `mimo-v2.5-free`, and `nemotron` — but only to requests that present the right `User-Agent`. Most agents force their own identity and get shut out with `429 FreeUsageLimitError`. Zen Proxy quietly speaks for them: it injects the correct `User-Agent`, forwards your real IP, and re-exposes everything as a standard `/v1/chat/completions` + `/v1/models` API.
+>
+> The result: whatever tool you love — Cline, Roo Code, Continue, Aider, mimo, or a plain `curl` — can now ride opencode's free models with **zero accounts, zero API keys**, and zero config beyond a `baseURL`.
+
+**What it enables:**
+
+- **Free OpenAI-compatible models outside opencode** — bring your own agent, keep the free tier
+- **Anonymous access with no accounts or keys** (`Bearer public`), or bring your own Zen key (BYOK) for your own quota
+- **Smart model fallback** — when one free model is saturated, it rolls to the next
+- **Model aliases** — call them `gpt-4o` or `claude-3-5`, get routed to free models
+- **Per-IP fairness** — your real IP is forwarded so quota stays fair per user
+- **A retro-zine management dashboard** — stats, one-click model tests, live config, and logs at `http://127.0.0.1:8787/`
+- **One-file install** on Linux, macOS, and Windows with a single `curl`
+
 ---
 
 ## why it exists
