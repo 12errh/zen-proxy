@@ -1,0 +1,5 @@
+node_modules/
+.mimocode/
+zen-proxy.json
+*.log
+.DS_Store

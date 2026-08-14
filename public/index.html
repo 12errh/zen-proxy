@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zen Proxy Dashboard</title>
+<style>
+:root {
+  --bg:#0b0f14; --panel:#11161d; --panel2:#161d26; --border:#232c38;
+  --text:#e6edf3; --muted:#8b98a5; --accent:#2f81f7; --green:#3fb950;
+  --yellow:#d29922; --red:#f85149; --radius:10px;
+}
+* { box-sizing:border-box; margin:0; padding:0 }
+body {
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  background:var(--bg); color:var(--text); font-size:14px; line-height:1.5;
+}
+a { color:var(--accent); text-decoration:none }
+header {
+  display:flex; align-items:center; gap:16px; padding:14px 22px;
+  border-bottom:1px solid var(--border); background:var(--panel);
+  position:sticky; top:0; z-index:10;
+}
+header h1 { font-size:16px; font-weight:600; white-space:nowrap }
+nav { display:flex; gap:4px; margin-left:8px; flex-wrap:wrap }
+nav button {
+  background:transparent; color:var(--muted); border:1px solid transparent;
+  padding:6px 12px; border-radius:8px; cursor:pointer; font-size:13px;
+}
+nav button.active { color:var(--text); background:var(--panel2); border-color:var(--border) }
+nav button:hover:not(.active) { color:var(--text) }
+.spacer { flex:1 }
+.pill {
+  display:inline-flex; align-items:center; gap:7px; padding:5px 12px;
+  border-radius:999px; font-size:12px; font-weight:600; border:1px solid var(--border);
+  background:var(--panel2);
+}
+.dot { width:8px; height:8px; border-radius:50%; background:var(--muted) }
+.dot.ok { background:var(--green); box-shadow:0 0 6px var(--green) }
+.dot.bad { background:var(--red); box-shadow:0 0 6px var(--red) }
+main { padding:22px; max-width:1100px; margin:0 auto }
+.tab { display:none }
+.tab.active { display:block }
+.cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:14px; margin-bottom:22px }
+.card { background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:16px }
+.card .label { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em }
+.card .value { font-size:26px; font-weight:700; margin-top:6px; font-variant-numeric:tabular-nums }
+.card .sub { font-size:12px; color:var(--muted); margin-top:4px }
+.panel { background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:18px; margin-bottom:22px }
+.panel h2 { font-size:14px; font-weight:600; margin-bottom:14px; display:flex; align-items:center; justify-content:space-between }
+table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums }
+th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); font-size:13px }
+th { color:var(--muted); font-weight:500; font-size:12px; text-transform:uppercase; letter-spacing:.04em }
+code, .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12.5px }
+.badge { display:inline-block; padding:2px 8px; border-radius:6px; font-size:11px; font-weight:600 }
+.badge.ok { background:rgba(63,185,80,.15); color:var(--green) }
+.badge.bad { background:rgba(248,81,73,.15); color:var(--red) }
+.badge.warn { background:rgba(210,153,34,.15); color:var(--yellow) }
+.badge.mut { background:var(--panel2); color:var(--muted); border:1px solid var(--border) }
+button {
+  background:var(--panel2); color:var(--text); border:1px solid var(--border);
+  padding:6px 12px; border-radius:8px; cursor:pointer; font-size:13px;
+}
+button:hover { border-color:var(--accent) }
+button.primary { background:var(--accent); border-color:var(--accent); color:#fff }
+button.primary:hover { filter:brightness(1.1) }
+button:disabled { opacity:.5; cursor:not-allowed }
+input, select, textarea {
+  background:var(--panel2); color:var(--text); border:1px solid var(--border);
+  border-radius:8px; padding:8px 10px; font-size:13px; width:100%;
+}
+input:focus, select:focus, textarea:focus { outline:none; border-color:var(--accent) }
+label { display:block; font-size:12px; color:var(--muted); margin:12px 0 5px; font-weight:500 }
+.formgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:0 20px }
+.hint { font-size:12px; color:var(--muted); margin-top:4px }
+textarea { resize:vertical; min-height:90px; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12.5px }
+.row { display:flex; gap:8px; align-items:center; flex-wrap:wrap }
+.row .grow { flex:1 }
+.checkbox { display:flex; align-items:center; gap:8px; margin-top:14px }
+.checkbox input { width:auto }
+.checkbox span { font-size:13px; color:var(--text) }
+.logs { background:#06080b; border:1px solid var(--border); border-radius:8px; padding:12px; height:420px; overflow-y:auto; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px }
+.logs .ts { color:var(--muted); margin-right:10px }
+.logs .line { white-space:pre-wrap; word-break:break-all; padding:2px 0 }
+.empty { color:var(--muted); text-align:center; padding:30px }
+.test-result { margin-top:10px; font-size:12px; display:none }
+.test-result .ok { color:var(--green) }
+.test-result .bad { color:var(--red) }
+.banner { display:none; margin:0 22px 14px; padding:12px 16px; border-radius:var(--radius); font-size:13px }
+.banner.error { display:block; background:rgba(248,81,73,.12); border:1px solid var(--red); color:var(--red) }
+.toast {
+  position:fixed; bottom:22px; right:22px; background:var(--panel2); border:1px solid var(--border);
+  padding:12px 18px; border-radius:10px; font-size:13px; box-shadow:0 6px 24px rgba(0,0,0,.4);
+  opacity:0; transform:translateY(8px); transition:.2s; z-index:50;
+}
+.toast.show { opacity:1; transform:none }
+.toast.ok { border-color:var(--green) }
+.toast.bad { border-color:var(--red) }
+#authScreen {
+  position:fixed; inset:0; background:rgba(4,6,9,.85); display:flex; align-items:center; justify-content:center; z-index:100;
+}
+#authScreen .box { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:28px; width:340px }
+#authScreen h2 { font-size:16px; margin-bottom:6px }
+#authScreen p { color:var(--muted); font-size:13px; margin-bottom:16px }
+@media (max-width:700px){ main{ padding:14px } header{ flex-wrap:wrap } }
+</style>
+</head>
+<body>
+
+<div id="authScreen" style="display:none">
+  <div class="box">
+    <h2>Proxy key required</h2>
+    <p>This dashboard is protected. Enter the admin key (<code>PROXY_KEY</code>).</p>
+    <input type="password" id="authKey" placeholder="Admin key" autocomplete="off">
+    <div class="row" style="margin-top:14px">
+      <button class="primary grow" onclick="submitAuth()">Unlock</button>
+    </div>
+  </div>
+</div>
+
+<header>
+  <h1>⚡ Zen Proxy</h1>
+  <nav>
+    <button data-tab="overview" class="active">Overview</button>
+    <button data-tab="models">Models</button>
+    <button data-tab="config">Settings</button>
+    <button data-tab="logs">Logs</button>
+  </nav>
+  <div class="spacer"></div>
+  <span class="pill" id="upstreamPill"><span class="dot" id="upstreamDot"></span><span id="upstreamText">checking…</span></span>
+</header>
+
+<div class="banner" id="banner"></div>
+
+<main>
+  <section class="tab active" id="tab-overview">
+    <div class="cards">
+      <div class="card"><div class="label">Upstream</div><div class="value mono" id="ovUpstream" style="font-size:15px">–</div><div class="sub" id="ovUa">–</div></div>
+      <div class="card"><div class="label">Uptime</div><div class="value" id="ovUptime">–</div><div class="sub">seconds</div></div>
+      <div class="card"><div class="label">Requests</div><div class="value" id="ovTotal">–</div><div class="sub" id="ovErr">0 errors</div></div>
+      <div class="card"><div class="label">Last minute</div><div class="value" id="ovMin">–</div><div class="sub" id="ov5m">– in 5 min</div></div>
+      <div class="card"><div class="label">Models</div><div class="value" id="ovModels">–</div><div class="sub" id="ovAllowed">– allowed</div></div>
+    </div>
+
+    <div class="panel">
+      <h2>Recent requests <span class="badge mut" id="modelFilterWrap"><span id="modelFilterText">all</span></span></h2>
+      <table id="reqTable">
+        <thead><tr><th>Time</th><th>Model</th><th>Result</th><th>Latency</th><th>Count</th></tr></thead>
+        <tbody><tr><td colspan="5" class="empty">No requests yet</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-models">
+    <div class="panel">
+      <h2>Allowed models <span class="badge mut" id="modelCount"></span></h2>
+      <p class="hint" style="margin-bottom:12px">These are served on <code>/v1/models</code> and accepted by the proxy. Click <b>Test</b> to send a tiny completion and see live status. Default model is used when a request asks for an unknown model.</p>
+      <table id="modelTable">
+        <thead><tr><th>Model</th><th>Default</th><th>Last test</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="row" style="margin-top:14px">
+        <input class="grow" id="newModel" placeholder="Add model id, e.g. nemotron-3-ultra-free">
+        <button onclick="addModel()">Add</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-config">
+    <div class="panel">
+      <h2>Server settings <span class="badge warn">port/host changes need restart</span></h2>
+      <div class="formgrid">
+        <div>
+          <label>Host</label><input id="cfgHost" type="text">
+          <label>Port</label><input id="cfgPort" type="number">
+          <label>Upstream URL</label><input id="cfgUpstream" type="text">
+          <label>User-Agent (the unlock)</label><input id="cfgUa" type="text">
+        </div>
+        <div>
+          <label>Default model</label><input id="cfgDefault" type="text">
+          <label>Proxy key (empty = open)</label><input id="cfgProxyKey" type="password" autocomplete="new-password">
+          <label>Default Zen key (BYOK, optional)</label><input id="cfgZenKey" type="password" autocomplete="new-password">
+          <label>Timeout (ms)</label><input id="cfgTimeout" type="number">
+        </div>
+      </div>
+      <label>Fallback models (JSON array — tried in order on 429/5xx)</label>
+      <textarea id="cfgFallback"></textarea>
+      <label>Model aliases (JSON map — e.g. {"gpt-4o":"deepseek-v4-flash-free"})</label>
+      <textarea id="cfgAliases"></textarea>
+      <div class="checkbox"><input type="checkbox" id="cfgTrust"><span>Trust <code>x-forwarded-for</code> from reverse proxy</span></div>
+      <div class="row" style="margin-top:18px">
+        <button class="primary" onclick="saveConfig()">Save &amp; apply</button>
+        <button onclick="reloadConfig()">Discard / reload from file</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-logs">
+    <div class="panel">
+      <h2>Server logs <button style="font-size:12px" onclick="loadLogs()">Refresh</button></h2>
+      <div class="logs" id="logBox"><div class="empty">Loading…</div></div>
+    </div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id)
+let key = localStorage.getItem("zpKey") || ""
+let config = null
+let statusCache = null
+
+function api(path, opts = {}) {
+  const headers = { ...(opts.headers || {}) }
+  if (key) headers["Authorization"] = "Bearer " + key
+  if (opts.body) headers["Content-Type"] = "application/json"
+  return fetch(path, { ...opts, headers }).then(async (r) => {
+    if (r.status === 401) { showAuth(); throw new Error("unauthorized") }
+    return r.json()
+  })
+}
+
+function toast(msg, type = "ok") {
+  const t = $("toast")
+  t.textContent = msg
+  t.className = "toast show " + type
+  clearTimeout(t._h)
+  t._h = setTimeout(() => (t.className = "toast"), 2400)
+}
+
+function showBanner(msg) {
+  const b = $("banner")
+  b.textContent = msg
+  b.className = "banner error"
+}
+function hideBanner() { $("banner").className = "banner" }
+
+function showAuth() {
+  $("authScreen").style.display = "flex"
+  $("authKey").focus()
+}
+async function submitAuth() {
+  key = $("authKey").value.trim()
+  localStorage.setItem("zpKey", key)
+  try {
+    await api("/api/status")
+    $("authScreen").style.display = "none"
+    toast("Unlocked")
+    refreshAll()
+  } catch {
+    toast("Wrong key", "bad")
+    key = ""
+    localStorage.removeItem("zpKey")
+  }
+}
+$("authKey").addEventListener("keydown", (e) => { if (e.key === "Enter") submitAuth() })
+
+function fmtTime(ms) {
+  const d = new Date(ms)
+  return d.toLocaleTimeString([], { hour12: false }) + "." + String(d.getMilliseconds()).padStart(3, "0")
+}
+function fmtDur(ms) {
+  if (ms < 1000) return ms + "ms"
+  return (ms / 1000).toFixed(1) + "s"
+}
+function fmtUp(sec) {
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60
+  if (h > 0) return h + "h " + m + "m"
+  if (m > 0) return m + "m " + s + "s"
+  return s + "s"
+}
+
+async function refreshStatus() {
+  try {
+    const st = await api("/api/status")
+    statusCache = st
+    const dot = $("upstreamDot"), txt = $("upstreamText")
+    dot.className = "dot " + (st.upstreamOk ? "ok" : "bad")
+    txt.textContent = st.upstreamOk ? "upstream OK" : "upstream DOWN"
+    $("ovUpstream").textContent = st.upstream
+    $("ovUa").textContent = "UA: " + st.ua
+    $("ovUptime").textContent = fmtUp(st.uptime)
+    $("ovTotal").textContent = st.requests.total
+    $("ovErr").textContent = st.requests.errors + " errors"
+    $("ovMin").textContent = st.requests.lastMinute
+    $("ov5m").textContent = st.requests.last5m + " in 5 min"
+    $("ovModels").textContent = st.models.total
+    $("ovAllowed").textContent = st.models.allowed + " allowed"
+    renderTable(st.recent)
+    renderModels(st)
+    hideBanner()
+  } catch (e) {
+    if (e.message !== "unauthorized") {
+      $("upstreamDot").className = "dot bad"
+      $("upstreamText").textContent = "unreachable"
+    }
+  }
+}
+
+function renderTable(recent) {
+    const tb = $("reqTable").querySelector("tbody")
+    if (!recent || !recent.length) {
+      tb.innerHTML = '<tr><td colspan="5" class="empty">No requests yet</td></tr>'
+      return
+    }
+    tb.innerHTML = recent.slice().reverse().map((r) => {
+      const cls = r.status < 300 ? "ok" : r.status === 429 ? "warn" : "bad"
+      return `<tr>
+        <td class="mono">${fmtTime(r.at)}</td>
+        <td class="mono">${escapeHtml(r.model)}</td>
+        <td><span class="badge ${cls}">${r.status}</span></td>
+        <td class="mono">${fmtDur(r.ms)}</td>
+        <td class="mono">${r.count}</td>
+      </tr>`
+    }).join("")
+}
+
+async function refreshModels() {
+  const cfg = await api("/api/config")
+  config = cfg.config
+  const st = await api("/api/status")
+  renderModels(st)
+}
+
+function renderModels(st) {
+  const tb = $("modelTable").querySelector("tbody")
+  const list = [...new Set([...config.fallbackModels, ...Object.keys(config.modelAliases)])]
+  $("modelCount").textContent = list.length + " configured"
+  if (!list.length) {
+    tb.innerHTML = '<tr><td colspan="4" class="empty">No models configured</td></tr>'
+    return
+  }
+  tb.innerHTML = list.map((m) => {
+    const aliasTarget = config.modelAliases[m]
+    const display = aliasTarget ? escapeHtml(m) + ' <span class="badge mut">→ ' + escapeHtml(aliasTarget) + "</span>" : escapeHtml(m)
+    const isDefault = m === config.defaultModel
+    return `<tr>
+      <td class="mono">${display}</td>
+      <td><input type="radio" name="defaultModel" value="${escapeAttr(m)}" ${isDefault ? "checked" : ""} onchange="setDefault('${escapeAttr(m)}')"></td>
+      <td class="mono testCell" id="tc-${escapeAttr(m)}">–</td>
+      <td class="row" style="gap:6px"><button onclick="testModel('${escapeAttr(m)}')">Test</button>${aliasTarget ? "" : `<button class="danger" onclick="removeModel('${escapeAttr(m)}')">✕</button>`}</td>
+    </tr>`
+  }).join("")
+  if (st) $("ovModels").textContent = st.models.total
+}
+
+async function setDefault(m) {
+  const cfg = await api("/api/config")
+  cfg.config.defaultModel = m
+  await api("/api/config", { method: "PUT", body: JSON.stringify(cfg.config) })
+  toast("Default model: " + m)
+  refreshModels()
+}
+
+async function testModel(m) {
+  const cell = $("tc-" + m)
+  cell.textContent = "testing…"
+  try {
+    const r = await api("/api/test", { method: "POST", body: JSON.stringify({ model: m }) })
+    const cls = r.ok ? "ok" : "bad"
+    cell.innerHTML = `<span class="${cls}">${r.ok ? "✓" : "✗"} ${r.status} · ${fmtDur(r.ms)}</span>${r.detail ? ' <span class="hint">' + escapeHtml(r.detail.slice(0, 60)) + "</span>" : ""}`
+    toast(r.ok ? m + " works" : m + " failed (" + r.status + ")", r.ok ? "ok" : "bad")
+  } catch {
+    cell.textContent = "error"
+  }
+}
+
+async function addModel() {
+  const m = $("newModel").value.trim()
+  if (!m) return
+  const cfg = await api("/api/config")
+  if (!cfg.config.fallbackModels.includes(m)) cfg.config.fallbackModels.push(m)
+  await api("/api/config", { method: "PUT", body: JSON.stringify(cfg.config) })
+  $("newModel").value = ""
+  toast("Added " + m)
+  refreshModels()
+}
+
+async function removeModel(m) {
+  const cfg = await api("/api/config")
+  cfg.config.fallbackModels = cfg.config.fallbackModels.filter((x) => x !== m)
+  if (cfg.config.defaultModel === m) cfg.config.defaultModel = cfg.config.fallbackModels[0] || ""
+  await api("/api/config", { method: "PUT", body: JSON.stringify(cfg.config) })
+  toast("Removed " + m)
+  refreshModels()
+}
+
+async function populateConfigForm() {
+  if (!config) config = (await api("/api/config")).config
+  $("cfgHost").value = config.host
+  $("cfgPort").value = config.port
+  $("cfgUpstream").value = config.upstream
+  $("cfgUa").value = config.ua
+  $("cfgDefault").value = config.defaultModel
+  $("cfgProxyKey").value = config.proxyKey === "••••••••" ? "" : config.proxyKey
+  $("cfgZenKey").value = config.defaultZenKey === "••••••••" ? "" : config.defaultZenKey
+  $("cfgTimeout").value = config.timeoutMs
+  $("cfgFallback").value = JSON.stringify(config.fallbackModels, null, 2)
+  $("cfgAliases").value = JSON.stringify(config.modelAliases, null, 2)
+  $("cfgTrust").checked = !!config.trustForwarded
+}
+
+async function saveConfig() {
+  const body = {
+    host: $("cfgHost").value.trim() || "127.0.0.1",
+    port: Number($("cfgPort").value || 8787),
+    upstream: $("cfgUpstream").value.trim(),
+    ua: $("cfgUa").value.trim(),
+    defaultModel: $("cfgDefault").value.trim(),
+    proxyKey: $("cfgProxyKey").value,
+    defaultZenKey: $("cfgZenKey").value,
+    timeoutMs: Number($("cfgTimeout").value || 120000),
+    fallbackModels: JSON.parse($("cfgFallback").value || "[]"),
+    modelAliases: JSON.parse($("cfgAliases").value || "{}"),
+    trustForwarded: $("cfgTrust").checked,
+  }
+  try {
+    await api("/api/config", { method: "PUT", body: JSON.stringify(body) })
+    toast("Saved & applied")
+    config = null
+    refreshAll()
+  } catch (e) {
+    toast("Invalid JSON — check config", "bad")
+  }
+}
+
+async function reloadConfig() {
+  config = null
+  await populateConfigForm()
+  toast("Reloaded from file")
+}
+
+async function loadLogs() {
+  try {
+    const r = await api("/api/logs?n=300")
+    const box = $("logBox")
+    box.innerHTML = r.logs.map((l) => `<div class="line"><span class="ts">${escapeHtml(l.at)}</span>${escapeHtml(l.msg)}</div>`).join("") || '<div class="empty">No logs</div>'
+    box.scrollTop = box.scrollHeight
+  } catch {}
+}
+
+function switchTab(name) {
+  document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.id === "tab-" + name))
+  document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b.dataset.tab === name))
+  if (name === "config") populateConfigForm()
+  if (name === "logs") loadLogs()
+  if (name === "models") refreshModels()
+  if (name === "overview") refreshStatus()
+}
+document.querySelectorAll("nav button").forEach((b) => b.addEventListener("click", () => switchTab(b.dataset.tab)))
+
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]))
+}
+function escapeAttr(s) { return escapeHtml(s) }
+
+async function refreshAll() {
+  try {
+    await refreshStatus()
+    await refreshModels()
+  } catch (e) {
+    if (e.message === "unauthorized") showAuth()
+  }
+}
+
+if (key) {
+  refreshAll()
+  setInterval(refreshStatus, 4000)
+  setInterval(loadLogs, 8000)
+} else {
+  // probe whether auth is needed
+  api("/api/status").then(() => {
+    refreshAll()
+    setInterval(refreshStatus, 4000)
+    setInterval(loadLogs, 8000)
+  }).catch(() => showAuth())
+}
+</script>
+</body>
+</html>
