@@ -134,7 +134,7 @@ main { max-width:1120px; margin:28px auto 70px; padding:0 18px }
 /* ---------- cards ---------- */
 .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:20px; margin-bottom:24px }
 .card {
-  position:relative; padding:20px;
+  position:relative; padding:20px; min-width:0;
   background:var(--card); border:var(--line); border-radius:22px 8px 22px 8px;
   box-shadow:8px 8px 0 var(--ink);
   transform:rotate(var(--tilt,0));
@@ -149,7 +149,7 @@ main { max-width:1120px; margin:28px auto 70px; padding:0 18px }
 }
 .card .label::before { content:"◦" }
 .card .value { font-size:34px; font-weight:900; margin-top:10px; letter-spacing:-.045em; font-variant-numeric:tabular-nums; text-transform:uppercase }
-.card .value.mono { font-size:15px; letter-spacing:0; text-transform:none; font-weight:800 }
+.card .value.mono { font-size:14px; letter-spacing:0; text-transform:none; font-weight:800; overflow-wrap:anywhere; word-break:break-word; line-height:1.4 }
 .card .sub { font-family:var(--mono); font-size:10.5px; color:var(--muted); margin-top:8px; text-transform:uppercase; letter-spacing:.08em }
 .cards .card.hero {
   background:var(--acid); grid-column:span 2;
@@ -317,7 +317,7 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
   <section class="tab active" id="tab-overview">
     <div class="cards">
       <div class="card hero"><div class="label">Requests served</div><div class="value" id="ovTotal">–</div><div class="sub" id="ovErr">0 errors</div></div>
-      <div class="card"><div class="label">Upstream</div><div class="value mono" id="ovUpstream" style="font-size:14px">–</div><div class="sub" id="ovUa">–</div></div>
+      <div class="card"><div class="label">Upstream</div><div class="value mono" id="ovUpstream">–</div><div class="sub" id="ovUa">–</div></div>
       <div class="card"><div class="label">Uptime</div><div class="value" id="ovUptime">–</div><div class="sub">seconds online</div></div>
       <div class="card"><div class="label">Last minute</div><div class="value" id="ovMin">–</div><div class="sub" id="ov5m">– in 5 min</div></div>
       <div class="card"><div class="label">Models</div><div class="value" id="ovModels">–</div><div class="sub" id="ovAllowed">– allowed</div></div>
@@ -447,7 +447,9 @@ async function refreshStatus() {
     const dot = $("upstreamDot"), txt = $("upstreamText")
     dot.className = "dot " + (st.upstreamOk ? "ok" : "bad")
     txt.textContent = st.upstreamOk ? "upstream OK" : "upstream DOWN"
-    $("ovUpstream").textContent = st.upstream
+    $("ovUpstream").textContent = st.upstream.replace(/^https?:\/\//, "")
+    $("ovUpstream").title = st.upstream
+    $("ovUpstream").dataset.host = new URL(st.upstream).host || st.upstream
     $("ovUa").textContent = "UA: " + st.ua
     $("ovUptime").textContent = fmtUp(st.uptime)
     $("ovTotal").textContent = st.requests.total
