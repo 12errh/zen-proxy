@@ -49,6 +49,12 @@ opencode's free `-free` models (`deepseek-v4-flash-free`, `nemotron`, `hy3-free`
   </ul>
 </div>
 
+## dashboard
+
+The management UI runs on **`http://localhost:8787`** (or `http://127.0.0.1:8787`) once the proxy is running — live stats, one-click model tests, auto-sync status, config editing, and server logs.
+
+![zen-proxy dashboard](assets/dashboard.png)
+
 ---
 
 ## install
