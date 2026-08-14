@@ -36,7 +36,7 @@ a { color:var(--ink) }
 
 /* ---------- soft ink-wash blobs + grain ---------- */
 .blobs { position:fixed; inset:0; z-index:-1; overflow:hidden; pointer-events:none }
-.blob { position:absolute; border-radius:50%; filter:blur(95px); will-change:transform }
+.blob { position:absolute; border-radius:50%; filter:blur(70px); will-change:transform; contain:strict }
 .b1 { width:52vmax; height:52vmax; left:-14vmax; top:-18vmax; background:radial-gradient(#d5f74f,transparent 65%); opacity:.5; animation:drift1 26s ease-in-out infinite alternate }
 .b2 { width:46vmax; height:46vmax; right:-15vmax; top:2vmax; background:radial-gradient(#ff9b7e,transparent 65%); opacity:.45; animation:drift2 30s ease-in-out infinite alternate }
 .b3 { width:48vmax; height:48vmax; left:16vmax; bottom:-24vmax; background:radial-gradient(#b3a2ff,transparent 65%); opacity:.45; animation:drift3 34s ease-in-out infinite alternate }
@@ -45,7 +45,7 @@ a { color:var(--ink) }
 @keyframes drift2 { to { transform:translate(-8vmax,8vmax) scale(1.2) } }
 @keyframes drift3 { to { transform:translate(6vmax,-7vmax) scale(1.1) } }
 @keyframes drift4 { to { transform:translate(-7vmax,-6vmax) scale(1.25) } }
-.grain { position:fixed; inset:0; z-index:70; pointer-events:none; opacity:.05; mix-blend-mode:multiply;
+.grain { position:fixed; inset:0; z-index:70; pointer-events:none; opacity:.05;
   background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='300' height='300'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.55'/%3E%3C/svg%3E");
   background-size:300px 300px }
 @media (prefers-reduced-motion: reduce) { .blob { animation:none } }
@@ -107,7 +107,7 @@ nav button.active { color:var(--ink) }
   transform:rotate(-.6deg); box-shadow:5px 5px 0 var(--ink);
 }
 .mq-track {
-  display:flex; width:max-content; animation:mq 26s linear infinite;
+  display:flex; width:max-content; animation:mq 26s linear infinite; will-change:transform;
   font-family:var(--mono); font-weight:800; font-size:11.5px; letter-spacing:.16em; text-transform:uppercase;
   white-space:nowrap; padding:7px 0;
 }
@@ -133,7 +133,10 @@ main { max-width:1120px; margin:28px auto 70px; padding:0 18px }
 @media (prefers-reduced-motion: reduce) { .tab.active { animation:none } }
 
 /* ---------- cards ---------- */
-.cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:20px; margin-bottom:24px }
+.cards { display:grid; grid-template-columns:repeat(5,1fr); gap:16px; margin-bottom:24px }
+@media (max-width:1000px) { .cards { grid-template-columns:repeat(3,1fr) } }
+@media (max-width:760px) { .cards { grid-template-columns:repeat(2,1fr) } }
+@media (max-width:460px) { .cards { grid-template-columns:1fr } }
 .card {
   position:relative; padding:20px; min-width:0;
   background:var(--card); border:var(--line); border-radius:22px 8px 22px 8px;
@@ -153,7 +156,7 @@ main { max-width:1120px; margin:28px auto 70px; padding:0 18px }
 .card .value.mono { font-size:14px; letter-spacing:0; text-transform:none; font-weight:800; overflow-wrap:anywhere; word-break:break-word; line-height:1.4 }
 .card .sub { font-family:var(--mono); font-size:10.5px; color:var(--muted); margin-top:8px; text-transform:uppercase; letter-spacing:.08em }
 .cards .card.hero {
-  background:var(--acid); grid-column:span 2;
+  background:var(--acid);
 }
 .cards .card.hero .label { color:var(--ink) }
 .cards .card.hero .sub { color:var(--ink) }
@@ -189,6 +192,10 @@ tbody tr:last-child td { border-bottom:none }
 .badge.warn { background:var(--grape); color:var(--ink); border:2px solid var(--ink) }
 .badge.mut { background:var(--paper2); color:var(--ink); border:2px solid var(--ink) }
 .empty { font-family:var(--serif); font-style:italic; color:var(--muted); text-align:center; padding:38px; font-size:15px }
+.pager { display:flex; align-items:center; justify-content:flex-end; gap:12px; margin-top:16px }
+.pager button { padding:6px 13px; font-size:10.5px; box-shadow:3px 3px 0 var(--ink) }
+.pager button:active { box-shadow:0 0 0 var(--ink) }
+.pager-info { font-family:var(--mono); font-size:11px; font-weight:800; color:var(--muted); letter-spacing:.06em; text-transform:uppercase; white-space:nowrap }
 
 /* ---------- controls ---------- */
 button {
@@ -271,7 +278,6 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
 
 @media (max-width:760px) {
   .brand .txt { display:none }
-  .cards .card.hero { grid-column:span 1 }
   main { padding:0 12px }
 }
 </style>
@@ -331,6 +337,7 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
         <thead><tr><th>Time</th><th>Model</th><th>Result</th><th>Latency</th><th>Count</th></tr></thead>
         <tbody><tr><td colspan="5" class="empty">no requests yet — go make some noise.</td></tr></tbody>
       </table>
+      <div class="pager" id="reqPager"></div>
     </div>
   </section>
 
@@ -460,20 +467,29 @@ async function refreshStatus() {
     $("ov5m").textContent = st.requests.last5m + " in 5 min"
     $("ovModels").textContent = st.models.total
     $("ovAllowed").textContent = st.models.allowed + " allowed"
-    renderTable(st.recent)
+    if (document.getElementById("tab-overview").classList.contains("active")) renderTable(st.recent)
     hideBanner()
   } catch (e) {
     if (e.message !== "unauthorized") { $("upstreamDot").className = "dot bad"; $("upstreamText").textContent = "unreachable" }
   }
 }
 
+const PAGE_SIZE = 10
+let tablePage = 1
 function renderTable(recent) {
   const tb = $("reqTable").querySelector("tbody")
+  const pager = $("reqPager")
   if (!recent || !recent.length) {
     tb.innerHTML = '<tr><td colspan="5" class="empty">no requests yet — go make some noise.</td></tr>'
+    pager.innerHTML = ""
     return
   }
-  tb.innerHTML = recent.slice().reverse().map((r) => {
+  const rows = recent.slice().reverse()
+  const pages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE))
+  if (tablePage > pages) tablePage = pages
+  if (tablePage < 1) tablePage = 1
+  const slice = rows.slice((tablePage - 1) * PAGE_SIZE, tablePage * PAGE_SIZE)
+  tb.innerHTML = slice.map((r) => {
     const cls = r.status < 300 ? "ok" : r.status === 429 ? "warn" : "bad"
     return `<tr>
       <td class="mono">${fmtTime(r.at)}</td>
@@ -483,7 +499,12 @@ function renderTable(recent) {
       <td class="mono">${r.count}</td>
     </tr>`
   }).join("")
+  pager.innerHTML = `
+    <button onclick="pageTable(-1)" ${tablePage <= 1 ? "disabled" : ""}>‹ prev</button>
+    <span class="pager-info">page ${tablePage} / ${pages} · ${rows.length} entries</span>
+    <button onclick="pageTable(1)" ${tablePage >= pages ? "disabled" : ""}>next ›</button>`
 }
+function pageTable(d) { tablePage += d; refreshStatus() }
 
 async function refreshModels() {
   const cfg = await api("/api/config")
@@ -590,6 +611,7 @@ async function saveConfig() {
 async function reloadConfig() { config = null; await populateConfigForm(); toast("Reloaded from file") }
 
 async function loadLogs() {
+  if (!document.getElementById("tab-logs").classList.contains("active")) return
   try {
     const r = await api("/api/logs?n=300")
     const box = $("logBox")
