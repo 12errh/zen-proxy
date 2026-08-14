@@ -1,0 +1,64 @@
+# zen-proxy
+
+> A local, zero-dependency OpenAI-compatible proxy that lets **any** coding agent (Cline, Roo Code, Continue, Aider, mimo CLI, opencode forks) use opencode's anonymous **free** Zen models — no accounts, no API keys.
+
+## The problem this solves
+
+opencode's Zen gateway serves its free `-free` models (`deepseek-v4-flash-free`, `hy3-free`, `mimo-v2.5-free`, `nemotron-*-free`, `big-pickle`, `laguna-s-2.1-free`, etc.) **only to requests that present the `User-Agent` of the opencode client**.
+
+- With the right UA, `POST https://opencode.ai/zen/v1/chat/completions` with `Authorization: Bearer public` returns HTTP 200.
+- Without it (e.g. `User-Agent: curl/8.0` or a fork's forced UA like `mimocode/0.1.12`), the gateway returns **429 FreeUsageLimitError**.
+- Most agents force their own UA, so they cannot use the free tier directly.
+- Verified: `x-opencode-client`, session, and other headers do **not** unlock access — only `User-Agent: opencode/<version>` does.
+
+zen-proxy solves this by injecting the correct `User-Agent` upstream and re-exposing everything as a standard OpenAI-compatible API on `http://127.0.0.1:8787/v1`.
+
+## Key facts
+
+- **Endpoints**: `POST /v1/chat/completions` (stream + non-stream), `POST /v1/responses`, `GET /v1/models`, `GET /health`, dashboard at `GET /`.
+- **Auth**: anonymous via `Bearer public`; BYOK via `defaultZenKey` config or an `x-zen-key` / real bearer token.
+- **Quota**: the free tier is per-IP (`x-real-ip` is forwarded), daily request limits + lifetime token budget. Do not abuse or rotate IPs.
+- **Model fallback**: tries `fallbackModels` in order on 429/5xx and honors `retry-after`.
+- **Model aliases**: `modelAliases` maps any name (e.g. `gpt-4o`) to a free model; reply model is rewritten back.
+- **Config**: `zen-proxy.json` (hot-reloaded) or env vars: `PORT`, `HOST`, `ZEN_URL`, `ZEN_UA`, `DEFAULT_MODEL`, `FALLBACK_MODELS`, `MODEL_ALIASES`, `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED`, `TIMEOUT_MS`, `CACHE_MS`, `ZEN_PROXY_CONFIG`.
+- **Requirements**: Node.js >= 18. Zero npm dependencies.
+
+## Install
+
+```bash
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/12errh/zen-proxy/main/install.sh | bash
+
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/12errh/zen-proxy/main/install.ps1 | iex
+```
+
+Or clone and run: `git clone https://github.com/12errh/zen-proxy.git && cd zen-proxy && node zen-proxy.mjs`
+
+## Point any agent at it
+
+```jsonc
+{
+  "provider": {
+    "zen": {
+      "baseURL": "http://127.0.0.1:8787/v1",
+      "apiKey": "public",
+      "models": { "deepseek-v4-flash-free": {} }
+    }
+  }
+}
+```
+
+Quick test:
+
+```bash
+curl -s http://127.0.0.1:8787/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4-flash-free","messages":[{"role":"user","content":"say hi"}]}'
+```
+
+## More
+
+- Full documentation: [README.md](README.md)
+- Everything in one file: [llms-full.txt](llms-full.txt)
+- Project: https://github.com/12errh/zen-proxy
