@@ -405,6 +405,7 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
 const $ = (id) => document.getElementById(id)
 let key = localStorage.getItem("zpKey") || ""
 let config = null
+let savedZenKeyMasked = ""
 
 function api(path, opts = {}) {
   const headers = { ...(opts.headers || {}) }
@@ -526,11 +527,14 @@ function renderModels(st) {
   if (st && st.sync) renderSync(st.sync)
   if (!list.length) { tb.innerHTML = '<tr><td colspan="4" class="empty">no models configured — add one.</td></tr>'; return }
   tb.innerHTML = list.map((m) => {
-    const aliasTarget = config.modelAliases[m]
-    const display = aliasTarget ? escapeHtml(m) + ' <span class="badge mut">→ ' + escapeHtml(aliasTarget) + "</span>" : escapeHtml(m)
-    const isDefault = m === config.defaultModel
-    return `<tr>
-      <td class="mono">${display}</td>
+  const sync = st && st.sync
+  const ms = modelStatus(m, sync)
+  const aliasTarget = config.modelAliases[m]
+  const display = aliasTarget ? escapeHtml(m) + ' <span class="badge mut">→ ' + escapeHtml(aliasTarget) + "</span>" : escapeHtml(m)
+  const msBadge = ms ? `<span class="badge ${ms.cls}" style="margin-left:7px">${ms.label}</span>` : ""
+  const isDefault = m === config.defaultModel
+  return `<tr>
+      <td class="mono">${display}${msBadge}</td>
       <td><input type="radio" name="defaultModel" value="${escapeAttr(m)}" ${isDefault ? "checked" : ""} onchange="setDefault('${escapeAttr(m)}')"></td>
       <td class="mono testCell" id="tc-${escapeAttr(m)}">–</td>
       <td class="row" style="gap:10px"><button onclick="testModel('${escapeAttr(m)}')">Test</button>${aliasTarget ? "" : `<button onclick="removeModel('${escapeAttr(m)}')">✕</button>`}</td>
@@ -558,14 +562,23 @@ async function testModel(m) {
   } catch { cell.textContent = "error" }
 }
 
+function modelStatus(m, sync) {
+  if (!sync || !sync.at) return { cls: "mut", label: "untested" }
+  if (sync.working?.includes(m)) return { cls: "ok", label: "ok" }
+  if (sync.rateLimited?.includes(m)) return { cls: "warn", label: "rate-limited" }
+  if (sync.flaky?.includes(m)) return { cls: "warn", label: "flaky" }
+  if (sync.dead?.includes(m)) return { cls: "bad", label: "dead" }
+  return { cls: "mut", label: "untested" }
+}
+
 function renderSync(s) {
   const el = $("syncStatus")
   if (!el) return
   if (s.running) { el.textContent = "auto-sync: probing…"; el.className = "badge warn"; return }
   if (!s.at) { el.textContent = "auto-sync: never"; el.className = "badge mut"; return }
   const ago = fmtUp(Math.max(1, Math.floor((Date.now() - s.at) / 1000))) + " ago"
-  el.textContent = `auto-sync: ${ago} · ${s.working} ok · ${s.rateLimited} rate-limited · ${s.flaky} flaky · ${s.dead} dead`
-  el.className = "badge " + (s.ok ? (s.dead ? "warn" : "ok") : "bad")
+  el.textContent = `auto-sync: ${ago} · ${s.working.length} ok · ${s.rateLimited.length} rate-limited · ${s.flaky.length} flaky · ${s.dead.length} dead`
+  el.className = "badge " + (s.ok ? (s.dead.length ? "warn" : "ok") : "bad")
 }
 
 async function syncNow() {
@@ -603,13 +616,14 @@ async function removeModel(m) {
 
 async function populateConfigForm() {
   if (!config) config = (await api("/api/config")).config
+  savedZenKeyMasked = config.defaultZenKey || ""
   $("cfgHost").value = config.host
   $("cfgPort").value = config.port
   $("cfgUpstream").value = config.upstream
   $("cfgUa").value = config.ua
   $("cfgDefault").value = config.defaultModel
   $("cfgProxyKey").value = config.proxyKey === "••••••••" ? "" : config.proxyKey
-  $("cfgZenKey").value = config.defaultZenKey === "••••••••" ? "" : config.defaultZenKey
+  $("cfgZenKey").value = savedZenKeyMasked
   $("cfgTimeout").value = config.timeoutMs
   $("cfgFallback").value = JSON.stringify(config.fallbackModels, null, 2)
   $("cfgAliases").value = JSON.stringify(config.modelAliases, null, 2)
@@ -626,7 +640,6 @@ async function saveConfig() {
     ua: $("cfgUa").value.trim(),
     defaultModel: $("cfgDefault").value.trim(),
     proxyKey: $("cfgProxyKey").value,
-    defaultZenKey: $("cfgZenKey").value,
     timeoutMs: Number($("cfgTimeout").value || 120000),
     fallbackModels: JSON.parse($("cfgFallback").value || "[]"),
     modelAliases: JSON.parse($("cfgAliases").value || "{}"),
@@ -634,6 +647,7 @@ async function saveConfig() {
     autoSync: $("cfgAutoSync").checked,
     autoSyncIntervalMs: Number($("cfgSyncMs").value || 3600000),
   }
+  if ($("cfgZenKey").value !== savedZenKeyMasked) body.defaultZenKey = $("cfgZenKey").value
   try {
     await api("/api/config", { method: "PUT", body: JSON.stringify(body) })
     toast("Saved & applied")

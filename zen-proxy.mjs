@@ -76,10 +76,16 @@ function saveConfig(next) {
   return merged
 }
 
+function maskKey(k) {
+  if (!k) return ""
+  if (k.length <= 12) return "••••••••"
+  return k.slice(0, 6) + "••••••" + k.slice(-4)
+}
+
 function sanitize(cfg) {
   const out = { ...cfg }
   if (out.proxyKey) out.proxyKey = "••••••••"
-  if (out.defaultZenKey) out.defaultZenKey = "••••••••"
+  if (out.defaultZenKey) out.defaultZenKey = maskKey(out.defaultZenKey)
   return out
 }
 
@@ -163,10 +169,13 @@ function authForUpstream(req) {
   if (config.proxyKey) {
     if (incoming !== config.proxyKey) return null
     const zen = req.headers["x-zen-key"]
-    if (typeof zen === "string" && zen) return `Bearer ${zen}`
-    return config.defaultZenKey ? `Bearer ${config.defaultZenKey}` : "Bearer public"
+    if (typeof zen === "string" && zen && zen !== "public") return `Bearer ${zen}`
+    if (config.defaultZenKey) return `Bearer ${config.defaultZenKey}`
+    return "Bearer public"
   }
-  return incoming && incoming !== "public" ? `Bearer ${incoming}` : "Bearer public"
+  if (incoming && incoming !== "public") return `Bearer ${incoming}`
+  if (config.defaultZenKey) return `Bearer ${config.defaultZenKey}`
+  return "Bearer public"
 }
 
 async function readBody(req) {
@@ -510,10 +519,10 @@ async function handleStatus(req, res) {
       at: syncState.at,
       running: syncState.running,
       ms: syncState.ms,
-      working: syncState.working.length,
-      rateLimited: syncState.rateLimited.length,
-      flaky: syncState.flaky.length,
-      dead: syncState.dead.length,
+      working: [...syncState.working],
+      rateLimited: [...syncState.rateLimited],
+      flaky: [...syncState.flaky],
+      dead: [...syncState.dead],
       error: syncState.error,
     },
     requests: { total: requestStats.total, errors: requestStats.errors, lastMinute, last5m },
