@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Zen Proxy installer for Linux & macOS
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/USER/zen-proxy/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/12errh/zen-proxy/main/install.sh | bash
 #   # or, from a local checkout:
 #   bash install.sh --local /path/to/zen-proxy
 #
 # Env options:
-#   ZEN_PROXY_REPO   GitHub "owner/repo" (default: placeholder below)
+#   ZEN_PROXY_REPO   GitHub "owner/repo" (default: 12errh/zen-proxy)
 #   ZEN_PROXY_DIR    install directory (default: ~/.zen-proxy)
 #   ZEN_PROXY_PORT   default port (default: 8787)
 
@@ -16,7 +16,7 @@ REPO="${ZEN_PROXY_REPO:-12errh/zen-proxy}"
 INSTALL_DIR="${ZEN_PROXY_DIR:-$HOME/.zen-proxy}"
 PORT="${ZEN_PROXY_PORT:-8787}"
 LOCAL_SRC="${1:-}"
-if [[ "$1" == "--local" && $# -ge 2 ]]; then LOCAL_SRC="$2"; fi
+if [[ "${1:-}" == "--local" && "$#" -ge 2 ]]; then LOCAL_SRC="$2"; fi
 
 info()  { printf "\033[32m%s\033[0m\n" "$*"; }
 warn()  { printf "\033[33m%s\033[0m\n" "$*"; }
@@ -82,7 +82,7 @@ info "  model   = deepseek-v4-flash-free"
 
 if command -v systemctl >/dev/null 2>&1 && [ -w /etc/systemd/system ]; then
   info ""
-  read -r -p "Install as a systemd service (auto-start)? [y/N] " ans
+  read -r -p "Install as a systemd service (auto-start)? [y/N] " ans || true
   if [[ "$ans" =~ ^[Yy]$ ]]; then
     cat > /etc/systemd/system/zen-proxy.service <<SVC
 [Unit]
