@@ -3,131 +3,272 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Zen Proxy Dashboard</title>
+<title>Zen Proxy — Liquid Glass Dashboard</title>
 <style>
 :root {
-  --bg:#0b0f14; --panel:#11161d; --panel2:#161d26; --border:#232c38;
-  --text:#e6edf3; --muted:#8b98a5; --accent:#2f81f7; --green:#3fb950;
-  --yellow:#d29922; --red:#f85149; --radius:10px;
+  --bg:#05070d;
+  --panel: rgba(255,255,255,.055);
+  --panel2: rgba(255,255,255,.085);
+  --border: rgba(255,255,255,.10);
+  --text:#f2f5fa;
+  --muted:#9aa7b8;
+  --accent:#5b8cff;
+  --green:#34d399;
+  --yellow:#fbbf24;
+  --red:#fb7185;
+  --radius:20px;
+  --spring: cubic-bezier(.34,1.56,.64,1);
+  --smooth: cubic-bezier(.16,1,.3,1);
 }
 * { box-sizing:border-box; margin:0; padding:0 }
+html, body { min-height:100% }
 body {
-  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","Segoe UI",Roboto,Helvetica,Arial,sans-serif;
   background:var(--bg); color:var(--text); font-size:14px; line-height:1.5;
+  overflow-x:hidden;
 }
 a { color:var(--accent); text-decoration:none }
+
+/* ---------- animated aurora backdrop ---------- */
+.aurora { position:fixed; inset:0; z-index:-2; overflow:hidden;
+  background:radial-gradient(120% 120% at 50% -10%, #0a1120 0%, #05070d 60%);
+}
+.blob { position:absolute; border-radius:50%; filter:blur(70px); opacity:.55;
+  mix-blend-mode:screen; will-change:transform; }
+.b1 { width:58vmax; height:58vmax; left:-14vmax; top:-16vmax;
+  background:radial-gradient(circle at 30% 30%, #4f46e5, transparent 62%);
+  animation:drift1 26s ease-in-out infinite alternate; }
+.b2 { width:52vmax; height:52vmax; right:-16vmax; top:4vmax;
+  background:radial-gradient(circle at 60% 40%, #2563eb, transparent 62%);
+  animation:drift2 30s ease-in-out infinite alternate; }
+.b3 { width:46vmax; height:46vmax; left:18vmax; bottom:-22vmax;
+  background:radial-gradient(circle at 50% 50%, #7c3aed, transparent 62%);
+  animation:drift3 34s ease-in-out infinite alternate; }
+.b4 { width:34vmax; height:34vmax; right:24vmax; bottom:-10vmax;
+  background:radial-gradient(circle at 50% 50%, #0891b2, transparent 62%);
+  animation:drift4 22s ease-in-out infinite alternate; }
+@keyframes drift1 { to { transform:translate(9vmax,6vmax) scale(1.15) } }
+@keyframes drift2 { to { transform:translate(-8vmax,8vmax) scale(1.2) } }
+@keyframes drift3 { to { transform:translate(6vmax,-7vmax) scale(1.1) } }
+@keyframes drift4 { to { transform:translate(-7vmax,-6vmax) scale(1.25) } }
+@media (prefers-reduced-motion: reduce) {
+  .blob { animation:none }
+}
+
+/* ---------- glass primitives ---------- */
+.glass {
+  position:relative;
+  border-radius:var(--radius);
+  background:linear-gradient(160deg, rgba(255,255,255,.10), rgba(255,255,255,.03));
+  -webkit-backdrop-filter:blur(22px) saturate(180%);
+  backdrop-filter:blur(22px) saturate(180%);
+  border:1px solid var(--border);
+  box-shadow:0 24px 60px rgba(2,4,12,.55),
+             inset 0 1px 0 rgba(255,255,255,.14),
+             inset 0 -1px 0 rgba(255,255,255,.03);
+}
+.glass::before {
+  content:""; position:absolute; inset:0; border-radius:inherit; pointer-events:none;
+  background:radial-gradient(120% 60% at 20% 0%, rgba(255,255,255,.13), transparent 55%);
+  z-index:0;
+}
+.glass > * { position:relative; z-index:1 }
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .glass { background:rgba(12,16,24,.92) }
+}
+
+/* ---------- header / capsule nav ---------- */
 header {
-  display:flex; align-items:center; gap:16px; padding:14px 22px;
-  border-bottom:1px solid var(--border); background:var(--panel);
-  position:sticky; top:0; z-index:10;
+  position:sticky; top:14px; z-index:40;
+  display:flex; align-items:center; gap:14px;
+  max-width:1120px; margin:14px auto 0; padding:10px 14px;
 }
-header h1 { font-size:16px; font-weight:600; white-space:nowrap }
-nav { display:flex; gap:4px; margin-left:8px; flex-wrap:wrap }
+.brand { display:flex; align-items:center; gap:10px; white-space:nowrap; font-weight:700; font-size:15px; letter-spacing:.01em }
+.brand .logo {
+  width:34px; height:34px; display:grid; place-items:center; border-radius:11px; font-size:17px;
+  background:linear-gradient(135deg,#5b8cff,#7c5cff);
+  box-shadow:0 10px 26px rgba(91,140,255,.45), inset 0 1px 0 rgba(255,255,255,.35);
+}
+nav.capsule {
+  position:relative; display:flex; align-items:center; gap:2px; padding:5px;
+  border-radius:999px; flex:1; min-width:0; overflow-x:auto; scrollbar-width:none;
+}
+nav.capsule::-webkit-scrollbar { display:none }
+.nav-indicator {
+  position:absolute; top:5px; left:0; height:calc(100% - 10px); border-radius:999px;
+  background:linear-gradient(135deg, rgba(255,255,255,.24), rgba(255,255,255,.07));
+  border:1px solid rgba(255,255,255,.18);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.28), 0 10px 26px rgba(0,0,0,.45);
+  -webkit-backdrop-filter:blur(10px); backdrop-filter:blur(10px);
+  transition:transform .6s var(--spring), width .6s var(--spring);
+  pointer-events:none; z-index:0;
+}
 nav button {
-  background:transparent; color:var(--muted); border:1px solid transparent;
-  padding:6px 12px; border-radius:8px; cursor:pointer; font-size:13px;
+  position:relative; z-index:1; flex:0 0 auto;
+  background:transparent; color:var(--muted); border:none;
+  padding:8px 18px; border-radius:999px; cursor:pointer; font-size:13px; font-weight:600;
+  transition:color .25s, transform .25s var(--spring);
 }
-nav button.active { color:var(--text); background:var(--panel2); border-color:var(--border) }
-nav button:hover:not(.active) { color:var(--text) }
-.spacer { flex:1 }
+nav button:hover { color:var(--text) }
+nav button:active { transform:scale(.94) }
+nav button.active { color:#fff }
 .pill {
-  display:inline-flex; align-items:center; gap:7px; padding:5px 12px;
-  border-radius:999px; font-size:12px; font-weight:600; border:1px solid var(--border);
-  background:var(--panel2);
+  display:inline-flex; align-items:center; gap:8px; padding:8px 15px;
+  border-radius:999px; font-size:12px; font-weight:600; white-space:nowrap;
 }
-.dot { width:8px; height:8px; border-radius:50%; background:var(--muted) }
-.dot.ok { background:var(--green); box-shadow:0 0 6px var(--green) }
-.dot.bad { background:var(--red); box-shadow:0 0 6px var(--red) }
-main { padding:22px; max-width:1100px; margin:0 auto }
+.pill .dot { width:9px; height:9px; border-radius:50%; background:var(--muted); transition:.3s }
+.dot.ok { background:var(--green); box-shadow:0 0 12px var(--green) }
+.dot.bad { background:var(--red); box-shadow:0 0 12px var(--red) }
+
+main { max-width:1120px; margin:26px auto 60px; padding:0 18px }
+.banner { display:none; margin:16px auto 0; max-width:1120px; padding:13px 18px; border-radius:14px; font-size:13px;
+  background:rgba(251,113,133,.14); border:1px solid rgba(251,113,133,.4); color:var(--red); }
+.banner.error { display:block }
+
+/* ---------- tabs (liquid transition) ---------- */
 .tab { display:none }
-.tab.active { display:block }
-.cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:14px; margin-bottom:22px }
-.card { background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:16px }
-.card .label { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em }
-.card .value { font-size:26px; font-weight:700; margin-top:6px; font-variant-numeric:tabular-nums }
-.card .sub { font-size:12px; color:var(--muted); margin-top:4px }
-.panel { background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:18px; margin-bottom:22px }
-.panel h2 { font-size:14px; font-weight:600; margin-bottom:14px; display:flex; align-items:center; justify-content:space-between }
+.tab.active { display:block; animation:tabIn .55s var(--smooth) }
+.tab.leaving { display:block; animation:tabOut .34s ease forwards; pointer-events:none }
+@keyframes tabIn { from { opacity:0; transform:translateY(18px) scale(.985); filter:blur(9px) } to { opacity:1; transform:none; filter:none } }
+@keyframes tabOut { to { opacity:0; transform:translateY(-12px) scale(.99); filter:blur(7px) } }
+@media (prefers-reduced-motion: reduce) {
+  .tab.active { animation:none }
+}
+
+/* ---------- cards ---------- */
+.cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:16px; margin-bottom:22px }
+.card { padding:20px; transition:transform .35s var(--smooth), box-shadow .35s var(--smooth) }
+.card:hover { transform:translateY(-4px);
+  box-shadow:0 34px 80px rgba(2,4,12,.6), inset 0 1px 0 rgba(255,255,255,.2) }
+.card .label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; font-weight:600 }
+.card .value { font-size:28px; font-weight:700; margin-top:8px; font-variant-numeric:tabular-nums; letter-spacing:-.02em }
+.card .value.mono { font-size:15px; letter-spacing:0 }
+.card .sub { font-size:12px; color:var(--muted); margin-top:5px }
+.card .value.green { color:var(--green) }
+.card .value.yellow { color:var(--yellow) }
+
+.panel { padding:24px; margin-bottom:22px }
+.panel h2 { font-size:14px; font-weight:700; margin-bottom:18px; display:flex; align-items:center; justify-content:space-between; letter-spacing:.01em }
+.hint { font-size:12px; color:var(--muted); margin-top:6px }
+
+/* ---------- table ---------- */
 table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums }
-th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); font-size:13px }
-th { color:var(--muted); font-weight:500; font-size:12px; text-transform:uppercase; letter-spacing:.04em }
-code, .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12.5px }
-.badge { display:inline-block; padding:2px 8px; border-radius:6px; font-size:11px; font-weight:600 }
-.badge.ok { background:rgba(63,185,80,.15); color:var(--green) }
-.badge.bad { background:rgba(248,81,73,.15); color:var(--red) }
-.badge.warn { background:rgba(210,153,34,.15); color:var(--yellow) }
-.badge.mut { background:var(--panel2); color:var(--muted); border:1px solid var(--border) }
+th,td { text-align:left; padding:11px 12px; border-bottom:1px solid rgba(255,255,255,.07); font-size:13px }
+th { color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.06em }
+tbody tr { transition:background .2s }
+tbody tr:hover { background:rgba(255,255,255,.04) }
+tbody tr:last-child td { border-bottom:none }
+.mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12.5px }
+.badge { display:inline-block; padding:3px 10px; border-radius:999px; font-size:11px; font-weight:700 }
+.badge.ok { background:rgba(52,211,153,.16); color:var(--green); box-shadow:inset 0 0 0 1px rgba(52,211,153,.25) }
+.badge.bad { background:rgba(251,113,133,.16); color:var(--red); box-shadow:inset 0 0 0 1px rgba(251,113,133,.25) }
+.badge.warn { background:rgba(251,191,36,.16); color:var(--yellow); box-shadow:inset 0 0 0 1px rgba(251,191,36,.25) }
+.badge.mut { background:rgba(255,255,255,.07); color:var(--muted); box-shadow:inset 0 0 0 1px var(--border) }
+.empty { color:var(--muted); text-align:center; padding:34px }
+
+/* ---------- controls ---------- */
 button {
-  background:var(--panel2); color:var(--text); border:1px solid var(--border);
-  padding:6px 12px; border-radius:8px; cursor:pointer; font-size:13px;
+  background:rgba(255,255,255,.07); color:var(--text); border:1px solid rgba(255,255,255,.14);
+  padding:8px 15px; border-radius:12px; cursor:pointer; font-size:13px; font-weight:600;
+  transition:background .2s, transform .25s var(--spring), box-shadow .2s, border-color .2s;
 }
-button:hover { border-color:var(--accent) }
-button.primary { background:var(--accent); border-color:var(--accent); color:#fff }
-button.primary:hover { filter:brightness(1.1) }
-button:disabled { opacity:.5; cursor:not-allowed }
+button:hover { background:rgba(255,255,255,.13); border-color:rgba(255,255,255,.22); transform:translateY(-1px) }
+button:active { transform:scale(.96) }
+button:disabled { opacity:.5; cursor:not-allowed; transform:none }
+button.primary {
+  background:linear-gradient(135deg,#5b8cff,#7c5cff); border:none; color:#fff;
+  box-shadow:0 12px 30px rgba(91,140,255,.35), inset 0 1px 0 rgba(255,255,255,.3);
+}
+button.primary:hover { filter:brightness(1.08); box-shadow:0 16px 36px rgba(91,140,255,.5) }
 input, select, textarea {
-  background:var(--panel2); color:var(--text); border:1px solid var(--border);
-  border-radius:8px; padding:8px 10px; font-size:13px; width:100%;
+  background:rgba(255,255,255,.06); color:var(--text); border:1px solid rgba(255,255,255,.14);
+  border-radius:12px; padding:10px 12px; font-size:13px; width:100%;
+  -webkit-backdrop-filter:blur(6px); backdrop-filter:blur(6px);
+  transition:border-color .2s, box-shadow .2s, background .2s;
 }
-input:focus, select:focus, textarea:focus { outline:none; border-color:var(--accent) }
-label { display:block; font-size:12px; color:var(--muted); margin:12px 0 5px; font-weight:500 }
-.formgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:0 20px }
-.hint { font-size:12px; color:var(--muted); margin-top:4px }
-textarea { resize:vertical; min-height:90px; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12.5px }
-.row { display:flex; gap:8px; align-items:center; flex-wrap:wrap }
+input:focus, select:focus, textarea:focus { outline:none; border-color:var(--accent);
+  box-shadow:0 0 0 3px rgba(91,140,255,.18) }
+label { display:block; font-size:11px; color:var(--muted); margin:14px 0 6px; font-weight:600; text-transform:uppercase; letter-spacing:.05em }
+.formgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:0 22px }
+textarea { resize:vertical; min-height:92px; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12.5px }
+.row { display:flex; gap:10px; align-items:center; flex-wrap:wrap }
 .row .grow { flex:1 }
-.checkbox { display:flex; align-items:center; gap:8px; margin-top:14px }
-.checkbox input { width:auto }
-.checkbox span { font-size:13px; color:var(--text) }
-.logs { background:#06080b; border:1px solid var(--border); border-radius:8px; padding:12px; height:420px; overflow-y:auto; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px }
-.logs .ts { color:var(--muted); margin-right:10px }
-.logs .line { white-space:pre-wrap; word-break:break-all; padding:2px 0 }
-.empty { color:var(--muted); text-align:center; padding:30px }
-.test-result { margin-top:10px; font-size:12px; display:none }
-.test-result .ok { color:var(--green) }
-.test-result .bad { color:var(--red) }
-.banner { display:none; margin:0 22px 14px; padding:12px 16px; border-radius:var(--radius); font-size:13px }
-.banner.error { display:block; background:rgba(248,81,73,.12); border:1px solid var(--red); color:var(--red) }
+.checkbox { display:flex; align-items:center; gap:10px; margin-top:16px }
+.checkbox input { width:auto; accent-color:var(--accent) }
+.checkbox span { font-size:13px }
+.testCell { transition:color .2s }
+
+/* ---------- logs ---------- */
+.logs {
+  background:rgba(4,7,13,.6); border:1px solid rgba(255,255,255,.09); border-radius:14px;
+  padding:14px; height:430px; overflow-y:auto;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12px;
+  box-shadow:inset 0 2px 14px rgba(0,0,0,.4);
+}
+.logs .ts { color:var(--muted); margin-right:12px }
+.logs .line { white-space:pre-wrap; word-break:break-all; padding:3px 0 }
+.logs .line:hover { background:rgba(255,255,255,.04) }
+
+/* ---------- toast ---------- */
 .toast {
-  position:fixed; bottom:22px; right:22px; background:var(--panel2); border:1px solid var(--border);
-  padding:12px 18px; border-radius:10px; font-size:13px; box-shadow:0 6px 24px rgba(0,0,0,.4);
-  opacity:0; transform:translateY(8px); transition:.2s; z-index:50;
+  position:fixed; bottom:26px; right:26px; z-index:60;
+  padding:14px 22px; border-radius:14px; font-size:13px; font-weight:600;
+  opacity:0; transform:translateY(10px) scale(.97); transition:.28s var(--spring); pointer-events:none;
+  background:linear-gradient(160deg, rgba(255,255,255,.14), rgba(255,255,255,.05));
+  -webkit-backdrop-filter:blur(20px) saturate(180%); backdrop-filter:blur(20px) saturate(180%);
+  border:1px solid rgba(255,255,255,.18);
+  box-shadow:0 20px 50px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.2);
 }
 .toast.show { opacity:1; transform:none }
-.toast.ok { border-color:var(--green) }
-.toast.bad { border-color:var(--red) }
+.toast.ok { border-color:rgba(52,211,153,.4) }
+.toast.bad { border-color:rgba(251,113,133,.5) }
+
+/* ---------- auth ---------- */
 #authScreen {
-  position:fixed; inset:0; background:rgba(4,6,9,.85); display:flex; align-items:center; justify-content:center; z-index:100;
+  position:fixed; inset:0; z-index:100; display:none; align-items:center; justify-content:center;
+  background:rgba(4,6,12,.6);
+  -webkit-backdrop-filter:blur(8px); backdrop-filter:blur(8px);
 }
-#authScreen .box { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:28px; width:340px }
-#authScreen h2 { font-size:16px; margin-bottom:6px }
-#authScreen p { color:var(--muted); font-size:13px; margin-bottom:16px }
-@media (max-width:700px){ main{ padding:14px } header{ flex-wrap:wrap } }
+#authScreen .box { width:350px; padding:30px; border-radius:22px; animation:tabIn .5s var(--smooth) }
+#authScreen h2 { font-size:17px; margin-bottom:6px }
+#authScreen p { color:var(--muted); font-size:13px; margin-bottom:18px }
+
+@media (max-width:760px) {
+  .brand span.txt { display:none }
+  nav.capsule { overflow-x:auto }
+  .nav-indicator { display:none }
+  .pill { padding:8px 11px }
+  main { padding:0 12px }
+}
 </style>
 </head>
 <body>
 
+<div class="aurora" aria-hidden="true">
+  <div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div><div class="blob b4"></div>
+</div>
+
 <div id="authScreen" style="display:none">
-  <div class="box">
+  <div class="box glass">
     <h2>Proxy key required</h2>
     <p>This dashboard is protected. Enter the admin key (<code>PROXY_KEY</code>).</p>
     <input type="password" id="authKey" placeholder="Admin key" autocomplete="off">
-    <div class="row" style="margin-top:14px">
+    <div class="row" style="margin-top:16px">
       <button class="primary grow" onclick="submitAuth()">Unlock</button>
     </div>
   </div>
 </div>
 
-<header>
-  <h1>⚡ Zen Proxy</h1>
-  <nav>
+<header class="glass">
+  <div class="brand"><span class="logo">⚡</span><span class="txt">Zen Proxy</span></div>
+  <nav class="capsule" id="nav">
+    <div class="nav-indicator" id="navIndicator"></div>
     <button data-tab="overview" class="active">Overview</button>
     <button data-tab="models">Models</button>
     <button data-tab="config">Settings</button>
     <button data-tab="logs">Logs</button>
   </nav>
-  <div class="spacer"></div>
-  <span class="pill" id="upstreamPill"><span class="dot" id="upstreamDot"></span><span id="upstreamText">checking…</span></span>
+  <span class="pill glass" id="upstreamPill"><span class="dot" id="upstreamDot"></span><span id="upstreamText">checking…</span></span>
 </header>
 
 <div class="banner" id="banner"></div>
@@ -135,15 +276,15 @@ textarea { resize:vertical; min-height:90px; font-family:ui-monospace,Menlo,Cons
 <main>
   <section class="tab active" id="tab-overview">
     <div class="cards">
-      <div class="card"><div class="label">Upstream</div><div class="value mono" id="ovUpstream" style="font-size:15px">–</div><div class="sub" id="ovUa">–</div></div>
-      <div class="card"><div class="label">Uptime</div><div class="value" id="ovUptime">–</div><div class="sub">seconds</div></div>
-      <div class="card"><div class="label">Requests</div><div class="value" id="ovTotal">–</div><div class="sub" id="ovErr">0 errors</div></div>
-      <div class="card"><div class="label">Last minute</div><div class="value" id="ovMin">–</div><div class="sub" id="ov5m">– in 5 min</div></div>
-      <div class="card"><div class="label">Models</div><div class="value" id="ovModels">–</div><div class="sub" id="ovAllowed">– allowed</div></div>
+      <div class="card glass"><div class="label">Upstream</div><div class="value mono" id="ovUpstream" style="font-size:14px">–</div><div class="sub" id="ovUa">–</div></div>
+      <div class="card glass"><div class="label">Uptime</div><div class="value" id="ovUptime">–</div><div class="sub">seconds online</div></div>
+      <div class="card glass"><div class="label">Requests</div><div class="value" id="ovTotal">–</div><div class="sub" id="ovErr">0 errors</div></div>
+      <div class="card glass"><div class="label">Last minute</div><div class="value" id="ovMin">–</div><div class="sub" id="ov5m">– in 5 min</div></div>
+      <div class="card glass"><div class="label">Models</div><div class="value" id="ovModels">–</div><div class="sub" id="ovAllowed">– allowed</div></div>
     </div>
 
-    <div class="panel">
-      <h2>Recent requests <span class="badge mut" id="modelFilterWrap"><span id="modelFilterText">all</span></span></h2>
+    <div class="panel glass">
+      <h2>Recent requests</h2>
       <table id="reqTable">
         <thead><tr><th>Time</th><th>Model</th><th>Result</th><th>Latency</th><th>Count</th></tr></thead>
         <tbody><tr><td colspan="5" class="empty">No requests yet</td></tr></tbody>
@@ -152,14 +293,14 @@ textarea { resize:vertical; min-height:90px; font-family:ui-monospace,Menlo,Cons
   </section>
 
   <section class="tab" id="tab-models">
-    <div class="panel">
+    <div class="panel glass">
       <h2>Allowed models <span class="badge mut" id="modelCount"></span></h2>
-      <p class="hint" style="margin-bottom:12px">These are served on <code>/v1/models</code> and accepted by the proxy. Click <b>Test</b> to send a tiny completion and see live status. Default model is used when a request asks for an unknown model.</p>
+      <p class="hint" style="margin-bottom:14px">These are served on <code>/v1/models</code> and accepted by the proxy. Click <b>Test</b> to send a tiny completion and see live status. The default model is used when a request asks for an unknown model.</p>
       <table id="modelTable">
         <thead><tr><th>Model</th><th>Default</th><th>Last test</th><th></th></tr></thead>
         <tbody></tbody>
       </table>
-      <div class="row" style="margin-top:14px">
+      <div class="row" style="margin-top:16px">
         <input class="grow" id="newModel" placeholder="Add model id, e.g. nemotron-3-ultra-free">
         <button onclick="addModel()">Add</button>
       </div>
@@ -167,8 +308,8 @@ textarea { resize:vertical; min-height:90px; font-family:ui-monospace,Menlo,Cons
   </section>
 
   <section class="tab" id="tab-config">
-    <div class="panel">
-      <h2>Server settings <span class="badge warn">port/host changes need restart</span></h2>
+    <div class="panel glass">
+      <h2>Server settings <span class="badge warn">port / host need restart</span></h2>
       <div class="formgrid">
         <div>
           <label>Host</label><input id="cfgHost" type="text">
@@ -187,8 +328,8 @@ textarea { resize:vertical; min-height:90px; font-family:ui-monospace,Menlo,Cons
       <textarea id="cfgFallback"></textarea>
       <label>Model aliases (JSON map — e.g. {"gpt-4o":"deepseek-v4-flash-free"})</label>
       <textarea id="cfgAliases"></textarea>
-      <div class="checkbox"><input type="checkbox" id="cfgTrust"><span>Trust <code>x-forwarded-for</code> from reverse proxy</span></div>
-      <div class="row" style="margin-top:18px">
+      <div class="checkbox"><input type="checkbox" id="cfgTrust"><span>Trust <code>x-forwarded-for</code> from a reverse proxy</span></div>
+      <div class="row" style="margin-top:20px">
         <button class="primary" onclick="saveConfig()">Save &amp; apply</button>
         <button onclick="reloadConfig()">Discard / reload from file</button>
       </div>
@@ -196,8 +337,8 @@ textarea { resize:vertical; min-height:90px; font-family:ui-monospace,Menlo,Cons
   </section>
 
   <section class="tab" id="tab-logs">
-    <div class="panel">
-      <h2>Server logs <button style="font-size:12px" onclick="loadLogs()">Refresh</button></h2>
+    <div class="panel glass">
+      <h2>Server logs <button style="font-size:12px; padding:5px 12px" onclick="loadLogs()">Refresh</button></h2>
       <div class="logs" id="logBox"><div class="empty">Loading…</div></div>
     </div>
   </section>
@@ -209,7 +350,6 @@ textarea { resize:vertical; min-height:90px; font-family:ui-monospace,Menlo,Cons
 const $ = (id) => document.getElementById(id)
 let key = localStorage.getItem("zpKey") || ""
 let config = null
-let statusCache = null
 
 function api(path, opts = {}) {
   const headers = { ...(opts.headers || {}) }
@@ -228,12 +368,7 @@ function toast(msg, type = "ok") {
   clearTimeout(t._h)
   t._h = setTimeout(() => (t.className = "toast"), 2400)
 }
-
-function showBanner(msg) {
-  const b = $("banner")
-  b.textContent = msg
-  b.className = "banner error"
-}
+function showBanner(msg) { const b = $("banner"); b.textContent = msg; b.className = "banner error" }
 function hideBanner() { $("banner").className = "banner" }
 
 function showAuth() {
@@ -260,21 +395,15 @@ function fmtTime(ms) {
   const d = new Date(ms)
   return d.toLocaleTimeString([], { hour12: false }) + "." + String(d.getMilliseconds()).padStart(3, "0")
 }
-function fmtDur(ms) {
-  if (ms < 1000) return ms + "ms"
-  return (ms / 1000).toFixed(1) + "s"
-}
+function fmtDur(ms) { return ms < 1000 ? ms + "ms" : (ms / 1000).toFixed(1) + "s" }
 function fmtUp(sec) {
   const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60
-  if (h > 0) return h + "h " + m + "m"
-  if (m > 0) return m + "m " + s + "s"
-  return s + "s"
+  return h > 0 ? h + "h " + m + "m" : m > 0 ? m + "m " + s + "s" : s + "s"
 }
 
 async function refreshStatus() {
   try {
     const st = await api("/api/status")
-    statusCache = st
     const dot = $("upstreamDot"), txt = $("upstreamText")
     dot.className = "dot " + (st.upstreamOk ? "ok" : "bad")
     txt.textContent = st.upstreamOk ? "upstream OK" : "upstream DOWN"
@@ -288,32 +417,28 @@ async function refreshStatus() {
     $("ovModels").textContent = st.models.total
     $("ovAllowed").textContent = st.models.allowed + " allowed"
     renderTable(st.recent)
-    renderModels(st)
     hideBanner()
   } catch (e) {
-    if (e.message !== "unauthorized") {
-      $("upstreamDot").className = "dot bad"
-      $("upstreamText").textContent = "unreachable"
-    }
+    if (e.message !== "unauthorized") { $("upstreamDot").className = "dot bad"; $("upstreamText").textContent = "unreachable" }
   }
 }
 
 function renderTable(recent) {
-    const tb = $("reqTable").querySelector("tbody")
-    if (!recent || !recent.length) {
-      tb.innerHTML = '<tr><td colspan="5" class="empty">No requests yet</td></tr>'
-      return
-    }
-    tb.innerHTML = recent.slice().reverse().map((r) => {
-      const cls = r.status < 300 ? "ok" : r.status === 429 ? "warn" : "bad"
-      return `<tr>
-        <td class="mono">${fmtTime(r.at)}</td>
-        <td class="mono">${escapeHtml(r.model)}</td>
-        <td><span class="badge ${cls}">${r.status}</span></td>
-        <td class="mono">${fmtDur(r.ms)}</td>
-        <td class="mono">${r.count}</td>
-      </tr>`
-    }).join("")
+  const tb = $("reqTable").querySelector("tbody")
+  if (!recent || !recent.length) {
+    tb.innerHTML = '<tr><td colspan="5" class="empty">No requests yet</td></tr>'
+    return
+  }
+  tb.innerHTML = recent.slice().reverse().map((r) => {
+    const cls = r.status < 300 ? "ok" : r.status === 429 ? "warn" : "bad"
+    return `<tr>
+      <td class="mono">${fmtTime(r.at)}</td>
+      <td class="mono">${escapeHtml(r.model)}</td>
+      <td><span class="badge ${cls}">${r.status}</span></td>
+      <td class="mono">${fmtDur(r.ms)}</td>
+      <td class="mono">${r.count}</td>
+    </tr>`
+  }).join("")
 }
 
 async function refreshModels() {
@@ -327,10 +452,7 @@ function renderModels(st) {
   const tb = $("modelTable").querySelector("tbody")
   const list = [...new Set([...config.fallbackModels, ...Object.keys(config.modelAliases)])]
   $("modelCount").textContent = list.length + " configured"
-  if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="4" class="empty">No models configured</td></tr>'
-    return
-  }
+  if (!list.length) { tb.innerHTML = '<tr><td colspan="4" class="empty">No models configured</td></tr>'; return }
   tb.innerHTML = list.map((m) => {
     const aliasTarget = config.modelAliases[m]
     const display = aliasTarget ? escapeHtml(m) + ' <span class="badge mut">→ ' + escapeHtml(aliasTarget) + "</span>" : escapeHtml(m)
@@ -339,7 +461,7 @@ function renderModels(st) {
       <td class="mono">${display}</td>
       <td><input type="radio" name="defaultModel" value="${escapeAttr(m)}" ${isDefault ? "checked" : ""} onchange="setDefault('${escapeAttr(m)}')"></td>
       <td class="mono testCell" id="tc-${escapeAttr(m)}">–</td>
-      <td class="row" style="gap:6px"><button onclick="testModel('${escapeAttr(m)}')">Test</button>${aliasTarget ? "" : `<button class="danger" onclick="removeModel('${escapeAttr(m)}')">✕</button>`}</td>
+      <td class="row" style="gap:8px"><button onclick="testModel('${escapeAttr(m)}')">Test</button>${aliasTarget ? "" : `<button onclick="removeModel('${escapeAttr(m)}')">✕</button>`}</td>
     </tr>`
   }).join("")
   if (st) $("ovModels").textContent = st.models.total
@@ -359,11 +481,9 @@ async function testModel(m) {
   try {
     const r = await api("/api/test", { method: "POST", body: JSON.stringify({ model: m }) })
     const cls = r.ok ? "ok" : "bad"
-    cell.innerHTML = `<span class="${cls}">${r.ok ? "✓" : "✗"} ${r.status} · ${fmtDur(r.ms)}</span>${r.detail ? ' <span class="hint">' + escapeHtml(r.detail.slice(0, 60)) + "</span>" : ""}`
+    cell.innerHTML = `<span style="color:${r.ok ? "var(--green)" : "var(--red)"}">${r.ok ? "✓" : "✗"} ${r.status} · ${fmtDur(r.ms)}</span>${r.detail ? ' <span class="hint">' + escapeHtml(r.detail.slice(0, 60)) + "</span>" : ""}`
     toast(r.ok ? m + " works" : m + " failed (" + r.status + ")", r.ok ? "ok" : "bad")
-  } catch {
-    cell.textContent = "error"
-  }
+  } catch { cell.textContent = "error" }
 }
 
 async function addModel() {
@@ -420,16 +540,10 @@ async function saveConfig() {
     toast("Saved & applied")
     config = null
     refreshAll()
-  } catch (e) {
-    toast("Invalid JSON — check config", "bad")
-  }
+  } catch (e) { toast("Invalid JSON — check config", "bad") }
 }
 
-async function reloadConfig() {
-  config = null
-  await populateConfigForm()
-  toast("Reloaded from file")
-}
+async function reloadConfig() { config = null; await populateConfigForm(); toast("Reloaded from file") }
 
 async function loadLogs() {
   try {
@@ -440,9 +554,30 @@ async function loadLogs() {
   } catch {}
 }
 
+function positionIndicator() {
+  if (window.innerWidth <= 760) return
+  const nav = $("nav"), ind = $("navIndicator")
+  const act = nav.querySelector("button.active")
+  if (!act) return
+  ind.style.width = act.offsetWidth + "px"
+  ind.style.transform = `translateX(${act.offsetLeft}px)`
+}
+window.addEventListener("resize", positionIndicator)
+
 function switchTab(name) {
-  document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.id === "tab-" + name))
   document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b.dataset.tab === name))
+  document.querySelectorAll(".tab").forEach((t) => {
+    const is = t.id === "tab-" + name
+    if (is) {
+      t.classList.remove("leaving")
+      t.classList.add("active")
+    } else if (t.classList.contains("active")) {
+      t.classList.remove("active")
+      t.classList.add("leaving")
+      setTimeout(() => t.classList.remove("leaving"), 340)
+    }
+  })
+  positionIndicator()
   if (name === "config") populateConfigForm()
   if (name === "logs") loadLogs()
   if (name === "models") refreshModels()
@@ -456,12 +591,7 @@ function escapeHtml(s) {
 function escapeAttr(s) { return escapeHtml(s) }
 
 async function refreshAll() {
-  try {
-    await refreshStatus()
-    await refreshModels()
-  } catch (e) {
-    if (e.message === "unauthorized") showAuth()
-  }
+  try { await refreshStatus(); await refreshModels() } catch (e) { if (e.message === "unauthorized") showAuth() }
 }
 
 if (key) {
@@ -469,7 +599,6 @@ if (key) {
   setInterval(refreshStatus, 4000)
   setInterval(loadLogs, 8000)
 } else {
-  // probe whether auth is needed
   api("/api/status").then(() => {
     refreshAll()
     setInterval(refreshStatus, 4000)
