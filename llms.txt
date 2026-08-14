@@ -20,7 +20,8 @@ zen-proxy solves this by injecting the correct `User-Agent` upstream and re-expo
 - **Quota**: the free tier is per-IP (`x-real-ip` is forwarded), daily request limits + lifetime token budget. Do not abuse or rotate IPs.
 - **Model fallback**: tries `fallbackModels` in order on 429/5xx and honors `retry-after`.
 - **Model aliases**: `modelAliases` maps any name (e.g. `gpt-4o`) to a free model; reply model is rewritten back.
-- **Config**: `zen-proxy.json` (hot-reloaded) or env vars: `PORT`, `HOST`, `ZEN_URL`, `ZEN_UA`, `DEFAULT_MODEL`, `FALLBACK_MODELS`, `MODEL_ALIASES`, `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED`, `TIMEOUT_MS`, `CACHE_MS`, `ZEN_PROXY_CONFIG`.
+- **Config**: `zen-proxy.json` (hot-reloaded) or env vars: `PORT`, `HOST`, `ZEN_URL`, `ZEN_UA`, `DEFAULT_MODEL`, `FALLBACK_MODELS`, `MODEL_ALIASES`, `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED`, `TIMEOUT_MS`, `CACHE_MS`, `AUTO_SYNC`, `AUTO_SYNC_MS`, `ZEN_PROXY_CONFIG`.
+- **Auto model sync**: probes every upstream free model with a tiny completion, prunes models that are dead (404 / fail twice in a row), re-adds recovered ones, and updates the config automatically — no hand-tuning.
 - **Requirements**: Node.js >= 18. Zero npm dependencies.
 
 ## Install

@@ -160,7 +160,7 @@ Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded wh
 | `timeoutMs` | `120000` | Upstream timeout for non-streaming |
 | `cacheMs` | `30000` | `/v1/models` cache TTL |
 
-Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `DEFAULT_MODEL`, `FALLBACK_MODELS` (JSON), `MODEL_ALIASES` (JSON), `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED=1`, `TIMEOUT_MS`, `CACHE_MS`, `ZEN_PROXY_CONFIG` (custom config path).
+Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `DEFAULT_MODEL`, `FALLBACK_MODELS` (JSON), `MODEL_ALIASES` (JSON), `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED=1`, `TIMEOUT_MS`, `CACHE_MS`, `AUTO_SYNC` (`0` to disable), `AUTO_SYNC_MS`, `ZEN_PROXY_CONFIG` (custom config path).
 
 ### bring your own key
 

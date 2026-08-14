@@ -344,7 +344,11 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
   <section class="tab" id="tab-models">
     <div class="panel">
       <h2><span class="hh">Allowed models</span><span class="badge mut" id="modelCount"></span></h2>
-      <p class="hint" style="margin-bottom:16px">These are served on <code>/v1/models</code> and accepted by the proxy. Hit <b>TEST</b> to send a tiny completion and see live status. The default model is used when a request asks for an unknown one.</p>
+      <p class="hint" style="margin-bottom:16px">These are served on <code>/v1/models</code> and accepted by the proxy. Hit <b>TEST</b> to send a tiny completion and see live status. The default model is used when a request asks for an unknown one. Auto-sync probes every upstream free model and prunes the dead ones automatically.</p>
+      <div class="row" style="margin:0 0 16px;gap:12px">
+        <span class="badge mut" id="syncStatus">auto-sync: …</span>
+        <button id="syncBtn" style="margin-left:auto" onclick="syncNow()">⟳ Sync now</button>
+      </div>
       <table id="modelTable">
         <thead><tr><th>Model</th><th>Default</th><th>Last test</th><th></th></tr></thead>
         <tbody></tbody>
@@ -378,6 +382,8 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
       <label>Model aliases (json map — e.g. {"gpt-4o":"deepseek-v4-flash-free"})</label>
       <textarea id="cfgAliases"></textarea>
       <div class="checkbox"><input type="checkbox" id="cfgTrust"><span>Trust <code>x-forwarded-for</code> from a reverse proxy</span></div>
+      <div class="checkbox"><input type="checkbox" id="cfgAutoSync"><span>Auto-sync models (probe upstream free models, prune dead ones)</span></div>
+      <label>Auto-sync interval (ms)</label><input id="cfgSyncMs" type="number">
       <div class="row" style="margin-top:22px">
         <button class="primary" onclick="saveConfig()">Save &amp; apply</button>
         <button onclick="reloadConfig()">Discard / reload</button>
@@ -517,6 +523,7 @@ function renderModels(st) {
   const tb = $("modelTable").querySelector("tbody")
   const list = [...new Set([...config.fallbackModels, ...Object.keys(config.modelAliases)])]
   $("modelCount").textContent = list.length + " configured"
+  if (st && st.sync) renderSync(st.sync)
   if (!list.length) { tb.innerHTML = '<tr><td colspan="4" class="empty">no models configured — add one.</td></tr>'; return }
   tb.innerHTML = list.map((m) => {
     const aliasTarget = config.modelAliases[m]
@@ -549,6 +556,29 @@ async function testModel(m) {
     cell.innerHTML = `<span style="color:${r.ok ? "var(--ink)" : "var(--coral)"}">${r.ok ? "✓" : "✗"} ${r.status} · ${fmtDur(r.ms)}</span>${r.detail ? ' <span class="hint">' + escapeHtml(r.detail.slice(0, 60)) + "</span>" : ""}`
     toast(r.ok ? m + " works" : m + " failed (" + r.status + ")", r.ok ? "ok" : "bad")
   } catch { cell.textContent = "error" }
+}
+
+function renderSync(s) {
+  const el = $("syncStatus")
+  if (!el) return
+  if (s.running) { el.textContent = "auto-sync: probing…"; el.className = "badge warn"; return }
+  if (!s.at) { el.textContent = "auto-sync: never"; el.className = "badge mut"; return }
+  const ago = fmtUp(Math.max(1, Math.floor((Date.now() - s.at) / 1000))) + " ago"
+  el.textContent = `auto-sync: ${ago} · ${s.working} ok · ${s.rateLimited} rate-limited · ${s.flaky} flaky · ${s.dead} dead`
+  el.className = "badge " + (s.ok ? (s.dead ? "warn" : "ok") : "bad")
+}
+
+async function syncNow() {
+  const btn = $("syncBtn")
+  btn.disabled = true
+  btn.textContent = "syncing…"
+  try {
+    const r = await api("/api/sync", { method: "POST" })
+    toast(r.ok ? "Models synced" : "Sync failed: " + (r.error || ""), r.ok ? "ok" : "bad")
+  } catch { toast("Sync failed", "bad") }
+  btn.disabled = false
+  btn.textContent = "⟳ Sync now"
+  refreshModels()
 }
 
 async function addModel() {
@@ -584,6 +614,8 @@ async function populateConfigForm() {
   $("cfgFallback").value = JSON.stringify(config.fallbackModels, null, 2)
   $("cfgAliases").value = JSON.stringify(config.modelAliases, null, 2)
   $("cfgTrust").checked = !!config.trustForwarded
+  $("cfgAutoSync").checked = config.autoSync !== false
+  $("cfgSyncMs").value = config.autoSyncIntervalMs ?? 3600000
 }
 
 async function saveConfig() {
@@ -599,6 +631,8 @@ async function saveConfig() {
     fallbackModels: JSON.parse($("cfgFallback").value || "[]"),
     modelAliases: JSON.parse($("cfgAliases").value || "{}"),
     trustForwarded: $("cfgTrust").checked,
+    autoSync: $("cfgAutoSync").checked,
+    autoSyncIntervalMs: Number($("cfgSyncMs").value || 3600000),
   }
   try {
     await api("/api/config", { method: "PUT", body: JSON.stringify(body) })

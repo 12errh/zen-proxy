@@ -33,6 +33,8 @@ const DEFAULT_CONFIG = {
   trustForwarded: ENV.TRUST_FORWARDED === "1",
   timeoutMs: Number(ENV.TIMEOUT_MS ?? 120000),
   cacheMs: Number(ENV.CACHE_MS ?? 30000),
+  autoSync: ENV.AUTO_SYNC !== "0",
+  autoSyncIntervalMs: Number(ENV.AUTO_SYNC_MS ?? 3600000),
 }
 
 function loadConfig() {
@@ -58,6 +60,7 @@ try {
     setTimeout(() => {
       config = loadConfig()
       reloading = false
+      scheduleSync()
       log("config reloaded")
     }, 150)
   })
@@ -80,6 +83,8 @@ function sanitize(cfg) {
 
 const ALLOWED = () => new Set([...config.fallbackModels, ...Object.values(config.modelAliases)])
 const requestStats = { total: 0, errors: 0, recent: [], perMinute: new Map() }
+const syncState = { at: 0, ok: false, running: false, working: [], rateLimited: [], flaky: [], dead: [], error: "", ms: 0 }
+const modelHealth = new Map()
 const MAX_LOG = 500
 const logLines = []
 function log(message) {
@@ -308,7 +313,13 @@ async function fetchModels() {
       const parsed = await res.json()
       const upstreamModels = parsed.data ?? []
       const allowed = ALLOWED()
-      const free = upstreamModels.filter((m) => m.id.endsWith("-free") || allowed.has(m.id))
+      let free
+      if (syncState.ok && syncState.at) {
+        const live = new Set([...syncState.working, ...syncState.rateLimited])
+        free = upstreamModels.filter((m) => live.has(m.id) || allowed.has(m.id))
+      } else {
+        free = upstreamModels.filter((m) => m.id.endsWith("-free") || allowed.has(m.id))
+      }
       modelsCache = { at: Date.now(), data: free, ok: true }
     } else {
       modelsCache = { at: Date.now(), data: modelsCache.data, ok: false }
@@ -317,6 +328,108 @@ async function fetchModels() {
     modelsCache = { at: Date.now(), data: modelsCache.data, ok: false }
   }
   return modelsCache
+}
+
+async function syncModels() {
+  if (syncState.running) return syncState
+  syncState.running = true
+  syncState.at = Date.now()
+  const start = Date.now()
+  try {
+    const res = await fetch(`${config.upstream}/models`, {
+      headers: { "user-agent": config.ua },
+      signal: AbortSignal.timeout(15_000),
+    })
+    if (!res.ok) throw new Error(`upstream /models → ${res.status}`)
+    const parsed = await res.json()
+    const upstreamIds = new Set((parsed.data ?? []).map((m) => m.id))
+    const current = [...config.fallbackModels]
+    const candidates = [...new Set([...current, ...[...upstreamIds].filter((id) => id.endsWith("-free"))])]
+    const working = []
+    const rateLimited = []
+    const dead = []
+    const flaky = []
+    const removeFromCurrent = new Set()
+    const auth = config.defaultZenKey ? `Bearer ${config.defaultZenKey}` : "Bearer public"
+    let idx = 0
+    const probe = async () => {
+      while (idx < candidates.length) {
+        const id = candidates[idx++]
+        try {
+          const r = await fetch(`${config.upstream}/chat/completions`, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              accept: "application/json",
+              authorization: auth,
+              "user-agent": config.ua,
+            },
+            body: JSON.stringify({ model: id, messages: [{ role: "user", content: "ping" }], max_tokens: 5 }),
+            signal: AbortSignal.timeout(Math.min(config.timeoutMs, 30_000)),
+          })
+          let bodyErr = ""
+          if (r.status === 200) {
+            try {
+              const j = await r.json()
+              if (j && j.error) bodyErr = (j.error.type || "") + " " + (j.error.message || "")
+            } catch {}
+          }
+          if (r.ok && !bodyErr) { working.push(id); modelHealth.set(id, 0) }
+          else if (r.status === 429 && !bodyErr) { rateLimited.push(id); modelHealth.set(id, 0) }
+          else {
+            const definiteDead = r.status === 404 || /model_not_found|no such model|does not exist/i.test(bodyErr || `${r.status}`)
+            const fails = (modelHealth.get(id) ?? 0) + 1
+            modelHealth.set(id, fails)
+            if (definiteDead) { dead.push(id); removeFromCurrent.add(id) }
+            else if (fails >= 2) { dead.push(id); removeFromCurrent.add(id) }
+            else { flaky.push(id) }
+          }
+        } catch {
+          const fails = (modelHealth.get(id) ?? 0) + 1
+          modelHealth.set(id, fails)
+          if (fails >= 2) { dead.push(id); removeFromCurrent.add(id) }
+          else flaky.push(id)
+        }
+      }
+    }
+    await Promise.all([probe(), probe(), probe()])
+    const newList = current.filter((id) => !removeFromCurrent.has(id))
+    for (const id of working) if (!newList.includes(id)) newList.push(id)
+    if (config.defaultModel && !newList.includes(config.defaultModel)) newList.push(config.defaultModel)
+    const changed = newList.join(",") !== current.join(",")
+    if (changed && newList.length) {
+      config.fallbackModels = newList
+      try { saveConfig({ fallbackModels: newList }) } catch {}
+      log(`auto-sync: updated model list (${working.length} ok, ${rateLimited.length} rate-limited, ${flaky.length} flaky, ${dead.length} dead)`)
+    } else {
+      log(`auto-sync: list unchanged (${working.length} ok, ${rateLimited.length} rate-limited, ${flaky.length} flaky, ${dead.length} dead)`)
+    }
+    syncState.working = working
+    syncState.rateLimited = rateLimited
+    syncState.flaky = flaky
+    syncState.dead = dead
+    syncState.error = ""
+    syncState.ok = true
+    modelsCache = { at: 0, data: [], ok: true }
+  } catch (err) {
+    syncState.ok = false
+    syncState.error = err.message
+    log(`auto-sync failed: ${err.message}`)
+  }
+  syncState.ms = Date.now() - start
+  syncState.running = false
+  return syncState
+}
+
+let syncTimer = null
+function scheduleSync() {
+  if (syncTimer) clearTimeout(syncTimer)
+  if (!config.autoSync || config.autoSyncIntervalMs <= 0) return
+  syncTimer = setTimeout(async () => {
+    await syncModels()
+    scheduleSync()
+  }, config.autoSyncIntervalMs)
+  if (syncTimer.unref) syncTimer.unref()
 }
 
 async function handleModels(req, res) {
@@ -346,11 +459,14 @@ async function handleApiConfig(req, res) {
       cleaned.timeoutMs = Number(cleaned.timeoutMs ?? config.timeoutMs)
       cleaned.cacheMs = Number(cleaned.cacheMs ?? config.cacheMs)
       cleaned.trustForwarded = !!cleaned.trustForwarded
+      cleaned.autoSync = cleaned.autoSync !== undefined ? !!cleaned.autoSync : config.autoSync
+      cleaned.autoSyncIntervalMs = Number(cleaned.autoSyncIntervalMs ?? config.autoSyncIntervalMs)
       if (!Array.isArray(cleaned.fallbackModels)) cleaned.fallbackModels = config.fallbackModels
       if (typeof cleaned.modelAliases !== "object" || cleaned.modelAliases === null) {
         cleaned.modelAliases = config.modelAliases
       }
       saveConfig(cleaned)
+      scheduleSync()
       log("config updated via UI")
       return json(res, 200, { config: sanitize(config) })
     } catch (err) {
@@ -377,6 +493,17 @@ async function handleStatus(req, res) {
     ua: config.ua,
     defaultModel: config.defaultModel,
     models: { total: cache.data.length, allowed: ALLOWED().size },
+    sync: {
+      ok: syncState.ok,
+      at: syncState.at,
+      running: syncState.running,
+      ms: syncState.ms,
+      working: syncState.working.length,
+      rateLimited: syncState.rateLimited.length,
+      flaky: syncState.flaky.length,
+      dead: syncState.dead.length,
+      error: syncState.error,
+    },
     requests: { total: requestStats.total, errors: requestStats.errors, lastMinute, last5m },
     recent: requestStats.recent.map(([k, count]) => ({ ...parseKey(k), count })),
   })
@@ -455,6 +582,11 @@ const server = http.createServer(async (req, res) => {
     if (p === "/api/status" && req.method === "GET") return handleStatus(req, res)
     if (p === "/api/test" && req.method === "POST") return handleTest(req, res)
     if (p === "/api/logs" && req.method === "GET") return handleLogs(req, res)
+    if (p === "/api/sync" && req.method === "POST") {
+      if (!adminAuth(req, res)) return
+      syncModels().then((s) => json(res, 200, { ok: s.ok, ...s }))
+      return
+    }
     if (p === "/api/reset" && req.method === "POST") {
       if (!adminAuth(req, res)) return
       requestStats.total = 0
@@ -495,4 +627,9 @@ server.listen(config.port, config.host, () => {
       log(`created default config: ${CONFIG_PATH}`)
     } catch {}
   }
+  if (config.autoSync) {
+    log(`auto-sync enabled (every ${Math.round(config.autoSyncIntervalMs / 60000)} min) — probing free models…`)
+    syncModels()
+  }
+  scheduleSync()
 })
