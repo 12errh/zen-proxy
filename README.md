@@ -21,7 +21,7 @@ anonymous free tier &nbsp;◦&nbsp; no accounts &nbsp;◦&nbsp; no keys &nbsp;�
 - **Anonymous access with no accounts or keys** (`Bearer public`), or bring your own Zen key (BYOK) for your own quota
 - **Smart model fallback** — when one free model is saturated, it rolls to the next
 - **Model aliases** — call them `gpt-4o` or `claude-3-5`, get routed to free models
-- **Per-IP fairness** — your real IP is forwarded so quota stays fair per user
+- **Per-IP fairness** — real client IPs are forwarded (local clients fall back to your machine's real IP, same quota bucket as opencode direct)
 - **A retro-zine management dashboard** — stats, one-click model tests, live config, and logs at `http://127.0.0.1:8787/`
 - **One-file install** on Linux, macOS, and Windows with a single `curl`
 
@@ -43,7 +43,7 @@ opencode's free `-free` models (`deepseek-v4-flash-free`, `nemotron`, `hy3-free`
     <li><b>BYOK</b> — ride anonymous <code>public</code> or bring your own Zen key (stable + no shared-pool throttling)</li>
     <li><b>Smart fallback</b> — tries models in order on <code>429</code>/<code>5xx</code>, honors <code>retry-after</code></li>
     <li><b>Model aliases</b> — e.g. <code>gpt-4o → deepseek-v4-flash-free</code>, replies rewritten back</li>
-    <li><b>Per-IP fairness</b> — forwards <code>x-real-ip</code> so each user keeps their own quota</li>
+    <li><b>Per-IP fairness</b> — real client IPs forwarded; local clients fall back to your real IP (same quota bucket as opencode direct)</li>
     <li><b>Management dashboard</b> — glass… no, sticker-style UI at <code>/</code> for stats, model tests, config &amp; logs</li>
     <li><b>Zero dependencies</b> — one <code>zen-proxy.mjs</code>, runs on any Node ≥ 18</li>
   </ul>

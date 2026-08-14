@@ -54,8 +54,10 @@ try {
 
 let reloading = false
 try {
-  fs.watch(path.dirname(CONFIG_PATH), () => {
+  const CONFIG_NAME = path.basename(CONFIG_PATH)
+  fs.watch(path.dirname(CONFIG_PATH), (_event, filename) => {
     if (reloading) return
+    if (filename && filename !== CONFIG_NAME && filename !== CONFIG_NAME + ".tmp") return
     reloading = true
     setTimeout(() => {
       config = loadConfig()
@@ -126,14 +128,24 @@ function clientIp(req) {
   return req.socket.remoteAddress ?? ""
 }
 
+function ipOmit(ip) {
+  if (!ip) return true
+  const v = ip.replace(/^::ffff:/, "").toLowerCase()
+  if (v === "::1" || v === "localhost" || v === "127.0.0.1" || /^127\./.test(v)) return true
+  if (/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(v)) return true
+  if (/^fe80:/.test(v) || /^fc/.test(v) || /^fd/.test(v)) return true
+  return false
+}
+
 function zenHeaders(req, auth) {
   const headers = {
     "content-type": "application/json",
     accept: "application/json, text/event-stream",
     authorization: auth,
     "user-agent": config.ua,
-    "x-real-ip": clientIp(req),
   }
+  const ip = clientIp(req)
+  if (!ipOmit(ip)) headers["x-real-ip"] = ip
   for (const h of ["x-opencode-session", "x-opencode-request", "x-opencode-client", "x-opencode-project"]) {
     const v = req.headers[h]
     if (typeof v === "string" && v) headers[h] = v
@@ -523,13 +535,17 @@ async function handleTest(req, res) {
     const auth = authForUpstream(req) ?? "Bearer public"
     const upstreamRes = await fetch(`${config.upstream}/chat/completions`, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        accept: "application/json",
-        authorization: auth,
-        "user-agent": config.ua,
-        "x-real-ip": req.socket.remoteAddress ?? "",
-      },
+      headers: (() => {
+        const h = {
+          "content-type": "application/json",
+          accept: "application/json",
+          authorization: auth,
+          "user-agent": config.ua,
+        }
+        const ip = req.socket.remoteAddress ?? ""
+        if (!ipOmit(ip)) h["x-real-ip"] = ip
+        return h
+      })(),
       body: JSON.stringify({ model, messages: [{ role: "user", content: "ping" }], max_tokens: 5 }),
       signal: AbortSignal.timeout(config.timeoutMs),
     })

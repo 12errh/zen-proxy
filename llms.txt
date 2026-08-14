@@ -17,7 +17,7 @@ zen-proxy solves this by injecting the correct `User-Agent` upstream and re-expo
 
 - **Endpoints**: `POST /v1/chat/completions` (stream + non-stream), `POST /v1/responses`, `GET /v1/models`, `GET /health`, dashboard at `GET /`.
 - **Auth**: anonymous via `Bearer public`; BYOK via `defaultZenKey` config or an `x-zen-key` / real bearer token.
-- **Quota**: the free tier is per-IP (`x-real-ip` is forwarded), daily request limits + lifetime token budget. Do not abuse or rotate IPs.
+- **Quota**: the free tier is per-IP; the proxy forwards the real client IP (`x-real-ip`/`x-forwarded-for` when `trustForwarded` is on), but for local/loopback clients it omits `x-real-ip` so upstream counts your machine's real IP — matching opencode direct usage and avoiding a bogus shared `127.0.0.1` bucket. Do not abuse or rotate IPs.
 - **Model fallback**: tries `fallbackModels` in order on 429/5xx and honors `retry-after`.
 - **Model aliases**: `modelAliases` maps any name (e.g. `gpt-4o`) to a free model; reply model is rewritten back.
 - **Config**: `zen-proxy.json` (hot-reloaded) or env vars: `PORT`, `HOST`, `ZEN_URL`, `ZEN_UA`, `DEFAULT_MODEL`, `FALLBACK_MODELS`, `MODEL_ALIASES`, `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED`, `TIMEOUT_MS`, `CACHE_MS`, `AUTO_SYNC`, `AUTO_SYNC_MS`, `ZEN_PROXY_CONFIG`.
