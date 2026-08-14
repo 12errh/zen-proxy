@@ -3,264 +3,298 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Zen Proxy — Liquid Glass Dashboard</title>
+<title>Zen Proxy — the free-tier hype machine</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%23ccf73a' stroke='%231a1612' stroke-width='6'/%3E%3Cpath d='M55 10 L22 58 h20 L45 90 L78 42 h-20 Z' fill='%231a1612'/%3E%3C/svg%3E">
 <style>
 :root {
-  --bg:#05070d;
-  --panel: rgba(255,255,255,.055);
-  --panel2: rgba(255,255,255,.085);
-  --border: rgba(255,255,255,.10);
-  --text:#f2f5fa;
-  --muted:#9aa7b8;
-  --accent:#5b8cff;
-  --green:#34d399;
-  --yellow:#fbbf24;
-  --red:#fb7185;
-  --radius:20px;
-  --spring: cubic-bezier(.34,1.56,.64,1);
-  --smooth: cubic-bezier(.16,1,.3,1);
+  --paper:#efe8d9;
+  --paper2:#e5dcc8;
+  --card:#f8f3e6;
+  --ink:#1a1612;
+  --ink2:#3a342a;
+  --acid:#ccf73a;
+  --coral:#ff5c39;
+  --grape:#8f7bff;
+  --sky:#8fd9ff;
+  --muted:#7d7461;
+  --line:2px solid var(--ink);
+  --sans:"Helvetica Neue",Helvetica,"Segoe UI",Arial,sans-serif;
+  --mono:ui-monospace,"SF Mono","Cascadia Code",Menlo,Consolas,monospace;
+  --serif:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif;
+  --spring:cubic-bezier(.34,1.56,.64,1);
+  --smooth:cubic-bezier(.16,1,.3,1);
 }
 * { box-sizing:border-box; margin:0; padding:0 }
-html, body { min-height:100% }
+html,body { min-height:100% }
 body {
-  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-  background:var(--bg); color:var(--text); font-size:14px; line-height:1.5;
-  overflow-x:hidden;
+  font-family:var(--sans); background:var(--paper); color:var(--ink);
+  font-size:14px; line-height:1.5; overflow-x:hidden;
+  background-image:radial-gradient(rgba(26,22,18,.09) 1px, transparent 1.3px);
+  background-size:22px 22px;
 }
-a { color:var(--accent); text-decoration:none }
+a { color:var(--ink) }
 
-/* ---------- animated aurora backdrop ---------- */
-.aurora { position:fixed; inset:0; z-index:-2; overflow:hidden;
-  background:radial-gradient(120% 120% at 50% -10%, #0a1120 0%, #05070d 60%);
-}
-.blob { position:absolute; border-radius:50%; filter:blur(70px); opacity:.55;
-  mix-blend-mode:screen; will-change:transform; }
-.b1 { width:58vmax; height:58vmax; left:-14vmax; top:-16vmax;
-  background:radial-gradient(circle at 30% 30%, #4f46e5, transparent 62%);
-  animation:drift1 26s ease-in-out infinite alternate; }
-.b2 { width:52vmax; height:52vmax; right:-16vmax; top:4vmax;
-  background:radial-gradient(circle at 60% 40%, #2563eb, transparent 62%);
-  animation:drift2 30s ease-in-out infinite alternate; }
-.b3 { width:46vmax; height:46vmax; left:18vmax; bottom:-22vmax;
-  background:radial-gradient(circle at 50% 50%, #7c3aed, transparent 62%);
-  animation:drift3 34s ease-in-out infinite alternate; }
-.b4 { width:34vmax; height:34vmax; right:24vmax; bottom:-10vmax;
-  background:radial-gradient(circle at 50% 50%, #0891b2, transparent 62%);
-  animation:drift4 22s ease-in-out infinite alternate; }
+/* ---------- soft ink-wash blobs + grain ---------- */
+.blobs { position:fixed; inset:0; z-index:-1; overflow:hidden; pointer-events:none }
+.blob { position:absolute; border-radius:50%; filter:blur(95px); will-change:transform }
+.b1 { width:52vmax; height:52vmax; left:-14vmax; top:-18vmax; background:radial-gradient(#d5f74f,transparent 65%); opacity:.5; animation:drift1 26s ease-in-out infinite alternate }
+.b2 { width:46vmax; height:46vmax; right:-15vmax; top:2vmax; background:radial-gradient(#ff9b7e,transparent 65%); opacity:.45; animation:drift2 30s ease-in-out infinite alternate }
+.b3 { width:48vmax; height:48vmax; left:16vmax; bottom:-24vmax; background:radial-gradient(#b3a2ff,transparent 65%); opacity:.45; animation:drift3 34s ease-in-out infinite alternate }
+.b4 { width:34vmax; height:34vmax; right:20vmax; bottom:-12vmax; background:radial-gradient(#8fd9ff,transparent 65%); opacity:.4; animation:drift4 22s ease-in-out infinite alternate }
 @keyframes drift1 { to { transform:translate(9vmax,6vmax) scale(1.15) } }
 @keyframes drift2 { to { transform:translate(-8vmax,8vmax) scale(1.2) } }
 @keyframes drift3 { to { transform:translate(6vmax,-7vmax) scale(1.1) } }
 @keyframes drift4 { to { transform:translate(-7vmax,-6vmax) scale(1.25) } }
-@media (prefers-reduced-motion: reduce) {
-  .blob { animation:none }
-}
+.grain { position:fixed; inset:0; z-index:70; pointer-events:none; opacity:.05; mix-blend-mode:multiply;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='300' height='300'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.55'/%3E%3C/svg%3E");
+  background-size:300px 300px }
+@media (prefers-reduced-motion: reduce) { .blob { animation:none } }
 
-/* ---------- glass primitives ---------- */
-.glass {
-  position:relative;
-  border-radius:var(--radius);
-  background:linear-gradient(160deg, rgba(255,255,255,.10), rgba(255,255,255,.03));
-  -webkit-backdrop-filter:blur(22px) saturate(180%);
-  backdrop-filter:blur(22px) saturate(180%);
-  border:1px solid var(--border);
-  box-shadow:0 24px 60px rgba(2,4,12,.55),
-             inset 0 1px 0 rgba(255,255,255,.14),
-             inset 0 -1px 0 rgba(255,255,255,.03);
-}
-.glass::before {
-  content:""; position:absolute; inset:0; border-radius:inherit; pointer-events:none;
-  background:radial-gradient(120% 60% at 20% 0%, rgba(255,255,255,.13), transparent 55%);
-  z-index:0;
-}
-.glass > * { position:relative; z-index:1 }
-@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
-  .glass { background:rgba(12,16,24,.92) }
-}
-
-/* ---------- header / capsule nav ---------- */
+/* ---------- header ---------- */
 header {
-  position:sticky; top:14px; z-index:40;
+  position:sticky; top:0; z-index:40;
   display:flex; align-items:center; gap:14px;
-  max-width:1120px; margin:14px auto 0; padding:10px 14px;
+  max-width:1120px; margin:0 auto; padding:14px 18px;
+  background:rgba(239,232,217,.86); border-bottom:var(--line);
+  -webkit-backdrop-filter:blur(10px); backdrop-filter:blur(10px);
 }
-.brand { display:flex; align-items:center; gap:10px; white-space:nowrap; font-weight:700; font-size:15px; letter-spacing:.01em }
+.brand { display:flex; align-items:center; gap:10px; white-space:nowrap }
 .brand .logo {
-  width:34px; height:34px; display:grid; place-items:center; border-radius:11px; font-size:17px;
-  background:linear-gradient(135deg,#5b8cff,#7c5cff);
-  box-shadow:0 10px 26px rgba(91,140,255,.45), inset 0 1px 0 rgba(255,255,255,.35);
+  width:36px; height:36px; display:grid; place-items:center; border-radius:10px;
+  background:var(--ink); color:var(--acid); font-size:17px;
+  border:2px solid var(--ink); box-shadow:3px 3px 0 var(--coral);
+  transform:rotate(-3deg);
 }
+.brand .txt { font-family:var(--mono); font-weight:800; font-size:14px; letter-spacing:.08em }
 nav.capsule {
-  position:relative; display:flex; align-items:center; gap:2px; padding:5px;
-  border-radius:999px; flex:1; min-width:0; overflow-x:auto; scrollbar-width:none;
+  position:relative; display:flex; align-items:center; gap:2px; padding:5px; flex:1; min-width:0;
+  background:var(--paper2); border:var(--line); border-radius:999px;
+  overflow-x:auto; scrollbar-width:none;
 }
 nav.capsule::-webkit-scrollbar { display:none }
 .nav-indicator {
   position:absolute; top:5px; left:0; height:calc(100% - 10px); border-radius:999px;
-  background:linear-gradient(135deg, rgba(255,255,255,.24), rgba(255,255,255,.07));
-  border:1px solid rgba(255,255,255,.18);
-  box-shadow:inset 0 1px 0 rgba(255,255,255,.28), 0 10px 26px rgba(0,0,0,.45);
-  -webkit-backdrop-filter:blur(10px); backdrop-filter:blur(10px);
+  background:var(--acid); border:2px solid var(--ink);
+  box-shadow:3px 3px 0 var(--ink);
   transition:transform .6s var(--spring), width .6s var(--spring);
   pointer-events:none; z-index:0;
 }
 nav button {
-  position:relative; z-index:1; flex:0 0 auto;
-  background:transparent; color:var(--muted); border:none;
-  padding:8px 18px; border-radius:999px; cursor:pointer; font-size:13px; font-weight:600;
+  position:relative; z-index:1; flex:0 0 auto; border:none; cursor:pointer;
+  background:transparent; color:var(--muted);
+  padding:8px 18px; border-radius:999px;
+  font-family:var(--mono); font-weight:800; font-size:11.5px; letter-spacing:.1em; text-transform:uppercase;
   transition:color .25s, transform .25s var(--spring);
 }
-nav button:hover { color:var(--text) }
-nav button:active { transform:scale(.94) }
-nav button.active { color:#fff }
+nav button:hover { color:var(--ink) }
+nav button:active { transform:scale(.92) }
+nav button.active { color:var(--ink) }
 .pill {
-  display:inline-flex; align-items:center; gap:8px; padding:8px 15px;
-  border-radius:999px; font-size:12px; font-weight:600; white-space:nowrap;
+  display:inline-flex; align-items:center; gap:8px; padding:8px 15px; white-space:nowrap;
+  background:var(--card); border:var(--line); border-radius:999px;
+  box-shadow:3px 3px 0 var(--ink);
+  font-family:var(--mono); font-weight:800; font-size:11px; letter-spacing:.08em; text-transform:uppercase;
 }
-.pill .dot { width:9px; height:9px; border-radius:50%; background:var(--muted); transition:.3s }
-.dot.ok { background:var(--green); box-shadow:0 0 12px var(--green) }
-.dot.bad { background:var(--red); box-shadow:0 0 12px var(--red) }
+.pill .dot { width:9px; height:9px; border-radius:50%; background:var(--muted) }
+.dot.ok { background:var(--ink); box-shadow:0 0 0 2px var(--acid) }
+.dot.bad { background:var(--coral) }
 
-main { max-width:1120px; margin:26px auto 60px; padding:0 18px }
-.banner { display:none; margin:16px auto 0; max-width:1120px; padding:13px 18px; border-radius:14px; font-size:13px;
-  background:rgba(251,113,133,.14); border:1px solid rgba(251,113,133,.4); color:var(--red); }
+/* ---------- marquee strip ---------- */
+.marquee {
+  position:relative; max-width:1084px; margin:22px auto 0; overflow:hidden;
+  border:var(--line); background:var(--acid); color:var(--ink);
+  transform:rotate(-.6deg); box-shadow:5px 5px 0 var(--ink);
+}
+.mq-track {
+  display:flex; width:max-content; animation:mq 26s linear infinite;
+  font-family:var(--mono); font-weight:800; font-size:11.5px; letter-spacing:.16em; text-transform:uppercase;
+  white-space:nowrap; padding:7px 0;
+}
+.mq-track span { padding:0 18px }
+@keyframes mq { to { transform:translateX(-50%) } }
+@media (prefers-reduced-motion: reduce) { .mq-track { animation:none } }
+
+main { max-width:1120px; margin:28px auto 70px; padding:0 18px }
+.banner {
+  display:none; max-width:1084px; margin:22px auto 0; padding:13px 18px;
+  border:var(--line); background:var(--coral); color:#fff;
+  font-family:var(--mono); font-weight:800; font-size:12px; letter-spacing:.06em; text-transform:uppercase;
+  box-shadow:5px 5px 0 var(--ink); transform:rotate(-.4deg);
+}
 .banner.error { display:block }
 
-/* ---------- tabs (liquid transition) ---------- */
+/* ---------- liquid tab transitions ---------- */
 .tab { display:none }
 .tab.active { display:block; animation:tabIn .55s var(--smooth) }
 .tab.leaving { display:block; animation:tabOut .34s ease forwards; pointer-events:none }
-@keyframes tabIn { from { opacity:0; transform:translateY(18px) scale(.985); filter:blur(9px) } to { opacity:1; transform:none; filter:none } }
-@keyframes tabOut { to { opacity:0; transform:translateY(-12px) scale(.99); filter:blur(7px) } }
-@media (prefers-reduced-motion: reduce) {
-  .tab.active { animation:none }
-}
+@keyframes tabIn { from { opacity:0; transform:translateY(20px) rotate(.5deg) scale(.985); filter:blur(8px) } to { opacity:1; transform:none; filter:none } }
+@keyframes tabOut { to { opacity:0; transform:translateY(-14px) rotate(-.4deg); filter:blur(6px) } }
+@media (prefers-reduced-motion: reduce) { .tab.active { animation:none } }
 
 /* ---------- cards ---------- */
-.cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:16px; margin-bottom:22px }
-.card { padding:20px; transition:transform .35s var(--smooth), box-shadow .35s var(--smooth) }
-.card:hover { transform:translateY(-4px);
-  box-shadow:0 34px 80px rgba(2,4,12,.6), inset 0 1px 0 rgba(255,255,255,.2) }
-.card .label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; font-weight:600 }
-.card .value { font-size:28px; font-weight:700; margin-top:8px; font-variant-numeric:tabular-nums; letter-spacing:-.02em }
-.card .value.mono { font-size:15px; letter-spacing:0 }
-.card .sub { font-size:12px; color:var(--muted); margin-top:5px }
-.card .value.green { color:var(--green) }
-.card .value.yellow { color:var(--yellow) }
+.cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:20px; margin-bottom:24px }
+.card {
+  position:relative; padding:20px;
+  background:var(--card); border:var(--line); border-radius:22px 8px 22px 8px;
+  box-shadow:8px 8px 0 var(--ink);
+  transform:rotate(var(--tilt,0));
+  transition:transform .35s var(--smooth), box-shadow .35s var(--smooth);
+}
+.card:nth-child(odd) { --tilt:-.7deg }
+.card:nth-child(even) { --tilt:.6deg }
+.card:hover { transform:translateY(-4px) rotate(0deg); box-shadow:12px 12px 0 var(--ink) }
+.card .label {
+  font-family:var(--mono); font-size:10px; font-weight:800; color:var(--muted);
+  text-transform:uppercase; letter-spacing:.14em; display:flex; align-items:center; gap:6px;
+}
+.card .label::before { content:"◦" }
+.card .value { font-size:34px; font-weight:900; margin-top:10px; letter-spacing:-.045em; font-variant-numeric:tabular-nums; text-transform:uppercase }
+.card .value.mono { font-size:15px; letter-spacing:0; text-transform:none; font-weight:800 }
+.card .sub { font-family:var(--mono); font-size:10.5px; color:var(--muted); margin-top:8px; text-transform:uppercase; letter-spacing:.08em }
+.cards .card.hero {
+  background:var(--acid); grid-column:span 2;
+}
+.cards .card.hero .label { color:var(--ink) }
+.cards .card.hero .sub { color:var(--ink) }
 
-.panel { padding:24px; margin-bottom:22px }
-.panel h2 { font-size:14px; font-weight:700; margin-bottom:18px; display:flex; align-items:center; justify-content:space-between; letter-spacing:.01em }
-.hint { font-size:12px; color:var(--muted); margin-top:6px }
+/* ---------- panels ---------- */
+.panel {
+  position:relative; padding:26px; margin-bottom:24px;
+  background:var(--card); border:var(--line); border-radius:26px 10px 26px 10px;
+  box-shadow:9px 9px 0 var(--ink);
+}
+.panel h2 {
+  display:flex; align-items:center; justify-content:space-between; margin-bottom:20px;
+  font-family:var(--mono); font-size:12.5px; font-weight:800; letter-spacing:.14em; text-transform:uppercase;
+}
+.panel h2 .hh {
+  padding:0 8px; background:linear-gradient(transparent 62%, rgba(204,247,58,.85) 62%);
+}
+.hint { font-family:var(--mono); font-size:11.5px; color:var(--muted); margin-top:8px; line-height:1.7 }
+code { background:rgba(26,22,18,.08); padding:1px 5px; border-radius:4px; font-family:var(--mono); font-size:.95em }
 
 /* ---------- table ---------- */
 table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums }
-th,td { text-align:left; padding:11px 12px; border-bottom:1px solid rgba(255,255,255,.07); font-size:13px }
-th { color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.06em }
-tbody tr { transition:background .2s }
-tbody tr:hover { background:rgba(255,255,255,.04) }
+th,td { text-align:left; padding:12px 12px; border-bottom:var(--line); font-size:13px }
+th { font-family:var(--mono); font-size:10px; font-weight:800; text-transform:uppercase; letter-spacing:.12em; color:var(--muted) }
+td { border-bottom:1px dashed rgba(26,22,18,.35) }
+tbody tr { transition:background .18s }
+tbody tr:hover { background:rgba(204,247,58,.25) }
 tbody tr:last-child td { border-bottom:none }
-.mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12.5px }
-.badge { display:inline-block; padding:3px 10px; border-radius:999px; font-size:11px; font-weight:700 }
-.badge.ok { background:rgba(52,211,153,.16); color:var(--green); box-shadow:inset 0 0 0 1px rgba(52,211,153,.25) }
-.badge.bad { background:rgba(251,113,133,.16); color:var(--red); box-shadow:inset 0 0 0 1px rgba(251,113,133,.25) }
-.badge.warn { background:rgba(251,191,36,.16); color:var(--yellow); box-shadow:inset 0 0 0 1px rgba(251,191,36,.25) }
-.badge.mut { background:rgba(255,255,255,.07); color:var(--muted); box-shadow:inset 0 0 0 1px var(--border) }
-.empty { color:var(--muted); text-align:center; padding:34px }
+.mono { font-family:var(--mono); font-size:12.5px }
+.badge { display:inline-block; padding:3px 11px; border-radius:999px; font-family:var(--mono); font-size:10.5px; font-weight:800; letter-spacing:.06em; text-transform:uppercase }
+.badge.ok { background:var(--acid); color:var(--ink); border:2px solid var(--ink) }
+.badge.bad { background:var(--coral); color:#fff; border:2px solid var(--ink) }
+.badge.warn { background:var(--grape); color:var(--ink); border:2px solid var(--ink) }
+.badge.mut { background:var(--paper2); color:var(--ink); border:2px solid var(--ink) }
+.empty { font-family:var(--serif); font-style:italic; color:var(--muted); text-align:center; padding:38px; font-size:15px }
 
 /* ---------- controls ---------- */
 button {
-  background:rgba(255,255,255,.07); color:var(--text); border:1px solid rgba(255,255,255,.14);
-  padding:8px 15px; border-radius:12px; cursor:pointer; font-size:13px; font-weight:600;
-  transition:background .2s, transform .25s var(--spring), box-shadow .2s, border-color .2s;
+  background:var(--ink); color:var(--card); border:2px solid var(--ink);
+  padding:9px 16px; border-radius:10px; cursor:pointer;
+  font-family:var(--mono); font-weight:800; font-size:11px; letter-spacing:.1em; text-transform:uppercase;
+  box-shadow:4px 4px 0 var(--ink);
+  transition:transform .2s var(--spring), box-shadow .2s, background .2s, color .2s;
 }
-button:hover { background:rgba(255,255,255,.13); border-color:rgba(255,255,255,.22); transform:translateY(-1px) }
-button:active { transform:scale(.96) }
-button:disabled { opacity:.5; cursor:not-allowed; transform:none }
-button.primary {
-  background:linear-gradient(135deg,#5b8cff,#7c5cff); border:none; color:#fff;
-  box-shadow:0 12px 30px rgba(91,140,255,.35), inset 0 1px 0 rgba(255,255,255,.3);
-}
-button.primary:hover { filter:brightness(1.08); box-shadow:0 16px 36px rgba(91,140,255,.5) }
+button:hover { transform:translate(-1px,-1px); box-shadow:6px 6px 0 var(--ink) }
+button:active { transform:translate(2px,2px); box-shadow:0 0 0 var(--ink) }
+button:disabled { opacity:.45; cursor:not-allowed; transform:none; box-shadow:4px 4px 0 var(--ink) }
+button.primary { background:var(--acid); color:var(--ink); box-shadow:5px 5px 0 var(--ink) }
+button.primary:hover { box-shadow:7px 7px 0 var(--ink) }
 input, select, textarea {
-  background:rgba(255,255,255,.06); color:var(--text); border:1px solid rgba(255,255,255,.14);
-  border-radius:12px; padding:10px 12px; font-size:13px; width:100%;
-  -webkit-backdrop-filter:blur(6px); backdrop-filter:blur(6px);
-  transition:border-color .2s, box-shadow .2s, background .2s;
+  background:#fff; color:var(--ink); border:2px solid var(--ink); border-radius:10px;
+  padding:11px 13px; font-size:13.5px; width:100%; font-family:var(--sans);
+  transition:box-shadow .2s, background .2s;
 }
-input:focus, select:focus, textarea:focus { outline:none; border-color:var(--accent);
-  box-shadow:0 0 0 3px rgba(91,140,255,.18) }
-label { display:block; font-size:11px; color:var(--muted); margin:14px 0 6px; font-weight:600; text-transform:uppercase; letter-spacing:.05em }
-.formgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:0 22px }
-textarea { resize:vertical; min-height:92px; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12.5px }
-.row { display:flex; gap:10px; align-items:center; flex-wrap:wrap }
+input:focus, select:focus, textarea:focus { outline:none; box-shadow:0 0 0 3px var(--acid) }
+label {
+  display:block; font-family:var(--mono); font-size:10.5px; font-weight:800; color:var(--ink2);
+  margin:16px 0 7px; text-transform:uppercase; letter-spacing:.12em;
+}
+label::before { content:"▸ "; color:var(--coral) }
+.formgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:0 24px }
+textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:12.5px }
+.row { display:flex; gap:12px; align-items:center; flex-wrap:wrap }
 .row .grow { flex:1 }
-.checkbox { display:flex; align-items:center; gap:10px; margin-top:16px }
-.checkbox input { width:auto; accent-color:var(--accent) }
-.checkbox span { font-size:13px }
-.testCell { transition:color .2s }
+.checkbox { display:flex; align-items:center; gap:10px; margin-top:18px }
+.checkbox input { width:auto; accent-color:var(--coral) }
+.checkbox span { font-size:13.5px }
+.checkbox code { font-size:.9em }
+.testCell { transition:color .2s; font-weight:700 }
 
 /* ---------- logs ---------- */
 .logs {
-  background:rgba(4,7,13,.6); border:1px solid rgba(255,255,255,.09); border-radius:14px;
-  padding:14px; height:430px; overflow-y:auto;
-  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12px;
-  box-shadow:inset 0 2px 14px rgba(0,0,0,.4);
+  background:#15120d; border:var(--line); border-radius:14px; padding:16px; height:430px; overflow-y:auto;
+  font-family:var(--mono); font-size:12px; color:#e9e2d2;
+  box-shadow:inset 0 2px 18px rgba(0,0,0,.5);
 }
-.logs .ts { color:var(--muted); margin-right:12px }
+.logs .ts { color:#8a806c; margin-right:14px }
 .logs .line { white-space:pre-wrap; word-break:break-all; padding:3px 0 }
-.logs .line:hover { background:rgba(255,255,255,.04) }
+.logs .line:hover { background:rgba(204,247,58,.08) }
 
 /* ---------- toast ---------- */
 .toast {
   position:fixed; bottom:26px; right:26px; z-index:60;
-  padding:14px 22px; border-radius:14px; font-size:13px; font-weight:600;
-  opacity:0; transform:translateY(10px) scale(.97); transition:.28s var(--spring); pointer-events:none;
-  background:linear-gradient(160deg, rgba(255,255,255,.14), rgba(255,255,255,.05));
-  -webkit-backdrop-filter:blur(20px) saturate(180%); backdrop-filter:blur(20px) saturate(180%);
-  border:1px solid rgba(255,255,255,.18);
-  box-shadow:0 20px 50px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.2);
+  padding:15px 24px; border-radius:12px;
+  font-family:var(--mono); font-weight:800; font-size:12px; letter-spacing:.06em;
+  background:var(--ink); color:var(--card);
+  border:2px solid var(--ink); border-left:8px solid var(--acid);
+  box-shadow:6px 6px 0 var(--ink);
+  opacity:0; transform:translateY(12px) rotate(1deg); transition:.3s var(--spring); pointer-events:none;
 }
 .toast.show { opacity:1; transform:none }
-.toast.ok { border-color:rgba(52,211,153,.4) }
-.toast.bad { border-color:rgba(251,113,133,.5) }
+.toast.bad { border-left-color:var(--coral) }
+
+/* ---------- stickers ---------- */
+.sticker {
+  display:inline-block; padding:7px 16px;
+  font-family:var(--mono); font-weight:800; font-size:10.5px; letter-spacing:.14em; text-transform:uppercase;
+  background:var(--acid); border:2px solid var(--ink); border-radius:999px;
+  box-shadow:4px 4px 0 var(--ink); transform:rotate(-4deg);
+}
+.sticker.coral { background:var(--coral); color:#fff; transform:rotate(3deg) }
+.sticker.grape { background:var(--grape); color:var(--ink); transform:rotate(-2deg) }
 
 /* ---------- auth ---------- */
 #authScreen {
   position:fixed; inset:0; z-index:100; display:none; align-items:center; justify-content:center;
-  background:rgba(4,6,12,.6);
-  -webkit-backdrop-filter:blur(8px); backdrop-filter:blur(8px);
+  background:rgba(26,22,18,.6); -webkit-backdrop-filter:blur(4px); backdrop-filter:blur(4px);
 }
-#authScreen .box { width:350px; padding:30px; border-radius:22px; animation:tabIn .5s var(--smooth) }
-#authScreen h2 { font-size:17px; margin-bottom:6px }
-#authScreen p { color:var(--muted); font-size:13px; margin-bottom:18px }
+#authScreen .box { width:360px; padding:32px; background:var(--ink); color:var(--card);
+  border:2px solid var(--ink); border-radius:18px; box-shadow:12px 12px 0 var(--acid); animation:tabIn .5s var(--smooth) }
+#authScreen h2 { font-family:var(--mono); font-size:15px; letter-spacing:.12em; text-transform:uppercase; margin-bottom:8px; color:var(--acid) }
+#authScreen p { color:#c9c1ae; font-size:13px; margin-bottom:20px }
+#authScreen .box input { background:#241f18; border-color:#4a4234; color:var(--card) }
+#authScreen .box input:focus { box-shadow:0 0 0 3px var(--acid) }
 
 @media (max-width:760px) {
-  .brand span.txt { display:none }
-  nav.capsule { overflow-x:auto }
-  .nav-indicator { display:none }
-  .pill { padding:8px 11px }
+  .brand .txt { display:none }
+  .cards .card.hero { grid-column:span 1 }
   main { padding:0 12px }
 }
 </style>
 </head>
 <body>
 
-<div class="aurora" aria-hidden="true">
-  <div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div><div class="blob b4"></div>
+<div class="blobs" aria-hidden="true">
+  <span class="blob b1"></span><span class="blob b2"></span><span class="blob b3"></span><span class="blob b4"></span>
 </div>
+<div class="grain" aria-hidden="true"></div>
 
 <div id="authScreen" style="display:none">
-  <div class="box glass">
-    <h2>Proxy key required</h2>
-    <p>This dashboard is protected. Enter the admin key (<code>PROXY_KEY</code>).</p>
-    <input type="password" id="authKey" placeholder="Admin key" autocomplete="off">
-    <div class="row" style="margin-top:16px">
+  <div class="box">
+    <h2>Locked 🔒</h2>
+    <p>This dashboard is protected. Enter the admin key (<code>PROXY_KEY</code>) to get in.</p>
+    <input type="password" id="authKey" placeholder="admin key" autocomplete="off">
+    <div class="row" style="margin-top:20px">
       <button class="primary grow" onclick="submitAuth()">Unlock</button>
     </div>
   </div>
 </div>
 
-<header class="glass">
-  <div class="brand"><span class="logo">⚡</span><span class="txt">Zen Proxy</span></div>
+<header>
+  <div class="brand"><span class="logo">⚡</span><span class="txt">ZEN·PROXY</span></div>
   <nav class="capsule" id="nav">
     <div class="nav-indicator" id="navIndicator"></div>
     <button data-tab="overview" class="active">Overview</button>
@@ -268,77 +302,83 @@ textarea { resize:vertical; min-height:92px; font-family:ui-monospace,Menlo,Cons
     <button data-tab="config">Settings</button>
     <button data-tab="logs">Logs</button>
   </nav>
-  <span class="pill glass" id="upstreamPill"><span class="dot" id="upstreamDot"></span><span id="upstreamText">checking…</span></span>
+  <span class="pill" id="upstreamPill"><span class="dot" id="upstreamDot"></span><span id="upstreamText">checking…</span></span>
 </header>
+
+<div class="marquee" aria-hidden="true">
+  <div class="mq-track">
+    <span>zen-proxy</span><span>◦</span><span>anonymous free tier</span><span>◦</span><span>no accounts</span><span>◦</span><span>no keys</span><span>◦</span><span>any openai-compatible agent</span><span>◦</span><span>100% local</span><span>◦</span><span>zen-proxy</span><span>◦</span><span>anonymous free tier</span><span>◦</span><span>no accounts</span><span>◦</span><span>no keys</span><span>◦</span><span>any openai-compatible agent</span><span>◦</span><span>100% local</span><span>◦</span>
+  </div>
+</div>
 
 <div class="banner" id="banner"></div>
 
 <main>
   <section class="tab active" id="tab-overview">
     <div class="cards">
-      <div class="card glass"><div class="label">Upstream</div><div class="value mono" id="ovUpstream" style="font-size:14px">–</div><div class="sub" id="ovUa">–</div></div>
-      <div class="card glass"><div class="label">Uptime</div><div class="value" id="ovUptime">–</div><div class="sub">seconds online</div></div>
-      <div class="card glass"><div class="label">Requests</div><div class="value" id="ovTotal">–</div><div class="sub" id="ovErr">0 errors</div></div>
-      <div class="card glass"><div class="label">Last minute</div><div class="value" id="ovMin">–</div><div class="sub" id="ov5m">– in 5 min</div></div>
-      <div class="card glass"><div class="label">Models</div><div class="value" id="ovModels">–</div><div class="sub" id="ovAllowed">– allowed</div></div>
+      <div class="card hero"><div class="label">Requests served</div><div class="value" id="ovTotal">–</div><div class="sub" id="ovErr">0 errors</div></div>
+      <div class="card"><div class="label">Upstream</div><div class="value mono" id="ovUpstream" style="font-size:14px">–</div><div class="sub" id="ovUa">–</div></div>
+      <div class="card"><div class="label">Uptime</div><div class="value" id="ovUptime">–</div><div class="sub">seconds online</div></div>
+      <div class="card"><div class="label">Last minute</div><div class="value" id="ovMin">–</div><div class="sub" id="ov5m">– in 5 min</div></div>
+      <div class="card"><div class="label">Models</div><div class="value" id="ovModels">–</div><div class="sub" id="ovAllowed">– allowed</div></div>
     </div>
 
-    <div class="panel glass">
-      <h2>Recent requests</h2>
+    <div class="panel">
+      <h2><span class="hh">Recent requests</span><span class="sticker grape" style="transform:none">live feed</span></h2>
       <table id="reqTable">
         <thead><tr><th>Time</th><th>Model</th><th>Result</th><th>Latency</th><th>Count</th></tr></thead>
-        <tbody><tr><td colspan="5" class="empty">No requests yet</td></tr></tbody>
+        <tbody><tr><td colspan="5" class="empty">no requests yet — go make some noise.</td></tr></tbody>
       </table>
     </div>
   </section>
 
   <section class="tab" id="tab-models">
-    <div class="panel glass">
-      <h2>Allowed models <span class="badge mut" id="modelCount"></span></h2>
-      <p class="hint" style="margin-bottom:14px">These are served on <code>/v1/models</code> and accepted by the proxy. Click <b>Test</b> to send a tiny completion and see live status. The default model is used when a request asks for an unknown model.</p>
+    <div class="panel">
+      <h2><span class="hh">Allowed models</span><span class="badge mut" id="modelCount"></span></h2>
+      <p class="hint" style="margin-bottom:16px">These are served on <code>/v1/models</code> and accepted by the proxy. Hit <b>TEST</b> to send a tiny completion and see live status. The default model is used when a request asks for an unknown one.</p>
       <table id="modelTable">
         <thead><tr><th>Model</th><th>Default</th><th>Last test</th><th></th></tr></thead>
         <tbody></tbody>
       </table>
-      <div class="row" style="margin-top:16px">
-        <input class="grow" id="newModel" placeholder="Add model id, e.g. nemotron-3-ultra-free">
-        <button onclick="addModel()">Add</button>
+      <div class="row" style="margin-top:18px">
+        <input class="grow" id="newModel" placeholder="add a model id, e.g. nemotron-3-ultra-free">
+        <button onclick="addModel()">+ Add</button>
       </div>
     </div>
   </section>
 
   <section class="tab" id="tab-config">
-    <div class="panel glass">
-      <h2>Server settings <span class="badge warn">port / host need restart</span></h2>
+    <div class="panel">
+      <h2><span class="hh">Server settings</span><span class="sticker coral" style="transform:none">port / host need restart</span></h2>
       <div class="formgrid">
         <div>
           <label>Host</label><input id="cfgHost" type="text">
           <label>Port</label><input id="cfgPort" type="number">
-          <label>Upstream URL</label><input id="cfgUpstream" type="text">
-          <label>User-Agent (the unlock)</label><input id="cfgUa" type="text">
+          <label>Upstream url</label><input id="cfgUpstream" type="text">
+          <label>User-agent (the unlock)</label><input id="cfgUa" type="text">
         </div>
         <div>
           <label>Default model</label><input id="cfgDefault" type="text">
           <label>Proxy key (empty = open)</label><input id="cfgProxyKey" type="password" autocomplete="new-password">
-          <label>Default Zen key (BYOK, optional)</label><input id="cfgZenKey" type="password" autocomplete="new-password">
+          <label>Zen key (byok, optional)</label><input id="cfgZenKey" type="password" autocomplete="new-password">
           <label>Timeout (ms)</label><input id="cfgTimeout" type="number">
         </div>
       </div>
-      <label>Fallback models (JSON array — tried in order on 429/5xx)</label>
+      <label>Fallback models (json array — tried in order on 429/5xx)</label>
       <textarea id="cfgFallback"></textarea>
-      <label>Model aliases (JSON map — e.g. {"gpt-4o":"deepseek-v4-flash-free"})</label>
+      <label>Model aliases (json map — e.g. {"gpt-4o":"deepseek-v4-flash-free"})</label>
       <textarea id="cfgAliases"></textarea>
       <div class="checkbox"><input type="checkbox" id="cfgTrust"><span>Trust <code>x-forwarded-for</code> from a reverse proxy</span></div>
-      <div class="row" style="margin-top:20px">
+      <div class="row" style="margin-top:22px">
         <button class="primary" onclick="saveConfig()">Save &amp; apply</button>
-        <button onclick="reloadConfig()">Discard / reload from file</button>
+        <button onclick="reloadConfig()">Discard / reload</button>
       </div>
     </div>
   </section>
 
   <section class="tab" id="tab-logs">
-    <div class="panel glass">
-      <h2>Server logs <button style="font-size:12px; padding:5px 12px" onclick="loadLogs()">Refresh</button></h2>
+    <div class="panel">
+      <h2><span class="hh">Server logs</span><button style="font-size:10.5px; padding:6px 12px" onclick="loadLogs()">Refresh</button></h2>
       <div class="logs" id="logBox"><div class="empty">Loading…</div></div>
     </div>
   </section>
@@ -426,7 +466,7 @@ async function refreshStatus() {
 function renderTable(recent) {
   const tb = $("reqTable").querySelector("tbody")
   if (!recent || !recent.length) {
-    tb.innerHTML = '<tr><td colspan="5" class="empty">No requests yet</td></tr>'
+    tb.innerHTML = '<tr><td colspan="5" class="empty">no requests yet — go make some noise.</td></tr>'
     return
   }
   tb.innerHTML = recent.slice().reverse().map((r) => {
@@ -452,7 +492,7 @@ function renderModels(st) {
   const tb = $("modelTable").querySelector("tbody")
   const list = [...new Set([...config.fallbackModels, ...Object.keys(config.modelAliases)])]
   $("modelCount").textContent = list.length + " configured"
-  if (!list.length) { tb.innerHTML = '<tr><td colspan="4" class="empty">No models configured</td></tr>'; return }
+  if (!list.length) { tb.innerHTML = '<tr><td colspan="4" class="empty">no models configured — add one.</td></tr>'; return }
   tb.innerHTML = list.map((m) => {
     const aliasTarget = config.modelAliases[m]
     const display = aliasTarget ? escapeHtml(m) + ' <span class="badge mut">→ ' + escapeHtml(aliasTarget) + "</span>" : escapeHtml(m)
@@ -461,7 +501,7 @@ function renderModels(st) {
       <td class="mono">${display}</td>
       <td><input type="radio" name="defaultModel" value="${escapeAttr(m)}" ${isDefault ? "checked" : ""} onchange="setDefault('${escapeAttr(m)}')"></td>
       <td class="mono testCell" id="tc-${escapeAttr(m)}">–</td>
-      <td class="row" style="gap:8px"><button onclick="testModel('${escapeAttr(m)}')">Test</button>${aliasTarget ? "" : `<button onclick="removeModel('${escapeAttr(m)}')">✕</button>`}</td>
+      <td class="row" style="gap:10px"><button onclick="testModel('${escapeAttr(m)}')">Test</button>${aliasTarget ? "" : `<button onclick="removeModel('${escapeAttr(m)}')">✕</button>`}</td>
     </tr>`
   }).join("")
   if (st) $("ovModels").textContent = st.models.total
@@ -481,7 +521,7 @@ async function testModel(m) {
   try {
     const r = await api("/api/test", { method: "POST", body: JSON.stringify({ model: m }) })
     const cls = r.ok ? "ok" : "bad"
-    cell.innerHTML = `<span style="color:${r.ok ? "var(--green)" : "var(--red)"}">${r.ok ? "✓" : "✗"} ${r.status} · ${fmtDur(r.ms)}</span>${r.detail ? ' <span class="hint">' + escapeHtml(r.detail.slice(0, 60)) + "</span>" : ""}`
+    cell.innerHTML = `<span style="color:${r.ok ? "var(--ink)" : "var(--coral)"}">${r.ok ? "✓" : "✗"} ${r.status} · ${fmtDur(r.ms)}</span>${r.detail ? ' <span class="hint">' + escapeHtml(r.detail.slice(0, 60)) + "</span>" : ""}`
     toast(r.ok ? m + " works" : m + " failed (" + r.status + ")", r.ok ? "ok" : "bad")
   } catch { cell.textContent = "error" }
 }
