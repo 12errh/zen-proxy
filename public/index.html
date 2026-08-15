@@ -535,9 +535,9 @@ function renderModels(st) {
   const isDefault = m === config.defaultModel
   return `<tr>
       <td class="mono">${display}${msBadge}</td>
-      <td><input type="radio" name="defaultModel" value="${escapeAttr(m)}" ${isDefault ? "checked" : ""} onchange="setDefault('${escapeAttr(m)}')"></td>
+      <td><input type="radio" name="defaultModel" value="${escapeAttr(m)}" ${isDefault ? "checked" : ""} onchange='setDefault(${jsStr(m)})'></td>
       <td class="mono testCell" id="tc-${escapeAttr(m)}">–</td>
-      <td class="row" style="gap:10px"><button onclick="testModel('${escapeAttr(m)}')">Test</button>${aliasTarget ? "" : `<button onclick="removeModel('${escapeAttr(m)}')">✕</button>`}</td>
+      <td class="row" style="gap:10px"><button onclick='testModel(${jsStr(m)})'>Test</button>${aliasTarget ? "" : `<button onclick='removeModel(${jsStr(m)})'>✕</button>`}</td>
     </tr>`
   }).join("")
   if (st) $("ovModels").textContent = st.models.total
@@ -703,6 +703,12 @@ function escapeHtml(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]))
 }
 function escapeAttr(s) { return escapeHtml(s) }
+// Safe embedding of a JS string into a single-quoted HTML attribute: HTML attribute
+// parsing does not honor \" as an escape, so JSON.stringify alone breaks double-quoted
+// attributes; \x27 and \u0026 survive attribute parsing and decode inside the JS string.
+function jsStr(s) {
+  return JSON.stringify(String(s ?? "")).replace(/'/g, "\\x27").replace(/&/g, "\\u0026")
+}
 
 async function refreshAll() {
   try { await refreshStatus(); await refreshModels() } catch (e) { if (e.message === "unauthorized") showAuth() }

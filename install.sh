@@ -22,6 +22,10 @@ info()  { printf "\033[32m%s\033[0m\n" "$*"; }
 warn()  { printf "\033[33m%s\033[0m\n" "$*"; }
 die()   { printf "\033[31m%s\033[0m\n" "$*" >&2; exit 1; }
 
+if [ -z "$INSTALL_DIR" ] || [ "$INSTALL_DIR" = "/" ]; then
+  die "Refusing to install into '$INSTALL_DIR'"
+fi
+
 command -v curl >/dev/null 2>&1 || die "curl is required. Install it first."
 command -v node >/dev/null 2>&1 || die "Node.js >= 18 is required. See https://nodejs.org"
 
@@ -30,6 +34,12 @@ if [ "$NODE_MAJOR" -lt 18 ]; then die "Node.js >= 18 is required (found $(node -
 
 mkdir -p "$INSTALL_DIR"
 info "Installing zen-proxy to $INSTALL_DIR"
+
+# Preserve an existing config across the wipe/copy below.
+CFG_BAK="$(mktemp)"
+if [ -f "$INSTALL_DIR/zen-proxy.json" ]; then
+  cp "$INSTALL_DIR/zen-proxy.json" "$CFG_BAK"
+fi
 
 if [ -n "$LOCAL_SRC" ]; then
   [ -d "$LOCAL_SRC" ] || die "Local source not found: $LOCAL_SRC"
@@ -47,6 +57,11 @@ else
   rm -rf "$TMP"
   info "Downloaded and extracted $REPO"
 fi
+
+if [ -s "$CFG_BAK" ]; then
+  cp "$CFG_BAK" "$INSTALL_DIR/zen-proxy.json"
+fi
+rm -f "$CFG_BAK"
 
 if [ ! -f "$INSTALL_DIR/zen-proxy.mjs" ]; then
   die "zen-proxy.mjs not found after install — check ZEN_PROXY_REPO"

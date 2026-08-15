@@ -28,8 +28,19 @@ if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
   Die "Node.js >= 18 is required. Install from https://nodejs.org then re-run."
 }
 
+if ([string]::IsNullOrWhiteSpace($InstallDir) -or $InstallDir -eq "/") {
+  Die "Refusing to install into '$InstallDir'"
+}
+
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 Info "Installing zen-proxy to $InstallDir"
+
+$ConfigPath = Join-Path $InstallDir "zen-proxy.json"
+$CfgBak = $null
+if (Test-Path $ConfigPath) {
+  $CfgBak = Join-Path $env:TEMP ("zen-proxy-config-" + [guid]::NewGuid().ToString() + ".json")
+  Copy-Item $ConfigPath $CfgBak -Force
+}
 
 if ($LocalSrc) {
   if (-not (Test-Path $LocalSrc)) { Die "Local source not found: $LocalSrc" }
@@ -50,11 +61,15 @@ else {
   Info "Downloaded and extracted $Repo"
 }
 
+if ($CfgBak -and (Test-Path $CfgBak)) {
+  Copy-Item $CfgBak $ConfigPath -Force
+  Remove-Item $CfgBak -Force
+}
+
 if (-not (Test-Path (Join-Path $InstallDir "zen-proxy.mjs"))) {
   Die "zen-proxy.mjs not found after install - check ZEN_PROXY_REPO"
 }
 
-$ConfigPath = Join-Path $InstallDir "zen-proxy.json"
 if (-not (Test-Path $ConfigPath)) {
   Set-Content -Path $ConfigPath -Value "{ `"host`": `"127.0.0.1`", `"port`": $Port }"
   Info "Created default config with port $Port"

@@ -5,6 +5,7 @@ import path from "node:path"
 import { fileURLToPath } from "node:url"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 const CONFIG_PATH = process.env.ZEN_PROXY_CONFIG || path.join(__dirname, "zen-proxy.json")
 const UI_PATH = path.join(__dirname, "public", "index.html")
 const ENV = process.env
@@ -53,20 +54,22 @@ try {
 } catch {}
 
 let reloading = false
-try {
-  const CONFIG_NAME = path.basename(CONFIG_PATH)
-  fs.watch(path.dirname(CONFIG_PATH), (_event, filename) => {
-    if (reloading) return
-    if (filename && filename !== CONFIG_NAME && filename !== CONFIG_NAME + ".tmp") return
-    reloading = true
-    setTimeout(() => {
-      config = loadConfig()
-      reloading = false
-      scheduleSync()
-      log("config reloaded")
-    }, 150)
-  })
-} catch {}
+if (isMain) {
+  try {
+    const CONFIG_NAME = path.basename(CONFIG_PATH)
+    fs.watch(path.dirname(CONFIG_PATH), (_event, filename) => {
+      if (reloading) return
+      if (filename && filename !== CONFIG_NAME && filename !== CONFIG_NAME + ".tmp") return
+      reloading = true
+      setTimeout(() => {
+        config = loadConfig()
+        reloading = false
+        scheduleSync()
+        log("config reloaded")
+      }, 150)
+    })
+  } catch {}
+}
 
 function saveConfig(next) {
   const merged = { ...config, ...next }
@@ -90,7 +93,29 @@ function sanitize(cfg) {
 }
 
 const ALLOWED = () => new Set([...config.fallbackModels, ...Object.values(config.modelAliases)])
-const requestStats = { total: 0, errors: 0, recent: [], perMinute: new Map() }
+const requestStats = { total: 0, errors: 0, recent: [], perMinute: new Map(), window60: [] }
+const VALID_MODEL_ID = /^[A-Za-z0-9._:@+/%-]+$/
+const MAX_BODY = 1024 * 1024
+
+function parseRetryAfter(v) {
+  if (v == null) return 0
+  const n = Number(v)
+  if (Number.isFinite(n)) return Math.max(0, n)
+  const t = Date.parse(v)
+  if (Number.isFinite(t)) return Math.max(0, (t - Date.now()) / 1000)
+  return 0
+}
+
+function toBool(v, dflt) {
+  if (v === undefined || v === null) return dflt
+  if (v === false || v === 0 || v === "0" || v === "false") return false
+  return true
+}
+
+function num(v, dflt) {
+  const n = Number(v)
+  return Number.isFinite(n) ? n : dflt
+}
 const syncState = { at: 0, ok: false, running: false, working: [], rateLimited: [], flaky: [], dead: [], error: "", ms: 0 }
 const modelHealth = new Map()
 const MAX_LOG = 500
@@ -102,10 +127,10 @@ function log(message) {
   console.log(line.msg)
 }
 
-function recordReq(req, model, ms, status) {
-  const entry = { at: Date.now(), ip: clientIp(req), model, status, ms }
+function recordReq(req, model, ms, status, at = Date.now()) {
+  const entry = { at, ip: clientIp(req), model, status, ms }
   const key = `${entry.at}|${entry.model}|${entry.status}`
-  if (!requestStats.recent.length || requestStats.recent[requestStats.recent.length - 1][1] !== key) {
+  if (!requestStats.recent.length || requestStats.recent[requestStats.recent.length - 1][0] !== key) {
     requestStats.recent.push([key, 1])
     if (requestStats.recent.length > 200) requestStats.recent.shift()
   } else {
@@ -115,13 +140,20 @@ function recordReq(req, model, ms, status) {
   if (status >= 400) requestStats.errors++
   const minute = Math.floor(entry.at / 60000)
   requestStats.perMinute.set(minute, (requestStats.perMinute.get(minute) ?? 0) + 1)
+  const cutoff = entry.at - 60_000
+  while (requestStats.window60.length && requestStats.window60[0] < cutoff) requestStats.window60.shift()
+  requestStats.window60.push(entry.at)
+  const minCutoff = minute - 60
+  for (const m of [...requestStats.perMinute.keys()]) {
+    if (m < minCutoff) requestStats.perMinute.delete(m)
+  }
 }
 
 function resolveModel(requested) {
   const id = String(requested ?? "").split("/").pop()
-  if (config.modelAliases[id]) return { requested: id, candidates: [config.modelAliases[id]] }
-  if (ALLOWED().has(id)) return { requested: id, candidates: [id] }
-  return { requested: id || config.defaultModel, candidates: [config.defaultModel] }
+  const target = config.modelAliases[id] || (ALLOWED().has(id) ? id : "") || config.defaultModel
+  const rest = config.fallbackModels.filter((m) => m !== target)
+  return { requested: id || config.defaultModel, candidates: [target, ...rest] }
 }
 
 function clientIp(req) {
@@ -193,7 +225,14 @@ async function handleChat(req, res) {
   const start = Date.now()
   let body
   try {
-    body = JSON.parse(await readBody(req))
+    const raw = await readBody(req)
+    if (raw.length > MAX_BODY) {
+      return json(res, 413, { error: { type: "invalid_request_error", message: "request body too large" } })
+    }
+    body = JSON.parse(raw)
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      return json(res, 400, { error: { type: "invalid_request_error", message: "body must be a JSON object" } })
+    }
   } catch {
     return json(res, 400, { error: { type: "invalid_request_error", message: "invalid JSON body" } })
   }
@@ -207,6 +246,7 @@ async function handleChat(req, res) {
   }
 
   let lastErr = null
+  let lastStatus = 502
   let used = requested
   for (const model of candidates) {
     used = model
@@ -221,6 +261,7 @@ async function handleChat(req, res) {
       })
     } catch (err) {
       lastErr = { error: { type: "upstream_error", message: err.message } }
+      lastStatus = 502
       continue
     }
 
@@ -247,8 +288,8 @@ async function handleChat(req, res) {
     } catch {
       lastErr = { error: { type: "upstream_error", message: `upstream returned ${upstreamRes.status}` } }
     }
-    const retryAfter = Number(upstreamRes.headers.get("retry-after") ?? 0)
-    const wait = Math.min(retryAfter * 1000, 3000)
+    lastStatus = upstreamRes.status
+    const wait = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
     if (upstreamRes.status === 429 || upstreamRes.status >= 500) {
       if (wait > 0) await new Promise((r) => setTimeout(r, wait))
       continue
@@ -256,8 +297,8 @@ async function handleChat(req, res) {
     break
   }
 
-  recordReq(req, `${requested}→${used}`, Date.now() - start, 429)
-  res.writeHead(429, { "content-type": "application/json" })
+  recordReq(req, `${requested}→${used}`, Date.now() - start, lastStatus)
+  res.writeHead(lastStatus, { "content-type": "application/json" })
   res.end(
     JSON.stringify(lastErr ?? { error: { type: "free_usage_limit_error", message: "all free models are rate-limited" } }),
   )
@@ -272,6 +313,17 @@ function relayStream(req, res, upstreamRes, requested) {
   const reader = upstreamRes.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ""
+  const ctrl = new AbortController()
+  const onAbort = () => ctrl.abort()
+  if (req.signal?.addEventListener) req.signal.addEventListener("abort", onAbort)
+  const timer = setTimeout(() => ctrl.abort(), config.timeoutMs)
+  ctrl.signal.addEventListener("abort", () => {
+    reader.cancel().catch(() => {})
+  })
+  const cleanup = () => {
+    clearTimeout(timer)
+    if (req.signal?.removeEventListener) req.signal.removeEventListener("abort", onAbort)
+  }
   const pump = async () => {
     try {
       for (;;) {
@@ -292,9 +344,11 @@ function relayStream(req, res, upstreamRes, requested) {
       }
     } catch {
       res.end()
+    } finally {
+      cleanup()
     }
   }
-  pump()
+  return pump()
 }
 
 function rewriteSSE(block, requested) {
@@ -323,32 +377,41 @@ function rewriteSSE(block, requested) {
 }
 
 let modelsCache = { at: 0, data: [], ok: false }
+let modelsFetching = null
 async function fetchModels() {
-  if (Date.now() - modelsCache.at < config.cacheMs) return modelsCache
-  try {
-    const res = await fetch(`${config.upstream}/models`, {
-      headers: { "user-agent": config.ua },
-      signal: AbortSignal.timeout(15_000),
-    })
-    if (res.ok) {
-      const parsed = await res.json()
-      const upstreamModels = parsed.data ?? []
-      const allowed = ALLOWED()
-      let free
-      if (syncState.ok && syncState.at) {
-        const live = new Set([...syncState.working, ...syncState.rateLimited])
-        free = upstreamModels.filter((m) => live.has(m.id) || allowed.has(m.id))
+  if (modelsCache.at && Date.now() - modelsCache.at < config.cacheMs) return modelsCache
+  if (modelsFetching) return modelsFetching
+  modelsFetching = (async () => {
+    try {
+      const res = await fetch(`${config.upstream}/models`, {
+        headers: { "user-agent": config.ua },
+        signal: AbortSignal.timeout(15_000),
+      })
+      if (res.ok) {
+        const parsed = await res.json()
+        const upstreamModels = parsed.data ?? []
+        const allowed = ALLOWED()
+        let free
+        if (syncState.ok && syncState.at) {
+          const live = new Set([...syncState.working, ...syncState.rateLimited])
+          free = upstreamModels.filter((m) => live.has(m.id) || allowed.has(m.id))
+        } else {
+          free = upstreamModels.filter((m) => m.id.endsWith("-free") || allowed.has(m.id))
+        }
+        modelsCache = { at: Date.now(), data: free, ok: true }
       } else {
-        free = upstreamModels.filter((m) => m.id.endsWith("-free") || allowed.has(m.id))
+        modelsCache = { at: Date.now(), data: modelsCache.data, ok: false }
       }
-      modelsCache = { at: Date.now(), data: free, ok: true }
-    } else {
+    } catch {
       modelsCache = { at: Date.now(), data: modelsCache.data, ok: false }
     }
-  } catch {
-    modelsCache = { at: Date.now(), data: modelsCache.data, ok: false }
+    return modelsCache
+  })()
+  try {
+    return await modelsFetching
+  } finally {
+    modelsFetching = null
   }
-  return modelsCache
 }
 
 async function syncModels() {
@@ -364,8 +427,8 @@ async function syncModels() {
     if (!res.ok) throw new Error(`upstream /models → ${res.status}`)
     const parsed = await res.json()
     const upstreamIds = new Set((parsed.data ?? []).map((m) => m.id))
-    const current = [...config.fallbackModels]
-    const candidates = [...new Set([...current, ...[...upstreamIds].filter((id) => id.endsWith("-free"))])]
+    const current = [...config.fallbackModels].filter((id) => VALID_MODEL_ID.test(id))
+    const candidates = [...new Set([...current, ...[...upstreamIds].filter((id) => id.endsWith("-free") && VALID_MODEL_ID.test(id))])]
     const working = []
     const rateLimited = []
     const dead = []
@@ -454,6 +517,7 @@ function scheduleSync() {
 }
 
 async function handleModels(req, res) {
+  if (!adminAuth(req, res)) return
   const cache = await fetchModels()
   json(res, 200, { object: "list", data: cache.data, ok: cache.ok })
 }
@@ -472,16 +536,22 @@ async function handleApiConfig(req, res) {
   if (req.method === "PUT") {
     try {
       const body = JSON.parse(await readBody(req))
+      if (typeof body !== "object" || body === null || Array.isArray(body)) throw new Error("body must be a JSON object")
       const cleaned = {}
       for (const key of Object.keys(DEFAULT_CONFIG)) {
         if (key in body) cleaned[key] = body[key]
       }
-      cleaned.port = Number(cleaned.port ?? config.port)
-      cleaned.timeoutMs = Number(cleaned.timeoutMs ?? config.timeoutMs)
-      cleaned.cacheMs = Number(cleaned.cacheMs ?? config.cacheMs)
-      cleaned.trustForwarded = !!cleaned.trustForwarded
-      cleaned.autoSync = cleaned.autoSync !== undefined ? !!cleaned.autoSync : config.autoSync
-      cleaned.autoSyncIntervalMs = Number(cleaned.autoSyncIntervalMs ?? config.autoSyncIntervalMs)
+      cleaned.port = num(cleaned.port ?? config.port, config.port)
+      cleaned.timeoutMs = num(cleaned.timeoutMs ?? config.timeoutMs, config.timeoutMs)
+      cleaned.cacheMs = num(cleaned.cacheMs ?? config.cacheMs, config.cacheMs)
+      cleaned.autoSyncIntervalMs = num(cleaned.autoSyncIntervalMs ?? config.autoSyncIntervalMs, config.autoSyncIntervalMs)
+      if (cleaned.cacheMs < 0) cleaned.cacheMs = config.cacheMs
+      cleaned.trustForwarded = toBool(cleaned.trustForwarded, config.trustForwarded)
+      cleaned.autoSync = toBool(cleaned.autoSync, config.autoSync)
+      if (cleaned.proxyKey === "••••••••") cleaned.proxyKey = config.proxyKey
+      if (cleaned.defaultZenKey === sanitize({ defaultZenKey: config.defaultZenKey }).defaultZenKey) {
+        cleaned.defaultZenKey = config.defaultZenKey
+      }
       if (!Array.isArray(cleaned.fallbackModels)) cleaned.fallbackModels = config.fallbackModels
       if (typeof cleaned.modelAliases !== "object" || cleaned.modelAliases === null) {
         cleaned.modelAliases = config.modelAliases
@@ -500,11 +570,12 @@ async function handleApiConfig(req, res) {
 async function handleStatus(req, res) {
   if (!adminAuth(req, res)) return
   const cache = await fetchModels()
-  const minute = Math.floor(Date.now() / 60000)
-  let lastMinute = 0
+  const now = Date.now()
+  while (requestStats.window60.length && requestStats.window60[0] < now - 60_000) requestStats.window60.shift()
+  const minute = Math.floor(now / 60000)
+  const lastMinute = requestStats.window60.length
   let last5m = 0
   for (const [m, c] of requestStats.perMinute) {
-    if (minute - m <= 1) lastMinute += c
     if (minute - m <= 5) last5m += c
   }
   json(res, 200, {
@@ -575,7 +646,7 @@ function handleLogs(req, res) {
   json(res, 200, { logs: logLines.slice(-n) })
 }
 
-const server = http.createServer(async (req, res) => {
+async function router(req, res) {
   const url = new URL(req.url, `http://${req.headers.host ?? "localhost"}`)
   const p = url.pathname
 
@@ -600,7 +671,10 @@ const server = http.createServer(async (req, res) => {
       return json(res, 404, { error: "not found" })
     }
   }
-  if (req.method === "GET" && p === "/health") return json(res, 200, { ok: true, upstream: config.upstream })
+  if (req.method === "GET" && p === "/health") {
+    const cache = await fetchModels()
+    return json(res, 200, { ok: cache.ok, upstream: config.upstream })
+  }
 
   if (p.startsWith("/api/")) {
     if (p === "/api/config") return handleApiConfig(req, res)
@@ -618,6 +692,7 @@ const server = http.createServer(async (req, res) => {
       requestStats.errors = 0
       requestStats.recent = []
       requestStats.perMinute.clear()
+      requestStats.window60 = []
       return json(res, 200, { ok: true })
     }
     return json(res, 404, { error: "not found" })
@@ -628,7 +703,9 @@ const server = http.createServer(async (req, res) => {
     return handleChat(req, res)
   }
   json(res, 404, { error: { type: "not_found", message: p } })
-})
+}
+
+const server = http.createServer(router)
 
 server.requestTimeout = 0
 server.headersTimeout = 60_000
@@ -642,19 +719,53 @@ server.on("error", (err) => {
   process.exit(1)
 })
 
-server.listen(config.port, config.host, () => {
-  log(`zen-proxy listening on http://${config.host}:${config.port}`)
-  log(`upstream ${config.upstream}  UA ${config.ua}  default ${config.defaultModel}`)
-  log(`config file: ${CONFIG_PATH}  UI: /`)
-  if (!fs.existsSync(CONFIG_PATH)) {
-    try {
-      fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2))
-      log(`created default config: ${CONFIG_PATH}`)
-    } catch {}
-  }
-  if (config.autoSync) {
-    log(`auto-sync enabled (every ${Math.round(config.autoSyncIntervalMs / 60000)} min) — probing free models…`)
-    syncModels()
-  }
-  scheduleSync()
-})
+if (isMain) {
+  server.listen(config.port, config.host, () => {
+    log(`zen-proxy listening on http://${config.host}:${config.port}`)
+    log(`upstream ${config.upstream}  UA ${config.ua}  default ${config.defaultModel}`)
+    log(`config file: ${CONFIG_PATH}  UI: /`)
+    if (!fs.existsSync(CONFIG_PATH)) {
+      try {
+        fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2))
+        log(`created default config: ${CONFIG_PATH}`)
+      } catch {}
+    }
+    if (config.autoSync) {
+      log(`auto-sync enabled (every ${Math.round(config.autoSyncIntervalMs / 60000)} min) — probing free models…`)
+      syncModels()
+    }
+    scheduleSync()
+  })
+}
+
+export {
+  isMain,
+  config,
+  loadConfig,
+  saveConfig,
+  sanitize,
+  maskKey,
+  resolveModel,
+  authForUpstream,
+  clientIp,
+  ipOmit,
+  zenHeaders,
+  recordReq,
+  requestStats,
+  handleChat,
+  relayStream,
+  rewriteSSE,
+  fetchModels,
+  handleModels,
+  handleApiConfig,
+  handleStatus,
+  handleTest,
+  handleLogs,
+  logLines,
+  router,
+  syncModels,
+  parseRetryAfter,
+  toBool,
+  MAX_BODY,
+  VALID_MODEL_ID,
+}
