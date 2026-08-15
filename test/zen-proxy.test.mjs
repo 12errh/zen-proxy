@@ -4,6 +4,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { execFileSync } from "node:child_process"
+import { fileURLToPath } from "node:url"
 
 // Must be set before importing the module (CONFIG_PATH is computed at load).
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "zen-proxy-test-"))
@@ -32,7 +33,9 @@ after(() => {
 
 const MODEL_ID_RE = /^[A-Za-z0-9._:@+/%-]+$/
 const DEFAULT_MODEL = zp.config.defaultModel
-const REPO_ROOT = new URL("..", import.meta.url).pathname
+const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url))
+// Git Bash (Windows) mangles backslash paths; forward slashes work everywhere
+const toPosix = (p) => p.replace(/\\/g, "/")
 
 // ---- harness ----
 
@@ -779,12 +782,12 @@ describe("install.sh config preservation", () => {
   function runInstall(tmp, destPort) {
     const env = {
       ...process.env,
-      HOME: path.join(tmp, "home"),
-      ZEN_PROXY_DIR: path.join(tmp, "install"),
+      HOME: toPosix(path.join(tmp, "home")),
+      ZEN_PROXY_DIR: toPosix(path.join(tmp, "install")),
       ZEN_PROXY_PORT: String(destPort),
     }
     fs.mkdirSync(env.HOME, { recursive: true })
-    execFileSync("bash", ["install.sh", "--local", path.join(tmp, "src")], { env, cwd: REPO_ROOT })
+    execFileSync("bash", ["install.sh", "--local", toPosix(path.join(tmp, "src"))], { env, cwd: REPO_ROOT })
     return env
   }
 
@@ -808,7 +811,7 @@ describe("install.sh config preservation", () => {
     const env = runInstall(tmp, 8899)
     fs.writeFileSync(path.join(env.ZEN_PROXY_DIR, "zen-proxy.json"), JSON.stringify({ user: true, port: 7777 }))
     // second run = reinstall over an existing install
-    execFileSync("bash", ["install.sh", "--local", path.join(tmp, "src")], { env, cwd: REPO_ROOT })
+    execFileSync("bash", ["install.sh", "--local", toPosix(path.join(tmp, "src"))], { env, cwd: REPO_ROOT })
     const cfg = JSON.parse(fs.readFileSync(path.join(env.ZEN_PROXY_DIR, "zen-proxy.json"), "utf8"))
     assert.deepEqual(cfg, { user: true, port: 7777 }, "user config must survive reinstall")
   })
@@ -818,9 +821,9 @@ describe("install.sh config preservation", () => {
     const src = path.join(tmp, "src")
     fs.mkdirSync(src, { recursive: true })
     fs.writeFileSync(path.join(src, "zen-proxy.mjs"), "console.log('zen-proxy')\n")
-    const env = { ...process.env, HOME: path.join(tmp, "home"), ZEN_PROXY_DIR: "/" }
+    const env = { ...process.env, HOME: toPosix(path.join(tmp, "home")), ZEN_PROXY_DIR: "/" }
     fs.mkdirSync(env.HOME, { recursive: true })
-    assert.throws(() => execFileSync("bash", ["install.sh", "--local", src], { env, cwd: REPO_ROOT }), /Refusing/)
+    assert.throws(() => execFileSync("bash", ["install.sh", "--local", toPosix(src)], { env, cwd: REPO_ROOT }), /Refusing/)
   })
 })
 
