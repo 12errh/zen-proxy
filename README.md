@@ -104,7 +104,7 @@ node zen-proxy.mjs            # or the installer's `zen-proxy` launcher
 |---|---|
 | Dashboard / admin UI | `http://127.0.0.1:8787/` |
 | OpenAI base URL | `http://127.0.0.1:8787/v1` |
-| API key | `public` (any value once you set `proxyKey`) |
+| API key | `public` (or your `proxyKey` once set) |
 | Example model | `deepseek-v4-flash-free` |
 | Health check | `http://127.0.0.1:8787/health` |
 
@@ -143,7 +143,7 @@ curl -s http://127.0.0.1:8787/v1/chat/completions \
 - **Settings** — edit host, port, upstream URL, User-Agent, proxy key, BYOK key, timeout, fallback list, aliases; saved to `zen-proxy.json` and applied instantly
 - **Logs** — live terminal-style log tail
 
-Set `proxyKey` and both the dashboard and the API require that key.
+Set `proxyKey` and the dashboard, `/api/*`, chat completions, and `/v1/models` all require it (`/health` stays open for uptime monitors).
 
 ---
 
@@ -163,7 +163,7 @@ Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded wh
 | `proxyKey` | `""` | If set, clients must send it as `Bearer`; locks the dashboard too |
 | `defaultZenKey` | `""` | Your own Zen key (BYOK) instead of anonymous `public` |
 | `trustForwarded` | `false` | Trust `x-forwarded-for`/`x-real-ip` from a reverse proxy |
-| `timeoutMs` | `120000` | Upstream timeout for non-streaming |
+| `timeoutMs` | `120000` | Upstream timeout (streaming and non-streaming) |
 | `cacheMs` | `30000` | `/v1/models` cache TTL |
 
 Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `DEFAULT_MODEL`, `FALLBACK_MODELS` (JSON), `MODEL_ALIASES` (JSON), `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED=1`, `TIMEOUT_MS`, `CACHE_MS`, `AUTO_SYNC` (`0` to disable), `AUTO_SYNC_MS`, `ZEN_PROXY_CONFIG` (custom config path).
