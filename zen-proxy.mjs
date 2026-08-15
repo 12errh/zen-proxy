@@ -131,10 +131,11 @@ function recordReq(req, model, ms, status, at = Date.now()) {
   const entry = { at, ip: clientIp(req), model, status, ms }
   const key = `${entry.at}|${entry.model}|${entry.status}`
   if (!requestStats.recent.length || requestStats.recent[requestStats.recent.length - 1][0] !== key) {
-    requestStats.recent.push([key, 1])
+    requestStats.recent.push([key, 1, ms])
     if (requestStats.recent.length > 200) requestStats.recent.shift()
   } else {
     requestStats.recent[requestStats.recent.length - 1][1]++
+    requestStats.recent[requestStats.recent.length - 1][2] = ms
   }
   requestStats.total++
   if (status >= 400) requestStats.errors++
@@ -597,7 +598,7 @@ async function handleStatus(req, res) {
       error: syncState.error,
     },
     requests: { total: requestStats.total, errors: requestStats.errors, lastMinute, last5m },
-    recent: requestStats.recent.map(([k, count]) => ({ ...parseKey(k), count })),
+    recent: requestStats.recent.map(([k, count, ms]) => ({ ...parseKey(k), count, ms })),
   })
 }
 

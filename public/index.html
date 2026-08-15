@@ -502,7 +502,7 @@ function renderTable(recent) {
       <td class="mono">${fmtTime(r.at)}</td>
       <td class="mono">${escapeHtml(r.model)}</td>
       <td><span class="badge ${cls}">${r.status}</span></td>
-      <td class="mono">${fmtDur(r.ms)}</td>
+      <td class="mono">${r.ms == null ? "—" : fmtDur(r.ms)}</td>
       <td class="mono">${r.count}</td>
     </tr>`
   }).join("")

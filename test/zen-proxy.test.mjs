@@ -292,6 +292,17 @@ describe("recordReq stats", () => {
     assert.equal(data.requests.last5m, 1)
     assert.equal(data.requests.total, 1)
   })
+
+  test("recent entries carry the real latency, not NaN", async () => {
+    const req = mockReq()
+    zp.recordReq(req, "m", 42, 200, Date.now() - 30_000)
+    globalThis.fetch = routeFetch([["/models", jsonResponse({ data: [] })]])
+    const res = mockRes()
+    await zp.handleStatus(req, res)
+    const data = JSON.parse(res.body)
+    assert.equal(data.recent.length, 1)
+    assert.equal(data.recent[0].ms, 42, "latency must be the recorded duration")
+  })
 })
 
 describe("parseRetryAfter", () => {
@@ -375,6 +386,7 @@ describe("handleChat", () => {
     const data = JSON.parse(res.body)
     assert.equal(data.model, m)
     assert.equal(zp.requestStats.recent.at(-1)[0].endsWith("|200"), true)
+    assert.equal(Number.isFinite(zp.requestStats.recent.at(-1)[2]), true, "recorded latency must be a number")
   })
 
   test("alias: upstream called with target, response rewritten to alias", async () => {
@@ -738,6 +750,20 @@ describe("router / health", () => {
     const res = mockRes()
     await zp.router(mockReq({ method: "GET", url: "/nope" }), res)
     assert.equal(res.state.status, 404)
+  })
+
+  test("/api/reset clears stats but keeps the Zen key", async () => {
+    zp.saveConfig({ proxyKey: "admin-1", defaultZenKey: "zen-keep-me" })
+    zp.requestStats.total = 42
+    const res = mockRes()
+    await zp.router(
+      mockReq({ method: "POST", url: "/api/reset", headers: { authorization: "Bearer admin-1" } }),
+      res,
+    )
+    assert.equal(res.state.status, 200)
+    assert.equal(zp.requestStats.total, 0, "reset clears request stats")
+    assert.equal(zp.config.defaultZenKey, "zen-keep-me", "reset must not clear the Zen key")
+    assert.equal(zp.config.proxyKey, "admin-1", "reset must not clear proxyKey")
   })
 })
 
