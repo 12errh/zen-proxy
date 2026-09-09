@@ -243,6 +243,63 @@ describe("ip handling", () => {
   })
 })
 
+describe("session injection", () => {
+  test("zenHeaders injects a synthetic session when none is sent", () => {
+    const h = zp.zenHeaders(mockReq({ remoteAddress: "8.8.8.8" }), "Bearer public")
+    assert.ok(h["x-opencode-session"], "session header present")
+    assert.ok(h["x-opencode-session"].startsWith("ses_"), `session looks like opencode: ${h["x-opencode-session"]}`)
+  })
+
+  test("client-provided session is passed through untouched", () => {
+    const h = zp.zenHeaders(
+      mockReq({ remoteAddress: "8.8.8.8", headers: { "x-opencode-session": "real-session-1" } }),
+      "Bearer public",
+    )
+    assert.equal(h["x-opencode-session"], "real-session-1")
+  })
+
+  test("injectSession=false disables injection", () => {
+    zp.saveConfig({ injectSession: false })
+    const h = zp.zenHeaders(mockReq({ remoteAddress: "8.8.8.8" }), "Bearer public")
+    assert.equal(h["x-opencode-session"], undefined)
+  })
+
+  test("sessionFor is stable per client and distinct across clients", () => {
+    const a1 = zp.sessionFor(mockReq({ remoteAddress: "8.8.8.8" })).value
+    const a2 = zp.sessionFor(mockReq({ remoteAddress: "8.8.8.8" })).value
+    assert.equal(a1, a2, "same client → same session")
+    const b = zp.sessionFor(mockReq({ remoteAddress: "9.9.9.9" })).value
+    assert.notEqual(a1, b, "different client → different session")
+    assert.match(a1, /^ses_[0-9a-f]{26}$/)
+    assert.ok(zp.sessionFor(mockReq()).injected, "local client gets an injected id")
+  })
+})
+
+describe("retryableUpstream", () => {
+  test("429 and 5xx are always retryable", () => {
+    assert.equal(zp.retryableUpstream(429, {}), true)
+    assert.equal(zp.retryableUpstream(502, {}), true)
+    assert.equal(zp.retryableUpstream(503, {}), true)
+  })
+
+  test("400 server_error / model unavailable is retryable", () => {
+    const body = { error: { type: "server_error", message: "Error from provider (Console): Upstream request failed: Model is unavailable." } }
+    assert.equal(zp.retryableUpstream(400, body), true)
+  })
+
+  test("MissingSessionID and RegionError are retryable", () => {
+    assert.equal(zp.retryableUpstream(400, { error: { type: "MissingSessionID", message: "OpenCode's free tier can only be used in OpenCode" } }), true)
+    assert.equal(zp.retryableUpstream(403, { error: { type: "RegionError", message: "not available in your country" } }), true)
+    assert.equal(zp.retryableUpstream(401, { error: { type: "ModelError", message: "Model hy3-free is not supported" } }), true)
+  })
+
+  test("plain client errors are not retryable", () => {
+    assert.equal(zp.retryableUpstream(400, { error: { message: "bad request" } }), false)
+    assert.equal(zp.retryableUpstream(401, { error: { message: "invalid api key" } }), false)
+    assert.equal(zp.retryableUpstream(400, { error: { type: "invalid_request_error" } }), false)
+  })
+})
+
 describe("recordReq stats", () => {
   test("dedups consecutive identical records", () => {
     const req = mockReq()
@@ -389,6 +446,26 @@ describe("handleChat", () => {
     assert.equal(Number.isFinite(zp.requestStats.recent.at(-1)[2]), true, "recorded latency must be a number")
   })
 
+  test("chat requests always carry an x-opencode-session upstream", async () => {
+    const m = zp.config.fallbackModels[0]
+    let sentHdr
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sentHdr = opts.headers["x-opencode-session"]
+          return jsonResponse({ model: "upstream-model", choices: [] })
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: m, messages: [] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 200)
+    assert.ok(sentHdr, "upstream must receive the session header")
+    assert.ok(sentHdr.startsWith("ses_"), `session header looks real: ${sentHdr}`)
+  })
+
   test("alias: upstream called with target, response rewritten to alias", async () => {
     zp.saveConfig({ modelAliases: { "gpt-4o": "deepseek-v4-flash-free" } })
     globalThis.fetch = routeFetch([
@@ -442,6 +519,31 @@ describe("handleChat", () => {
     await zp.handleChat(req, res)
     assert.equal(res.state.status, 400)
     assert.match(res.body, /bad request/)
+  })
+
+  test("falls back to next candidate when a 400 says the model is unavailable", async () => {
+    const [m1, m2] = zp.config.fallbackModels
+    let calls = []
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          const sent = JSON.parse(opts.body)
+          calls.push(sent.model)
+          if (sent.model === m1) {
+            return jsonResponse({
+              error: { type: "server_error", message: "Error from provider (Console): Upstream request failed: Model is unavailable." },
+            }, 400)
+          }
+          return jsonResponse({ model: "ok", choices: [] })
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: m1, messages: [] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 200)
+    assert.deepEqual(calls, [m1, m2], "dead default model must roll to the next candidate")
   })
 
   test("401 from upstream propagates as 401", async () => {

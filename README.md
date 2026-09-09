@@ -11,7 +11,7 @@ anonymous free tier &nbsp;◦&nbsp; no accounts &nbsp;◦&nbsp; no keys &nbsp;�
 
 > **Zen Proxy** is a zero-dependency, locally-run OpenAI-compatible proxy that unlocks opencode's Zen free tier **for any coding agent — not just opencode**.
 >
-> opencode gives you free models like `deepseek-v4-flash-free`, `hy3-free`, `mimo-v2.5-free`, and `nemotron` — but only to requests that present the right `User-Agent`. Most agents force their own identity and get shut out with `429 FreeUsageLimitError`. Zen Proxy quietly speaks for them: it injects the correct `User-Agent`, forwards your real IP, and re-exposes everything as a standard `/v1/chat/completions` + `/v1/models` API.
+> opencode gives you free models like `deepseek-v4-flash-free`, `mimo-v2.5-free`, and `nemotron` — but only to requests that look like they come from opencode itself: the right `User-Agent` **and** an `x-opencode-session` header. Most agents force their own identity and get shut out with `400 MissingSessionID` ("OpenCode's free tier can only be used in OpenCode") or `429 FreeUsageLimitError`. Zen Proxy quietly speaks for them: it injects the correct `User-Agent`, mints stable per-client session IDs, forwards your real IP, and re-exposes everything as a standard `/v1/chat/completions` + `/v1/models` API.
 >
 > The result: whatever tool you love — Cline, Roo Code, Continue, Aider, mimo, or a plain `curl` — can now ride opencode's free models with **zero accounts, zero API keys**, and zero config beyond a `baseURL`.
 
@@ -29,9 +29,9 @@ anonymous free tier &nbsp;◦&nbsp; no accounts &nbsp;◦&nbsp; no keys &nbsp;�
 
 ## why it exists
 
-opencode's free `-free` models (`deepseek-v4-flash-free`, `nemotron`, `hy3-free`, …) are only served to requests carrying the right `User-Agent`. Most coding agents — like the *mimo* CLI fork — force their own UA and get slammed with `429 FreeUsageLimitError`.
+opencode's free `-free` models (`deepseek-v4-flash-free`, `nemotron`, `mimo-v2.5-free`, …) are only served to requests that mimic the real client. Since opencode started requiring an `x-opencode-session` header, anything without it gets `400 MissingSessionID: "OpenCode's free tier can only be used in OpenCode"` — even with a valid API key. Most coding agents — like the *mimo* CLI fork — force their own identity and get slammed with that error (or `429 FreeUsageLimitError`).
 
-**zen-proxy** injects the correct `User-Agent` upstream and re-exposes everything as a plain OpenAI API. No accounts, no API keys, no source patches.
+**zen-proxy** injects the correct `User-Agent` and a stable synthetic `x-opencode-session` per client, then re-exposes everything as a plain OpenAI API. No accounts, no API keys, no source patches.
 
 > works with: **mimo cli**, **Cline**, **Roo Code**, **Continue**, **Aider**, opencode forks — anything that lets you set a `baseURL` + `apiKey`.
 
@@ -39,7 +39,7 @@ opencode's free `-free` models (`deepseek-v4-flash-free`, `nemotron`, `hy3-free`
   <p style="margin:0;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:#ccf73a;">▸ feature list</p>
   <ul style="margin:10px 0 0;padding-left:20px;line-height:1.9;font-size:14px;">
     <li><b>OpenAI-compatible API</b> — <code>/v1/chat/completions</code> (stream + non-stream), <code>/v1/models</code>, <code>/v1/responses</code></li>
-    <li><b>UA unlock</b> — injects <code>User-Agent: opencode/1.2.31</code> upstream, the key that opens the free tier</li>
+    <li><b>UA unlock</b> — injects <code>User-Agent: opencode/1.18.30</code> plus a stable per-client <code>x-opencode-session</code> upstream, the two things that open the free tier</li>
     <li><b>BYOK</b> — ride anonymous <code>public</code> or bring your own Zen key (stable + no shared-pool throttling)</li>
     <li><b>Smart fallback</b> — tries models in order on <code>429</code>/<code>5xx</code>, honors <code>retry-after</code></li>
     <li><b>Model aliases</b> — e.g. <code>gpt-4o → deepseek-v4-flash-free</code>, replies rewritten back</li>
@@ -156,9 +156,10 @@ Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded wh
 | `host` | `127.0.0.1` | Bind address (restart needed) |
 | `port` | `8787` | Listen port (restart needed) |
 | `upstream` | `https://opencode.ai/zen/v1` | Zen API base |
-| `ua` | `opencode/1.2.31` | The `User-Agent` that unlocks the free tier |
+| `ua` | `opencode/1.18.30` | The `User-Agent` that unlocks the free tier |
+| `injectSession` | `true` | Mint an `x-opencode-session` header per client (upstream rejects requests without one) |
 | `defaultModel` | `deepseek-v4-flash-free` | Used when a request names an unknown model |
-| `fallbackModels` | `["deepseek-v4-flash-free","big-pickle","hy3-free", …]` | Tried in order on `429`/`5xx` |
+| `fallbackModels` | `["deepseek-v4-flash-free","mimo-v2.5-free", …]` | Tried in order on `429`/`5xx` and dead-model `4xx` (e.g. "Model is unavailable") |
 | `modelAliases` | `{}` | e.g. `{"gpt-4o":"deepseek-v4-flash-free"}` — reply model rewritten back |
 | `proxyKey` | `""` | If set, clients must send it as `Bearer`; locks the dashboard too |
 | `defaultZenKey` | `""` | Your own Zen key (BYOK) instead of anonymous `public` |
@@ -166,7 +167,7 @@ Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded wh
 | `timeoutMs` | `120000` | Upstream timeout (streaming and non-streaming) |
 | `cacheMs` | `30000` | `/v1/models` cache TTL |
 
-Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `DEFAULT_MODEL`, `FALLBACK_MODELS` (JSON), `MODEL_ALIASES` (JSON), `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED=1`, `TIMEOUT_MS`, `CACHE_MS`, `AUTO_SYNC` (`0` to disable), `AUTO_SYNC_MS`, `ZEN_PROXY_CONFIG` (custom config path).
+Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION` (`0` to disable), `DEFAULT_MODEL`, `FALLBACK_MODELS` (JSON), `MODEL_ALIASES` (JSON), `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED=1`, `TIMEOUT_MS`, `CACHE_MS`, `AUTO_SYNC` (`0` to disable), `AUTO_SYNC_MS`, `ZEN_PROXY_CONFIG` (custom config path).
 
 ### bring your own key
 

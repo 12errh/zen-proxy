@@ -2,6 +2,7 @@
 import http from "node:http"
 import fs from "node:fs"
 import path from "node:path"
+import { randomBytes } from "node:crypto"
 import { fileURLToPath } from "node:url"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -14,18 +15,20 @@ const DEFAULT_CONFIG = {
   host: ENV.HOST ?? "127.0.0.1",
   port: Number(ENV.PORT ?? 8787),
   upstream: (ENV.ZEN_URL ?? "https://opencode.ai/zen/v1").replace(/\/+$/, ""),
-  ua: ENV.ZEN_UA ?? "opencode/1.2.31",
+  ua: ENV.ZEN_UA ?? "opencode/1.18.30",
+  injectSession: ENV.INJECT_SESSION !== "0",
   defaultModel: ENV.DEFAULT_MODEL ?? "deepseek-v4-flash-free",
   fallbackModels: JSON.parse(
     ENV.FALLBACK_MODELS ??
       JSON.stringify([
         "deepseek-v4-flash-free",
-        "big-pickle",
-        "hy3-free",
         "mimo-v2.5-free",
+        "big-pickle",
+        "ling-3.0-flash-fin-free",
         "nemotron-3.5-lightning-free",
         "nemotron-3-ultra-free",
-        "laguna-s-2.1-free",
+        "muse-spark-1.3-contributor-free",
+        "muse-spark-1.2-contributor-free",
       ]),
   ),
   modelAliases: JSON.parse(ENV.MODEL_ALIASES ?? "{}"),
@@ -97,6 +100,29 @@ const requestStats = { total: 0, errors: 0, recent: [], perMinute: new Map(), wi
 const VALID_MODEL_ID = /^[A-Za-z0-9._:@+/%-]+$/
 const MAX_BODY = 1024 * 1024
 
+// opencode's free tier requires every request to carry an `x-opencode-session`
+// header (upstream returns 400 `MissingSessionID` otherwise). Generic agents
+// never send one, so we mint stable per-client session IDs and inject them.
+const sessionPool = new Map()
+function genSessionId() {
+  return "ses_" + randomBytes(13).toString("hex")
+}
+function sessionFor(req) {
+  const incoming = req?.headers?.["x-opencode-session"]
+  if (typeof incoming === "string" && incoming.trim()) return { value: incoming.trim(), injected: false }
+  const key = req ? (ipOmit(clientIp(req)) ? "local" : clientIp(req)) : "server"
+  let id = sessionPool.get(key)
+  if (!id) {
+    id = genSessionId()
+    sessionPool.set(key, id)
+  }
+  return { value: id, injected: true }
+}
+function sessionHeader(req) {
+  if (!config.injectSession) return undefined
+  return sessionFor(req).value
+}
+
 function parseRetryAfter(v) {
   if (v == null) return 0
   const n = Number(v)
@@ -104,6 +130,30 @@ function parseRetryAfter(v) {
   const t = Date.parse(v)
   if (Number.isFinite(t)) return Math.max(0, (t - Date.now()) / 1000)
   return 0
+}
+
+const RETRYABLE_ERROR_TYPES = new Set([
+  "server_error",
+  "api_error",
+  "upstream_error",
+  "ProviderError",
+  "ModelError",
+  "MissingSessionID",
+  "RegionError",
+  "model_not_found",
+])
+// Free-tier backends fail with 4xx errors that are really per-model / per-provider
+// conditions (console says "Model is unavailable", "not supported", geo blocks…).
+// Those are not client bugs — the proxy should roll to the next candidate instead
+// of surfacing a hard 4xx. Real request errors (bad JSON, auth, context length…)
+// still break out immediately.
+function retryableUpstream(status, body) {
+  if (status === 429 || status >= 500) return true
+  if (status < 400 || status > 499) return false
+  const t = body?.error?.type ?? body?.type ?? ""
+  const msg = String(body?.error?.message ?? body?.message ?? "")
+  if (RETRYABLE_ERROR_TYPES.has(t)) return true
+  return /model is unavailable|not supported|only be used in opencode|no such model|does not exist|overloaded|temporarily.*limit|upstream request failed/i.test(msg)
 }
 
 function toBool(v, dflt) {
@@ -183,6 +233,8 @@ function zenHeaders(req, auth) {
     authorization: auth,
     "user-agent": config.ua,
   }
+  const sess = sessionFor(req)
+  if (sess.injected && config.injectSession) headers["x-opencode-session"] = sess.value
   const ip = clientIp(req)
   if (!ipOmit(ip)) headers["x-real-ip"] = ip
   for (const h of ["x-opencode-session", "x-opencode-request", "x-opencode-client", "x-opencode-project"]) {
@@ -290,8 +342,12 @@ async function handleChat(req, res) {
       lastErr = { error: { type: "upstream_error", message: `upstream returned ${upstreamRes.status}` } }
     }
     lastStatus = upstreamRes.status
-    const wait = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
-    if (upstreamRes.status === 429 || upstreamRes.status >= 500) {
+    // Try the next candidate not only on 429/5xx but also when the upstream
+    // reports a model/environment-level failure (e.g. a provider that is
+    // temporarily "unavailable", a geo-blocked free model, or a stale model id)
+    // so one dead model doesn't brick the whole request.
+    if (retryableUpstream(upstreamRes.status, lastErr)) {
+      const wait = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
       if (wait > 0) await new Promise((r) => setTimeout(r, wait))
       continue
     }
@@ -443,12 +499,17 @@ async function syncModels() {
         try {
           const r = await fetch(`${config.upstream}/chat/completions`, {
             method: "POST",
-            headers: {
-              "content-type": "application/json",
-              accept: "application/json",
-              authorization: auth,
-              "user-agent": config.ua,
-            },
+            headers: (() => {
+              const h = {
+                "content-type": "application/json",
+                accept: "application/json",
+                authorization: auth,
+                "user-agent": config.ua,
+              }
+              const sess = sessionHeader()
+              if (sess) h["x-opencode-session"] = sess
+              return h
+            })(),
             body: JSON.stringify({ model: id, messages: [{ role: "user", content: "ping" }], max_tokens: 5 }),
             signal: AbortSignal.timeout(Math.min(config.timeoutMs, 30_000)),
           })
@@ -623,6 +684,8 @@ async function handleTest(req, res) {
           authorization: auth,
           "user-agent": config.ua,
         }
+        const sess = sessionHeader(req)
+        if (sess) h["x-opencode-session"] = sess
         const ip = req.socket.remoteAddress ?? ""
         if (!ipOmit(ip)) h["x-real-ip"] = ip
         return h
@@ -766,7 +829,10 @@ export {
   router,
   syncModels,
   parseRetryAfter,
+  retryableUpstream,
   toBool,
+  sessionFor,
+  sessionHeader,
   MAX_BODY,
   VALID_MODEL_ID,
 }
