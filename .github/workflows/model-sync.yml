@@ -1,0 +1,31 @@
+name: model-sync
+
+# Keeps the shipped free-model list in sync with opencode's Zen gateway:
+# new -free models get added automatically, vanished ones get dropped, and the
+# hardcoded default stays auto (first healthy free model). Runs a few times a day
+# and can be triggered manually from the Actions tab.
+on:
+  schedule:
+    - cron: "17 */6 * * *" # every 6 hours, minute 17
+  workflow_dispatch:
+
+concurrency:
+  group: model-sync
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Sync free model list
+        run: node scripts/sync-models.mjs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}

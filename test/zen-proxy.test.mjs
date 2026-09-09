@@ -32,7 +32,7 @@ after(() => {
 })
 
 const MODEL_ID_RE = /^[A-Za-z0-9._:@+/%-]+$/
-const DEFAULT_MODEL = zp.config.defaultModel
+const DEFAULT_MODEL = zp.config.defaultModel || zp.config.fallbackModels[0] || ""
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url))
 // Git Bash (Windows) mangles backslash paths; forward slashes work everywhere
 const toPosix = (p) => p.replace(/\\/g, "/")
@@ -130,6 +130,7 @@ beforeEach(() => {
   globalThis.fetch = originalFetch
   if (originalConfig) zp.saveConfig(originalConfig)
   Object.assign(zp.requestStats, { total: 0, errors: 0, recent: [], perMinute: new Map(), window60: [] })
+  Object.assign(zp.syncState, { at: 0, ok: false, running: false, ms: 0, working: [], rateLimited: [], flaky: [], dead: [], error: "" })
 })
 beforeEach(() => {
   originalConfig = snapshotConfig()
@@ -297,6 +298,143 @@ describe("retryableUpstream", () => {
     assert.equal(zp.retryableUpstream(400, { error: { message: "bad request" } }), false)
     assert.equal(zp.retryableUpstream(401, { error: { message: "invalid api key" } }), false)
     assert.equal(zp.retryableUpstream(400, { error: { type: "invalid_request_error" } }), false)
+  })
+})
+
+describe("effectiveDefault", () => {
+  test("explicit defaultModel always wins", () => {
+    zp.saveConfig({ defaultModel: "mimo-v2.5-free", fallbackModels: ["big-pickle", "mimo-v2.5-free"] })
+    assert.equal(zp.effectiveDefault(), "mimo-v2.5-free")
+  })
+
+  test("empty default resolves to the first healthy model after a sync", async () => {
+    zp.saveConfig({ defaultModel: "", fallbackModels: ["mimo-v2.5-free", "big-pickle"], autoSyncIntervalMs: 0, cacheMs: 0 })
+    globalThis.fetch = routeFetch([
+      ["/models", jsonResponse({ data: [{ id: "mimo-v2.5-free" }, { id: "big-pickle" }] })],
+      [
+        "/chat/completions",
+        (u, opts) => {
+          const sent = JSON.parse(opts.body)
+          if (sent.model === "mimo-v2.5-free") {
+            return jsonResponse({
+              error: { type: "server_error", message: "Error from provider (Console): Upstream request failed: Model is unavailable." },
+            }, 400)
+          }
+          return jsonResponse({ model: "ok", choices: [] })
+        },
+      ],
+    ])
+    const s = await zp.syncModels()
+    assert.equal(s.ok, true)
+    assert.ok(s.working.includes("big-pickle"), "big-pickle healthy")
+    assert.ok(s.flaky.includes("mimo-v2.5-free"), "mimo currently down")
+    assert.equal(zp.effectiveDefault(), "big-pickle", "auto default must skip the dead model")
+  })
+
+  test("no sync data falls back to the first list entry", () => {
+    zp.saveConfig({ defaultModel: "", fallbackModels: ["mimo-v2.5-free", "big-pickle"] })
+    assert.equal(zp.effectiveDefault(), "mimo-v2.5-free")
+  })
+})
+
+describe("auto-UA tracking", () => {
+  test("refreshUA adopts a newer opencode version and persists it", async () => {
+    zp.saveConfig({ autoUA: true, ua: "opencode/1.18.30" })
+    globalThis.fetch = routeFetch([
+      ["registry.npmjs.org/opencode-ai/latest", jsonResponse({ version: "9.9.9" })],
+    ])
+    await zp.refreshUA(true)
+    assert.equal(zp.config.ua, "opencode/9.9.9", "UA must track the latest opencode version")
+  })
+
+  test("refreshUA leaves custom User-Agents untouched", async () => {
+    zp.saveConfig({ autoUA: true, ua: "my-agent/1.0" })
+    globalThis.fetch = routeFetch([
+      ["registry.npmjs.org/opencode-ai/latest", jsonResponse({ version: "9.9.9" })],
+    ])
+    await zp.refreshUA(true)
+    assert.equal(zp.config.ua, "my-agent/1.0", "custom UA must not be overwritten")
+  })
+
+  test("refreshUA is a no-op when autoUA is disabled", async () => {
+    zp.saveConfig({ autoUA: false, ua: "opencode/1.18.30" })
+    let hit = false
+    globalThis.fetch = async () => { hit = true; return jsonResponse({ version: "9.9.9" }) }
+    await zp.refreshUA(true)
+    assert.equal(hit, false, "must not fetch when disabled")
+    assert.equal(zp.config.ua, "opencode/1.18.30")
+  })
+})
+
+describe("sync prunes unsupported models", () => {
+  test("model that upstream no longer supports is removed immediately", async () => {
+    zp.saveConfig({ fallbackModels: ["hy3-free"], autoSyncIntervalMs: 0, cacheMs: 0 })
+    globalThis.fetch = routeFetch([
+      ["/models", jsonResponse({ data: [{ id: "hy3-free" }, { id: "mimo-v2.5-free" }] })],
+      [
+        "/chat/completions",
+        (u, opts) => {
+          const sent = JSON.parse(opts.body)
+          return sent.model === "hy3-free"
+            ? jsonResponse({ error: { type: "ModelError", message: "Model hy3-free is not supported" } }, 401)
+            : jsonResponse({ model: "ok", choices: [] })
+        },
+      ],
+    ])
+    const s = await zp.syncModels()
+    assert.equal(s.ok, true)
+    assert.ok(s.dead.includes("hy3-free"), "hy3-free reported dead")
+    assert.ok(!zp.config.fallbackModels.includes("hy3-free"), "hy3-free removed from config")
+    assert.ok(zp.config.fallbackModels.includes("mimo-v2.5-free"), "healthy model kept")
+  })
+
+  test("auth failures never punish healthy models", async () => {
+    zp.saveConfig({ fallbackModels: ["mimo-v2.5-free"], autoSyncIntervalMs: 0, cacheMs: 0 })
+    globalThis.fetch = routeFetch([
+      ["/models", jsonResponse({ data: [{ id: "mimo-v2.5-free" }] })],
+      ["/chat/completions", jsonResponse({ error: { type: "AuthError", message: "Invalid API key." } }, 401)],
+    ])
+    const s = await zp.syncModels()
+    assert.equal(s.ok, true)
+    assert.ok(s.flaky.includes("mimo-v2.5-free"), "not counted as dead")
+    assert.ok(zp.config.fallbackModels.includes("mimo-v2.5-free"), "still configured")
+  })
+})
+
+describe("auth visibility & key test", () => {
+  test("/api/status reports the effective auth mode", async () => {
+    zp.saveConfig({ defaultZenKey: "", proxyKey: "" })
+    globalThis.fetch = routeFetch([["/models", jsonResponse({ data: [] })]])
+    let res = mockRes()
+    await zp.handleStatus(mockReq(), res)
+    assert.equal(JSON.parse(res.body).auth.mode, "public")
+
+    zp.saveConfig({ defaultZenKey: "zen-secret-key-123", proxyKey: "" })
+    globalThis.fetch = routeFetch([["/models", jsonResponse({ data: [] })]])
+    res = mockRes()
+    await zp.handleStatus(mockReq(), res)
+    const st = JSON.parse(res.body)
+    assert.equal(st.auth.mode, "byok")
+    assert.ok(!JSON.parse(JSON.stringify(st.auth)).zenKey.includes("zen-secret"), "key masked")
+  })
+
+  test("/api/test sends an explicit zenKey override", async () => {
+    const m = zp.config.fallbackModels[0]
+    let sentAuth
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sentAuth = opts.headers["authorization"]
+          return jsonResponse({ model: "ok", choices: [] })
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: m, zenKey: "sk-custom-zen-key" }) })
+    const res = mockRes()
+    await zp.handleTest(req, res)
+    assert.equal(res.state.status, 200)
+    assert.equal(sentAuth, "Bearer sk-custom-zen-key")
   })
 })
 
@@ -583,7 +721,7 @@ describe("handleChat", () => {
     await zp.handleChat(req, res)
     await res.done
     assert.equal(res.state.status, 200)
-    assert.match(res.body, /"model":"deepseek-v4-flash-free"/)
+    assert.match(res.body, new RegExp(`"model":"${m.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`))
     assert.ok(res.body.includes("data: [DONE]"))
   })
 })

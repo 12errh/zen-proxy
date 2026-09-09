@@ -371,9 +371,14 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
           <label>User-agent (the unlock)</label><input id="cfgUa" type="text">
         </div>
         <div>
-          <label>Default model</label><input id="cfgDefault" type="text">
+          <label>Default model <span class="hint">(empty = auto-pick healthy free model)</span></label><input id="cfgDefault" type="text">
           <label>Proxy key (empty = open)</label><input id="cfgProxyKey" type="password" autocomplete="new-password">
           <label>Zen key (byok, optional)</label><input id="cfgZenKey" type="password" autocomplete="new-password">
+          <div class="row" style="gap:8px;margin-top:2px">
+            <button type="button" class="primary" onclick="testZenKey()" style="font-size:11px;padding:6px 10px">Test key</button>
+            <span class="hint mono" id="cfgAuth"></span>
+            <span class="hint" id="zenKeyHint" style="min-height:16px"></span>
+          </div>
           <label>Timeout (ms)</label><input id="cfgTimeout" type="number">
         </div>
       </div>
@@ -384,6 +389,9 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
       <div class="checkbox"><input type="checkbox" id="cfgTrust"><span>Trust <code>x-forwarded-for</code> from a reverse proxy</span></div>
       <div class="checkbox"><input type="checkbox" id="cfgAutoSync"><span>Auto-sync models (probe upstream free models, prune dead ones)</span></div>
       <label>Auto-sync interval (ms)</label><input id="cfgSyncMs" type="number">
+      <div class="checkbox"><input type="checkbox" id="cfgAutoUA"><span>Auto-track opencode releases &amp; update the User-Agent</span></div>
+      <label>User-agent refresh interval (ms)</label><input id="cfgUaMs" type="number">
+      <div class="checkbox"><input type="checkbox" id="cfgInject"><span>Inject <code>x-opencode-session</code> header per client (free tier needs it)</span></div>
       <div class="row" style="margin-top:22px">
         <button class="primary" onclick="saveConfig()">Save &amp; apply</button>
         <button onclick="reloadConfig()">Discard / reload</button>
@@ -467,6 +475,7 @@ async function refreshStatus() {
     $("ovUpstream").title = st.upstream
     $("ovUpstream").dataset.host = new URL(st.upstream).host || st.upstream
     $("ovUa").textContent = "UA: " + st.ua
+    $("ovUa").title = st.uaAutoVersion && st.uaAutoVersion !== (st.ua.split("/")[1] || "") ? "latest opencode: " + st.uaAutoVersion : ""
     $("ovUptime").textContent = fmtUp(st.uptime)
     $("ovTotal").textContent = st.requests.total
     $("ovErr").textContent = st.requests.errors + " errors"
@@ -594,6 +603,21 @@ async function syncNow() {
   refreshModels()
 }
 
+async function testZenKey() {
+  const hint = $("zenKeyHint")
+  hint.textContent = "testing…"
+  const zenKey = $("cfgZenKey").value
+  const body = { model: $("cfgDefault").value.trim() || (config && config.fallbackModels ? config.fallbackModels[0] : "") }
+  if (zenKey && zenKey !== savedZenKeyMasked) body.zenKey = zenKey
+  try {
+    const r = await api("/api/test", { method: "POST", body: JSON.stringify(body) })
+    hint.innerHTML = r.ok
+      ? '<span style="color:var(--ink)">✓ works (' + r.model + ")</span>"
+      : '<span style="color:var(--coral)">✗ ' + r.status + " " + escapeHtml(String(r.detail || "").slice(0, 80)) + "</span>"
+    toast(r.ok ? "Key works: " + r.model : "Key rejected (" + r.status + ")", r.ok ? "ok" : "bad")
+  } catch (e) { hint.textContent = "test failed"; toast("Test failed", "bad") }
+}
+
 async function addModel() {
   const m = $("newModel").value.trim()
   if (!m) return
@@ -622,6 +646,7 @@ async function populateConfigForm() {
   $("cfgUpstream").value = config.upstream
   $("cfgUa").value = config.ua
   $("cfgDefault").value = config.defaultModel
+  $("cfgDefault").placeholder = "(auto)"
   $("cfgProxyKey").value = config.proxyKey === "••••••••" ? "" : config.proxyKey
   $("cfgZenKey").value = savedZenKeyMasked
   $("cfgTimeout").value = config.timeoutMs
@@ -630,6 +655,21 @@ async function populateConfigForm() {
   $("cfgTrust").checked = !!config.trustForwarded
   $("cfgAutoSync").checked = config.autoSync !== false
   $("cfgSyncMs").value = config.autoSyncIntervalMs ?? 3600000
+  $("cfgAutoUA").checked = config.autoUA !== false
+  $("cfgUaMs").value = config.uaRefreshMs ?? 21600000
+  $("cfgInject").checked = config.injectSession !== false
+  try {
+    const st = await api("/api/status")
+    const auth = st.auth || {}
+    const modeLabel =
+      auth.mode === "proxy+byok" ? "proxy key + your zen key"
+      : auth.mode === "byok" ? "your zen key"
+      : auth.mode === "proxy" ? "proxy key"
+      : "anonymous public"
+    const eff = st.effectiveDefault ? " · auto→" + st.effectiveDefault : ""
+    $("cfgDefault").placeholder = eff ? "auto → " + st.effectiveDefault : "(auto)"
+    $("cfgAuth").textContent = "auth: " + modeLabel + (auth.zenKey ? " (" + auth.zenKey + ")" : "") + eff
+  } catch {}
 }
 
 async function saveConfig() {
@@ -646,6 +686,9 @@ async function saveConfig() {
     trustForwarded: $("cfgTrust").checked,
     autoSync: $("cfgAutoSync").checked,
     autoSyncIntervalMs: Number($("cfgSyncMs").value || 3600000),
+    autoUA: $("cfgAutoUA").checked,
+    uaRefreshMs: Number($("cfgUaMs").value || 21600000),
+    injectSession: $("cfgInject").checked,
   }
   if ($("cfgZenKey").value !== savedZenKeyMasked) body.defaultZenKey = $("cfgZenKey").value
   try {

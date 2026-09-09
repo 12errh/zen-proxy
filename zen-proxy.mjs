@@ -16,15 +16,20 @@ const DEFAULT_CONFIG = {
   port: Number(ENV.PORT ?? 8787),
   upstream: (ENV.ZEN_URL ?? "https://opencode.ai/zen/v1").replace(/\/+$/, ""),
   ua: ENV.ZEN_UA ?? "opencode/1.18.30",
+  autoUA: ENV.AUTO_UA !== "0",
+  uaRefreshMs: Number(ENV.UA_REFRESH_MS ?? 6 * 3600_000),
   injectSession: ENV.INJECT_SESSION !== "0",
-  defaultModel: ENV.DEFAULT_MODEL ?? "deepseek-v4-flash-free",
+  // "" = auto: at request time the first *healthy* free model becomes the default
+  // (see effectiveDefault), so a vanished model like deepseek-v4-flash-free never
+  // bricks new installs. Set an explicit model here to pin it.
+  defaultModel: ENV.DEFAULT_MODEL ?? "",
   fallbackModels: JSON.parse(
     ENV.FALLBACK_MODELS ??
       JSON.stringify([
-        "deepseek-v4-flash-free",
         "mimo-v2.5-free",
         "big-pickle",
         "ling-3.0-flash-fin-free",
+        "deepseek-v4-flash-free",
         "nemotron-3.5-lightning-free",
         "nemotron-3-ultra-free",
         "muse-spark-1.3-contributor-free",
@@ -68,6 +73,7 @@ if (isMain) {
         config = loadConfig()
         reloading = false
         scheduleSync()
+        scheduleUA()
         log("config reloaded")
       }, 150)
     })
@@ -200,11 +206,22 @@ function recordReq(req, model, ms, status, at = Date.now()) {
   }
 }
 
+// Effective default model: an explicit config.defaultModel always wins; when it's
+// empty (auto), prefer the first fallback model the last auto-sync saw as healthy
+// so a dead hardcoded default never stalls requests.
+function effectiveDefault() {
+  if (config.defaultModel) return config.defaultModel
+  const synced = new Set([...(syncState.working ?? []), ...(syncState.rateLimited ?? [])])
+  for (const m of config.fallbackModels) if (synced.has(m)) return m
+  return config.fallbackModels[0] ?? ""
+}
+
 function resolveModel(requested) {
+  const dflt = effectiveDefault()
   const id = String(requested ?? "").split("/").pop()
-  const target = config.modelAliases[id] || (ALLOWED().has(id) ? id : "") || config.defaultModel
+  const target = config.modelAliases[id] || (ALLOWED().has(id) ? id : "") || dflt
   const rest = config.fallbackModels.filter((m) => m !== target)
-  return { requested: id || config.defaultModel, candidates: [target, ...rest] }
+  return { requested: id || dflt, candidates: [target, ...rest] }
 }
 
 function clientIp(req) {
@@ -448,12 +465,13 @@ async function fetchModels() {
         const parsed = await res.json()
         const upstreamModels = parsed.data ?? []
         const allowed = ALLOWED()
+        const dead = new Set(syncState.dead)
         let free
         if (syncState.ok && syncState.at) {
           const live = new Set([...syncState.working, ...syncState.rateLimited])
-          free = upstreamModels.filter((m) => live.has(m.id) || allowed.has(m.id))
+          free = upstreamModels.filter((m) => (live.has(m.id) || allowed.has(m.id)) && !dead.has(m.id))
         } else {
-          free = upstreamModels.filter((m) => m.id.endsWith("-free") || allowed.has(m.id))
+          free = upstreamModels.filter((m) => (m.id.endsWith("-free") || allowed.has(m.id)) && !dead.has(m.id))
         }
         modelsCache = { at: Date.now(), data: free, ok: true }
       } else {
@@ -514,21 +532,32 @@ async function syncModels() {
             signal: AbortSignal.timeout(Math.min(config.timeoutMs, 30_000)),
           })
           let bodyErr = ""
-          if (r.status === 200) {
-            try {
-              const j = await r.json()
-              if (j && j.error) bodyErr = (j.error.type || "") + " " + (j.error.message || "")
-            } catch {}
-          }
+          try {
+            const j = await r.json()
+            if (j && (j.error || j.type === "error")) {
+              const e = j.error ?? j
+              bodyErr = (e.type || "") + " " + (e.message || "")
+            }
+          } catch {}
           if (r.ok && !bodyErr) { working.push(id); modelHealth.set(id, 0) }
           else if (r.status === 429 && !bodyErr) { rateLimited.push(id); modelHealth.set(id, 0) }
           else {
-            const definiteDead = r.status === 404 || /model_not_found|no such model|does not exist/i.test(bodyErr || `${r.status}`)
+            // Model gone / not supported upstream ("Model hy3-free is not supported",
+            // "does not exist", 404…) → remove immediately, no grace period needed.
+            const notSupported =
+              r.status === 404 ||
+              /model_not_found|no such model|does not exist|not supported/i.test(bodyErr)
+            // Key/auth problems are not model problems — never punish a healthy
+            // model because the configured key is bad.
+            const authErr = /AuthError|invalid api key|missing api key/i.test(bodyErr)
             const fails = (modelHealth.get(id) ?? 0) + 1
-            modelHealth.set(id, fails)
-            if (definiteDead) { dead.push(id); removeFromCurrent.add(id) }
-            else if (fails >= 2) { dead.push(id); removeFromCurrent.add(id) }
-            else { flaky.push(id) }
+            if (notSupported) { dead.push(id); removeFromCurrent.add(id) }
+            else if (authErr) { flaky.push(id) }
+            else {
+              modelHealth.set(id, fails)
+              if (fails >= 2) { dead.push(id); removeFromCurrent.add(id) }
+              else { flaky.push(id) }
+            }
           }
         } catch {
           const fails = (modelHealth.get(id) ?? 0) + 1
@@ -541,7 +570,6 @@ async function syncModels() {
     await Promise.all([probe(), probe(), probe()])
     const newList = current.filter((id) => !removeFromCurrent.has(id))
     for (const id of working) if (!newList.includes(id)) newList.push(id)
-    if (config.defaultModel && !newList.includes(config.defaultModel)) newList.push(config.defaultModel)
     const changed = newList.join(",") !== current.join(",")
     if (changed && newList.length) {
       config.fallbackModels = newList
@@ -578,6 +606,46 @@ function scheduleSync() {
   if (syncTimer.unref) syncTimer.unref()
 }
 
+// Auto-UA: opencode ships new versions regularly; keeping the injected
+// `opencode/<version>` User-Agent current future-proofs the free-tier unlock.
+const uaAutoState = { at: 0, version: "" }
+async function refreshUA(force = false) {
+  if (!config.autoUA) return ""
+  const now = Date.now()
+  if (!force && uaAutoState.at && now - uaAutoState.at < config.uaRefreshMs) return uaAutoState.version
+  uaAutoState.at = now
+  try {
+    const res = await fetch("https://registry.npmjs.org/opencode-ai/latest", {
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(10_000),
+    })
+    if (!res.ok) return uaAutoState.version
+    const data = await res.json()
+    const v = String(data?.version ?? "")
+    if (!/^\d+\.\d+\.\d+/.test(v)) return uaAutoState.version
+    uaAutoState.version = v
+    const next = `opencode/${v}`
+    if (next !== config.ua && /^opencode\/\d+\.\d+\.\d+/.test(config.ua)) {
+      log(`auto-UA: opencode ${v} released — updating User-Agent`)
+      try { saveConfig({ ua: next }) } catch {}
+    }
+    return v
+  } catch {
+    return uaAutoState.version
+  }
+}
+
+let uaTimer = null
+function scheduleUA() {
+  if (uaTimer) clearTimeout(uaTimer)
+  if (!config.autoUA || config.uaRefreshMs <= 0) return
+  uaTimer = setTimeout(async () => {
+    await refreshUA()
+    scheduleUA()
+  }, config.uaRefreshMs)
+  if (uaTimer.unref) uaTimer.unref()
+}
+
 async function handleModels(req, res) {
   if (!adminAuth(req, res)) return
   const cache = await fetchModels()
@@ -607,9 +675,12 @@ async function handleApiConfig(req, res) {
       cleaned.timeoutMs = num(cleaned.timeoutMs ?? config.timeoutMs, config.timeoutMs)
       cleaned.cacheMs = num(cleaned.cacheMs ?? config.cacheMs, config.cacheMs)
       cleaned.autoSyncIntervalMs = num(cleaned.autoSyncIntervalMs ?? config.autoSyncIntervalMs, config.autoSyncIntervalMs)
+      cleaned.uaRefreshMs = num(cleaned.uaRefreshMs ?? config.uaRefreshMs, config.uaRefreshMs)
       if (cleaned.cacheMs < 0) cleaned.cacheMs = config.cacheMs
       cleaned.trustForwarded = toBool(cleaned.trustForwarded, config.trustForwarded)
       cleaned.autoSync = toBool(cleaned.autoSync, config.autoSync)
+      cleaned.autoUA = toBool(cleaned.autoUA, config.autoUA)
+      cleaned.injectSession = toBool(cleaned.injectSession, config.injectSession)
       if (cleaned.proxyKey === "••••••••") cleaned.proxyKey = config.proxyKey
       if (cleaned.defaultZenKey === sanitize({ defaultZenKey: config.defaultZenKey }).defaultZenKey) {
         cleaned.defaultZenKey = config.defaultZenKey
@@ -620,6 +691,7 @@ async function handleApiConfig(req, res) {
       }
       saveConfig(cleaned)
       scheduleSync()
+      scheduleUA()
       log("config updated via UI")
       return json(res, 200, { config: sanitize(config) })
     } catch (err) {
@@ -640,12 +712,16 @@ async function handleStatus(req, res) {
   for (const [m, c] of requestStats.perMinute) {
     if (minute - m <= 5) last5m += c
   }
+  const authMode = config.defaultZenKey ? (config.proxyKey ? "proxy+byok" : "byok") : config.proxyKey ? "proxy" : "public"
   json(res, 200, {
     uptime: Math.floor(process.uptime()),
     upstreamOk: cache.ok,
     upstream: config.upstream,
     ua: config.ua,
+    uaAutoVersion: uaAutoState.version,
     defaultModel: config.defaultModel,
+    effectiveDefault: effectiveDefault(),
+    auth: { mode: authMode, zenKey: maskKey(config.defaultZenKey), proxyKey: !!config.proxyKey },
     models: { total: cache.data.length, allowed: ALLOWED().size },
     sync: {
       ok: syncState.ok,
@@ -672,9 +748,14 @@ async function handleTest(req, res) {
   if (!adminAuth(req, res)) return
   try {
     const body = JSON.parse(await readBody(req))
-    const model = String(body.model ?? config.defaultModel)
+    const model = String(body.model ?? effectiveDefault())
     const start = Date.now()
-    const auth = authForUpstream(req) ?? "Bearer public"
+    // Explicit key override lets the dashboard "test my key" flow verify a typed
+    // key before saving it. Falls back to the normal auth path otherwise.
+    const auth =
+      typeof body.zenKey === "string" && body.zenKey.trim()
+        ? `Bearer ${body.zenKey.trim()}`
+        : (authForUpstream(req) ?? "Bearer public")
     const upstreamRes = await fetch(`${config.upstream}/chat/completions`, {
       method: "POST",
       headers: (() => {
@@ -786,7 +867,7 @@ server.on("error", (err) => {
 if (isMain) {
   server.listen(config.port, config.host, () => {
     log(`zen-proxy listening on http://${config.host}:${config.port}`)
-    log(`upstream ${config.upstream}  UA ${config.ua}  default ${config.defaultModel}`)
+    log(`upstream ${config.upstream}  UA ${config.ua}  default ${config.defaultModel || "(auto)"}`)
     log(`config file: ${CONFIG_PATH}  UI: /`)
     if (!fs.existsSync(CONFIG_PATH)) {
       try {
@@ -794,11 +875,16 @@ if (isMain) {
         log(`created default config: ${CONFIG_PATH}`)
       } catch {}
     }
+    if (config.autoUA) {
+      log("auto-UA enabled — checking for new opencode releases…")
+      refreshUA()
+    }
     if (config.autoSync) {
       log(`auto-sync enabled (every ${Math.round(config.autoSyncIntervalMs / 60000)} min) — probing free models…`)
       syncModels()
     }
     scheduleSync()
+    scheduleUA()
   })
 }
 
@@ -810,12 +896,14 @@ export {
   sanitize,
   maskKey,
   resolveModel,
+  effectiveDefault,
   authForUpstream,
   clientIp,
   ipOmit,
   zenHeaders,
   recordReq,
   requestStats,
+  syncState,
   handleChat,
   relayStream,
   rewriteSSE,
@@ -828,6 +916,9 @@ export {
   logLines,
   router,
   syncModels,
+  scheduleSync,
+  refreshUA,
+  scheduleUA,
   parseRetryAfter,
   retryableUpstream,
   toBool,

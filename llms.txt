@@ -4,7 +4,7 @@
 
 ## The problem this solves
 
-opencode's Zen gateway serves its free `-free` models (`deepseek-v4-flash-free`, `mimo-v2.5-free`, `nemotron-*-free`, `big-pickle`, `ling-3.0-flash-fin-free`, etc.) **only to requests that mimic the opencode client**.
+opencode's Zen gateway serves its free `-free` models (`mimo-v2.5-free`, `big-pickle`, `ling-3.0-flash-fin-free`, `nemotron-*-free`, etc.) **only to requests that mimic the opencode client**.
 
 - With the right UA plus an `x-opencode-session` header, `POST https://opencode.ai/zen/v1/chat/completions` with `Authorization: Bearer public` returns HTTP 200.
 - Without the session header the gateway returns **400 MissingSessionID** — `"OpenCode's free tier can only be used in OpenCode"` (this happens even with a valid API key).
@@ -20,8 +20,8 @@ zen-proxy solves this by injecting the correct `User-Agent` and a stable per-cli
 - **Quota**: the free tier is per-IP; the proxy forwards the real client IP (`x-real-ip`/`x-forwarded-for` when `trustForwarded` is on), but for local/loopback clients it omits `x-real-ip` so upstream counts your machine's real IP — matching opencode direct usage and avoiding a bogus shared `127.0.0.1` bucket. Do not abuse or rotate IPs.
 - **Model fallback**: tries `fallbackModels` in order on 429/5xx **and** on dead-model 4xx responses (e.g. `Model is unavailable`, geo-blocked free models, `Model not supported`), honors `retry-after`.
 - **Model aliases**: `modelAliases` maps any name (e.g. `gpt-4o`) to a free model; reply model is rewritten back.
-- **Config**: `zen-proxy.json` (hot-reloaded) or env vars: `PORT`, `HOST`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION`, `DEFAULT_MODEL`, `FALLBACK_MODELS`, `MODEL_ALIASES`, `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED`, `TIMEOUT_MS`, `CACHE_MS`, `AUTO_SYNC`, `AUTO_SYNC_MS`, `ZEN_PROXY_CONFIG`.
-- **Auto model sync**: probes every upstream free model with a tiny completion (sending a session header, matching real traffic), prunes models that are dead (404 / fail twice in a row), re-adds recovered ones, and updates the config automatically — no hand-tuning.
+- **Config**: `zen-proxy.json` (hot-reloaded) or env vars: `PORT`, `HOST`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION`, `AUTO_UA`, `UA_REFRESH_MS`, `DEFAULT_MODEL`, `FALLBACK_MODELS`, `MODEL_ALIASES`, `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED`, `TIMEOUT_MS`, `CACHE_MS`, `AUTO_SYNC`, `AUTO_SYNC_MS`, `ZEN_PROXY_CONFIG`.
+- **Auto model sync**: probes every upstream free model with a tiny completion (sending a session header, matching real traffic), prunes vanished/unsupported models immediately, re-adds recovered ones, and updates the config automatically — no hand-tuning. A GitHub Action keeps the shipped list in the repo current too.
 - **Requirements**: Node.js >= 18. Zero npm dependencies.
 
 ## Install
@@ -44,7 +44,7 @@ Or clone and run: `git clone https://github.com/12errh/zen-proxy.git && cd zen-p
     "zen": {
       "baseURL": "http://127.0.0.1:8787/v1",
       "apiKey": "public",
-      "models": { "deepseek-v4-flash-free": {} }
+      "models": { "mimo-v2.5-free": {} }
     }
   }
 }
@@ -55,7 +55,7 @@ Quick test:
 ```bash
 curl -s http://127.0.0.1:8787/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-v4-flash-free","messages":[{"role":"user","content":"say hi"}]}'
+  -d '{"model":"mimo-v2.5-free","messages":[{"role":"user","content":"say hi"}]}'
 ```
 
 ## More
