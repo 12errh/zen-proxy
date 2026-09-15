@@ -162,6 +162,41 @@ function retryableUpstream(status, body) {
   return /model is unavailable|not supported|only be used in opencode|no such model|does not exist|overloaded|temporarily.*limit|upstream request failed/i.test(msg)
 }
 
+function isResponsesModel(id) {
+  return /muse-spark/i.test(String(id))
+}
+
+function chatMessagesToInput(messages) {
+  if (!Array.isArray(messages)) return String(messages ?? "")
+  return messages
+    .map((m) => {
+      const role = m?.role ?? "user"
+      const c = m?.content
+      const text = typeof c === "string" ? c : Array.isArray(c) ? c.map((p) => p?.text ?? p?.content ?? "").join("\n") : String(c ?? "")
+      if (role === "system") return `[SYSTEM] ${text}`
+      if (role === "user") return text
+      if (role === "assistant") return text
+      return `${role}: ${text}`
+    })
+    .join("\n\n")
+}
+
+function responsesOutputToText(data) {
+  if (!data || typeof data !== "object") return ""
+  if (typeof data.output_text === "string" && data.output_text) return data.output_text
+  const out = data.output
+  if (Array.isArray(out)) {
+    const texts = []
+    for (const item of out) {
+      if (item?.type === "message" && Array.isArray(item.content)) {
+        for (const c of item.content) if (c?.type === "output_text" && c.text) texts.push(c.text)
+      } else if (item?.type === "text" && item.text) texts.push(item.text)
+    }
+    if (texts.length) return texts.join("\n\n")
+  }
+  return ""
+}
+
 function toBool(v, dflt) {
   if (v === undefined || v === null) return dflt
   if (v === false || v === 0 || v === "0" || v === "false") return false
@@ -320,10 +355,26 @@ async function handleChat(req, res) {
   let used = requested
   for (const model of candidates) {
     used = model
-    const payload = { ...body, model }
+    const useResponses = isResponsesModel(model)
+    const endpoint = useResponses ? "/responses" : "/chat/completions"
+    let payload
+    if (useResponses) {
+      const input = chatMessagesToInput(body.messages)
+      payload = { model, input, stream: !!body.stream }
+      if (body.temperature != null) payload.temperature = body.temperature
+      if (body.top_p != null) payload.top_p = body.top_p
+      // Muse Spark is reasoning-heavy (~900 reasoning tokens for a simple prompt).
+      // Forwarding a tiny max_tokens/max_output_tokens (e.g. 5) truncates before any
+      // visible text is produced (upstream returns reasoning only + empty output_text).
+      // Only forward when the caller asks for a reasonably large budget.
+      const mt = body.max_completion_tokens ?? body.max_tokens
+      if (mt != null && Number(mt) >= 256) payload.max_output_tokens = Number(mt)
+    } else {
+      payload = { ...body, model }
+    }
     let upstreamRes
     try {
-      upstreamRes = await fetch(`${config.upstream}/chat/completions`, {
+      upstreamRes = await fetch(`${config.upstream}${endpoint}`, {
         method: "POST",
         headers: zenHeaders(req, auth),
         body: JSON.stringify(payload),
@@ -338,12 +389,45 @@ async function handleChat(req, res) {
     if (upstreamRes.ok) {
       const contentType = upstreamRes.headers.get("content-type") ?? "application/json"
       if (isStream) {
+        // For responses API streaming the SSE shape differs; for now treat as non-stream fallback
+        if (useResponses) {
+          try {
+            const data = await upstreamRes.json()
+            const text = responsesOutputToText(data)
+            const chatResp = {
+              id: data.id ?? `chatcmpl-${Date.now()}`,
+              object: "chat.completion",
+              created: Math.floor(Date.now() / 1000),
+              model: requested,
+              choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
+              usage: data.usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+            }
+            recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
+            return json(res, 200, chatResp)
+          } catch {
+            recordReq(req, requested, Date.now() - start, 502)
+            return json(res, 502, { error: { type: "upstream_error", message: "bad upstream response" } })
+          }
+        }
         relayStream(req, res, upstreamRes, requested)
         res.on("finish", () => recordReq(req, `${requested}→${model}`, Date.now() - start, 200))
         return
       }
       try {
         const content = await upstreamRes.json()
+        if (useResponses) {
+          const text = responsesOutputToText(content)
+          const chatResp = {
+            id: content.id ?? `chatcmpl-${Date.now()}`,
+            object: "chat.completion",
+            created: Math.floor(Date.now() / 1000),
+            model: requested,
+            choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
+            usage: content.usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+          }
+          recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
+          return json(res, 200, chatResp)
+        }
         if (content && typeof content === "object") content.model = requested
         recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
         return json(res, 200, content)
@@ -515,7 +599,12 @@ async function syncModels() {
       while (idx < candidates.length) {
         const id = candidates[idx++]
         try {
-          const r = await fetch(`${config.upstream}/chat/completions`, {
+          const useResponses = isResponsesModel(id)
+          const endpoint = useResponses ? "/responses" : "/chat/completions"
+          const probeBody = useResponses
+            ? { model: id, input: "ping" }
+            : { model: id, messages: [{ role: "user", content: "ping" }], max_tokens: 5 }
+          const r = await fetch(`${config.upstream}${endpoint}`, {
             method: "POST",
             headers: (() => {
               const h = {
@@ -528,7 +617,7 @@ async function syncModels() {
               if (sess) h["x-opencode-session"] = sess
               return h
             })(),
-            body: JSON.stringify({ model: id, messages: [{ role: "user", content: "ping" }], max_tokens: 5 }),
+            body: JSON.stringify(probeBody),
             signal: AbortSignal.timeout(Math.min(config.timeoutMs, 30_000)),
           })
           let bodyErr = ""
@@ -756,7 +845,10 @@ async function handleTest(req, res) {
       typeof body.zenKey === "string" && body.zenKey.trim()
         ? `Bearer ${body.zenKey.trim()}`
         : (authForUpstream(req) ?? "Bearer public")
-    const upstreamRes = await fetch(`${config.upstream}/chat/completions`, {
+    const useResponses = isResponsesModel(model)
+    const endpoint = useResponses ? "/responses" : "/chat/completions"
+    const probeBody = useResponses ? { model, input: "ping" } : { model, messages: [{ role: "user", content: "ping" }], max_tokens: 5 }
+    const upstreamRes = await fetch(`${config.upstream}${endpoint}`, {
       method: "POST",
       headers: (() => {
         const h = {
@@ -771,13 +863,14 @@ async function handleTest(req, res) {
         if (!ipOmit(ip)) h["x-real-ip"] = ip
         return h
       })(),
-      body: JSON.stringify({ model, messages: [{ role: "user", content: "ping" }], max_tokens: 5 }),
+      body: JSON.stringify(probeBody),
       signal: AbortSignal.timeout(config.timeoutMs),
     })
     let detail = ""
     try {
       const parsed = await upstreamRes.json()
-      detail = parsed.error?.message ?? parsed.choices?.[0]?.message?.content ?? ""
+      if (useResponses) detail = responsesOutputToText(parsed) || parsed.error?.message || ""
+      else detail = parsed.error?.message ?? parsed.choices?.[0]?.message?.content ?? ""
     } catch {}
     json(res, 200, { ok: upstreamRes.ok, model, status: upstreamRes.status, ms: Date.now() - start, detail })
   } catch (err) {
