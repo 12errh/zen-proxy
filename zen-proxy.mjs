@@ -108,6 +108,26 @@ const requestStats = { total: 0, errors: 0, recent: [], perMinute: new Map(), wi
 const VALID_MODEL_ID = /^[A-Za-z0-9._:@+/%-]+$/
 const MAX_BODY = 1024 * 1024
 
+// Basic per-IP request throttling (CWE-770): without this, a single client can
+// flood the router/upstream with unlimited concurrent requests.
+const RATE_LIMIT_WINDOW_MS = Number(ENV.RATE_LIMIT_WINDOW_MS ?? 60_000)
+const RATE_LIMIT_MAX = Number(ENV.RATE_LIMIT_MAX ?? 120)
+const rateLimitBuckets = new Map()
+function isRateLimited(req) {
+  const ip = clientIp(req) || "unknown"
+  const now = Date.now()
+  const bucket = rateLimitBuckets.get(ip)
+  if (!bucket || now - bucket.start >= RATE_LIMIT_WINDOW_MS) {
+    rateLimitBuckets.set(ip, { start: now, count: 1 })
+    if (rateLimitBuckets.size > 5000) {
+      for (const [k, v] of rateLimitBuckets) if (now - v.start >= RATE_LIMIT_WINDOW_MS) rateLimitBuckets.delete(k)
+    }
+    return false
+  }
+  bucket.count++
+  return bucket.count > RATE_LIMIT_MAX
+}
+
 // opencode's free tier requires every request to carry an `x-opencode-session`
 // header (upstream returns 400 `MissingSessionID` otherwise). Generic agents
 // never send one, so we mint stable per-client session IDs and inject them.
@@ -796,6 +816,10 @@ function handleLogs(req, res) {
 async function router(req, res) {
   const url = new URL(req.url, `http://${req.headers.host ?? "localhost"}`)
   const p = url.pathname
+
+  if (isRateLimited(req)) {
+    return json(res, 429, { error: { type: "rate_limit_error", message: "too many requests" } })
+  }
 
   if (req.method === "GET" && (p === "/" || p === "/index.html" || p === "/ui")) {
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" })
