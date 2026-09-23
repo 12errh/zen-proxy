@@ -36,6 +36,7 @@ const DEFAULT_CONFIG = {
         "muse-spark-1.2-contributor-free",
         "jev-1.13-free",
         "mimo-v2.6-flash-free",
+        "space-bunny-free",
       ]),
   ),
   modelAliases: JSON.parse(ENV.MODEL_ALIASES ?? "{}"),
