@@ -588,8 +588,15 @@ async function testModel(m) {
   cell.textContent = "testing…"
   try {
     const r = await api("/api/test", { method: "POST", body: JSON.stringify({ model: m }) })
+    if (r.gated) {
+      // The free tier only accepts genuine agent traffic, so a bare ping can't
+      // confirm or deny these. Say so instead of showing a red ✗.
+      cell.innerHTML = '<span style="color:var(--mut)">◦ agent-only</span> <span class="hint">works for real agents, not verifiable here</span>'
+      toast(m + " is agent-only — real agent requests can use it", "ok")
+      return
+    }
     const cls = r.ok ? "ok" : "bad"
-    cell.innerHTML = `<span style="color:${r.ok ? "var(--ink)" : "var(--coral)"}">${r.ok ? "✓" : "✗"} ${r.status} · ${fmtDur(r.ms)}</span>${r.detail ? ' <span class="hint">' + escapeHtml(r.detail.slice(0, 60)) + "</span>" : ""}`
+    cell.innerHTML = `<span style="color:${r.ok ? "var(--ink)" : "var(--coral)"}">${r.ok ? "✓" : "✗"} ${r.status} · ${fmtDur(r.ms)}</span>${r.detail ? ' <span class="hint">' + escapeHtml(String(r.detail).slice(0, 60)) + "</span>" : ""}`
     toast(r.ok ? m + " works" : m + " failed (" + r.status + ")", r.ok ? "ok" : "bad")
   } catch { cell.textContent = "error" }
 }
@@ -639,10 +646,15 @@ async function testZenKey() {
   if (zenKey && zenKey !== savedZenKeyMasked) body.zenKey = zenKey
   try {
     const r = await api("/api/test", { method: "POST", body: JSON.stringify(body) })
-    hint.innerHTML = r.ok
-      ? '<span style="color:var(--ink)">✓ works (' + r.model + ")</span>"
-      : '<span style="color:var(--coral)">✗ ' + r.status + " " + escapeHtml(String(r.detail || "").slice(0, 80)) + "</span>"
-    toast(r.ok ? "Key works: " + r.model : "Key rejected (" + r.status + ")", r.ok ? "ok" : "bad")
+    if (r.gated) {
+      hint.innerHTML = '<span style="color:var(--mut)">◦ key accepted, model is agent-only</span>'
+      toast("Key reached the free tier (model is agent-only)", "ok")
+    } else {
+      hint.innerHTML = r.ok
+        ? '<span style="color:var(--ink)">✓ works (' + r.model + ")</span>"
+        : '<span style="color:var(--coral)">✗ ' + r.status + " " + escapeHtml(String(r.detail || "").slice(0, 80)) + "</span>"
+      toast(r.ok ? "Key works: " + r.model : "Key rejected (" + r.status + ")", r.ok ? "ok" : "bad")
+    }
   } catch (e) { hint.textContent = "test failed"; toast("Test failed", "bad") }
 }
 

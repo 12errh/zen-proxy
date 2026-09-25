@@ -211,6 +211,45 @@ sudo systemctl enable --now zen-proxy
 
 ---
 
+## the free-tier gate (read this if a model says "agent-only")
+
+opencode serves its free models **only to genuine opencode traffic**. Verified by capturing and replaying a real opencode request, the upstream accepts a request only when it carries:
+
+- `stream: true`, **and**
+- a realistic set of **tool definitions** in the request body
+
+A bare `curl`, a health probe, or any non-agent client gets:
+
+```
+403 FreeTierError: OpenCode's free tier can only be used from within OpenCode
+```
+
+**This is not the model being broken.** A model in this state is shown as **agent-only**, is kept in your list, and is never pruned. Because the built-in probe can't verify it, the proxy learns real health from your actual client traffic — a model that serves your agent shows **`ok (live traffic)`**.
+
+| badge | meaning |
+|---|---|
+| `ok (live traffic)` | a real request through the proxy succeeded — the strongest signal |
+| `ok` | the health probe got a clean 200 |
+| `agent-only` | free-tier gated: works for real agents, not verifiable by the probe |
+| `flaky` | temporary trouble (timeout, 5xx, rate-limit) |
+| `dead` | upstream says it's gone (`not supported`, 404) — the only state that removes it |
+
+### Does my agent need anything?
+
+If your agent **streams and sends tool definitions** (Claude Code, Cline, Roo Code, Continue, Aider, mimo, opencode itself — all of them do), it works. If it makes simple one-shot calls without tools, those specific calls get gated and the proxy transparently falls back to another free model.
+
+You don't need to change anything. When a fallback happens the response tells you:
+
+```jsonc
+{ "model": "mimo-v2.6-flash-free", "zen_served_by": "space-bunny-free", /* … */ }
+```
+
+plus response headers `x-zen-served-by` and `x-zen-fallback: true`.
+
+> The proxy deliberately does **not** fake opencode's tool schemas to get past this check. That gate is an access control, and the honest behaviour is to tell you which models are gated and let your real agent traffic use them.
+
+---
+
 ## caveats
 
 - This rides opencode's **anonymous free tier**: per-IP request/daily quotas and a shared pool that's sometimes saturated. Don't rotate/abuse IPs or run heavy workloads anonymously.

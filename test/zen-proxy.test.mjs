@@ -871,6 +871,45 @@ describe("restore model list", () => {
   })
 })
 
+describe("test endpoint honest reporting", () => {
+  test("free-tier gate is reported as agent-only, not as a failure", async () => {
+    const m = zp.config.fallbackModels[0]
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        () =>
+          jsonResponse(
+            { type: "error", error: { type: "FreeTierError", message: "Error from provider (Console): OpenCode's free tier can only be used from within OpenCode" } },
+            403,
+          ),
+      ],
+      ["/responses", () => jsonResponse({ error: { type: "FreeTierError", message: "free tier can only" } }, 403)],
+    ])
+    const res = mockRes()
+    await zp.handleTest(mockReq({ _body: JSON.stringify({ model: m }) }), res)
+    assert.equal(res.state.status, 200)
+    const data = JSON.parse(res.body)
+    assert.equal(data.gated, true, "flagged as gated")
+    assert.equal(data.ok, true, "not presented as a broken model")
+    assert.equal(data.status, 403)
+    assert.match(data.detail, /real agent/i)
+  })
+
+  test("a genuine failure is still reported as a failure", async () => {
+    const m = zp.config.fallbackModels[0]
+    globalThis.fetch = routeFetch([
+      ["/chat/completions", () => jsonResponse({ error: { type: "RegionError", message: "not available in your country" } }, 403)],
+      ["/responses", () => jsonResponse({ error: { type: "RegionError", message: "nope" } }, 403)],
+    ])
+    const res = mockRes()
+    await zp.handleTest(mockReq({ _body: JSON.stringify({ model: m }) }), res)
+    const data = JSON.parse(res.body)
+    assert.equal(data.gated, false)
+    assert.equal(data.ok, false)
+    assert.equal(data.status, 403)
+  })
+})
+
 describe("recordReq stats", () => {
   test("dedups consecutive identical records", () => {
     const req = mockReq()

@@ -1190,18 +1190,23 @@ async function handleTest(req, res) {
       signal: AbortSignal.timeout(config.timeoutMs),
     })
     let detail = ""
+    let gated = false
     try {
       const parsed = await upstreamRes.json()
       if (format === "responses") detail = parsed.error?.message ?? (typeof parsed.output_text === "string" ? parsed.output_text : "")
       else detail = parsed.error?.message ?? parsed.choices?.[0]?.message?.content ?? ""
+      // A free-tier gate here is not a failure of the model: the free tier only
+      // accepts genuine agent traffic, which a bare ping never is.
+      if (upstreamRes.status === 403 && /FreeTierError|free tier can only/i.test(detail)) gated = true
     } catch {}
     json(res, 200, {
-      ok: upstreamRes.ok,
+      ok: upstreamRes.ok || gated,
+      gated,
       model,
       format,
       status: upstreamRes.status,
       ms: Date.now() - start,
-      detail,
+      detail: gated ? "free tier accepts real agent requests only — this probe can't verify it" : detail,
     })
   } catch (err) {
     json(res, 400, { ok: false, error: err.message })
