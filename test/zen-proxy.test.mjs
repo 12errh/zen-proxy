@@ -140,10 +140,10 @@ beforeEach(() => {
 
 describe("resolveModel", () => {
   test("maps an alias to its target", () => {
-    zp.saveConfig({ modelAliases: { "gpt-4o": "deepseek-v4-flash-free" } })
+    zp.saveConfig({ modelAliases: { "gpt-4o": "space-bunny-free" } })
     const { requested, candidates } = zp.resolveModel("gpt-4o")
     assert.equal(requested, "gpt-4o")
-    assert.equal(candidates[0], "deepseek-v4-flash-free")
+    assert.equal(candidates[0], "space-bunny-free")
   })
 
   test("passes an allowed model through unchanged", () => {
@@ -725,6 +725,42 @@ describe("FreeTierError handling", () => {
   })
 })
 
+describe("probe auth toggle", () => {
+  test("auto uses the Zen key when configured", () => {
+    zp.saveConfig({ probeAuth: "auto", defaultZenKey: "zen-abc" })
+    assert.equal(zp.probeAuthHeader(), "Bearer zen-abc")
+  })
+  test("auto falls back to anonymous when no key", () => {
+    zp.saveConfig({ probeAuth: "auto", defaultZenKey: "" })
+    assert.equal(zp.probeAuthHeader(), "Bearer public")
+  })
+  test("anonymous ignores a configured key", () => {
+    zp.saveConfig({ probeAuth: "anonymous", defaultZenKey: "zen-abc" })
+    assert.equal(zp.probeAuthHeader(), "Bearer public", "probes the free tier, not the user's quota")
+  })
+  test("key with no key configured degrades to anonymous instead of failing", () => {
+    zp.saveConfig({ probeAuth: "key", defaultZenKey: "" })
+    assert.equal(zp.probeAuthHeader(), "Bearer public")
+  })
+
+  test("probes actually send the selected credentials", async () => {
+    zp.saveConfig({ probeAuth: "anonymous", defaultZenKey: "zen-secret", fallbackModels: ["space-bunny-free"], autoSyncIntervalMs: 0, cacheMs: 0 })
+    let sentAuth = null
+    globalThis.fetch = routeFetch([
+      ["/models", () => jsonResponse({ data: [{ id: "space-bunny-free" }] })],
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sentAuth = opts.headers["authorization"]
+          return jsonResponse({ model: "ok", choices: [] })
+        },
+      ],
+    ])
+    await zp.syncModels()
+    assert.equal(sentAuth, "Bearer public", "anonymous mode must not leak the user's key")
+  })
+})
+
 describe("recordReq stats", () => {
   test("dedups consecutive identical records", () => {
     const req = mockReq()
@@ -892,9 +928,9 @@ describe("handleChat", () => {
   })
 
   test("alias: upstream called with target, response rewritten to alias", async () => {
-    zp.saveConfig({ modelAliases: { "gpt-4o": "deepseek-v4-flash-free" } })
+    zp.saveConfig({ modelAliases: { "gpt-4o": "space-bunny-free" } })
     globalThis.fetch = routeFetch([
-      ["/chat/completions", chatStub("deepseek-v4-flash-free", jsonResponse({ model: "upstream-model", choices: [] }))],
+      ["/chat/completions", chatStub("space-bunny-free", jsonResponse({ model: "upstream-model", choices: [] }))],
     ])
     const req = mockReq({ _body: JSON.stringify({ model: "gpt-4o", messages: [] }) })
     const res = mockRes()
@@ -1042,7 +1078,7 @@ describe("fetchModels", () => {
         "/models",
         () => {
           calls++
-          return jsonResponse({ data: [{ id: "deepseek-v4-flash-free" }, { id: "paid-model" }] })
+          return jsonResponse({ data: [{ id: "space-bunny-free" }, { id: "paid-model" }] })
         },
       ],
     ])
@@ -1075,7 +1111,7 @@ describe("fetchModels", () => {
   test("returns ok:false on upstream failure and keeps prior data", async () => {
     zp.saveConfig({ cacheMs: 0 })
     globalThis.fetch = routeFetch([
-      ["/models", jsonResponse({ data: [{ id: "deepseek-v4-flash-free" }] })],
+      ["/models", jsonResponse({ data: [{ id: "space-bunny-free" }] })],
     ])
     const good = await zp.fetchModels()
     assert.equal(good.ok, true)
@@ -1089,7 +1125,7 @@ describe("fetchModels", () => {
     ])
     const bad = await zp.fetchModels()
     assert.equal(bad.ok, false)
-    assert.deepEqual(bad.data.map((m) => m.id), ["deepseek-v4-flash-free"])
+    assert.deepEqual(bad.data.map((m) => m.id), ["space-bunny-free"])
   })
 
   test("in-flight requests share a single fetch (no stampede)", async () => {
@@ -1130,7 +1166,7 @@ describe("handleModels", () => {
   test("serves model list with valid key", async () => {
     zp.saveConfig({ proxyKey: "admin-1", cacheMs: 0 })
     globalThis.fetch = routeFetch([
-      ["/models", () => jsonResponse({ data: [{ id: "deepseek-v4-flash-free" }] })],
+      ["/models", () => jsonResponse({ data: [{ id: "space-bunny-free" }] })],
     ])
     await zp.fetchModels() // cold refresh so the cache holds the stub's data
     zp.saveConfig({ cacheMs: 60_000 })
@@ -1140,7 +1176,7 @@ describe("handleModels", () => {
     assert.equal(res.state.status, 200)
     const data = JSON.parse(res.body)
     assert.equal(data.ok, true)
-    assert.equal(data.data[0].id, "deepseek-v4-flash-free")
+    assert.equal(data.data[0].id, "space-bunny-free")
   })
 })
 
@@ -1242,7 +1278,7 @@ describe("syncModels model-ID validation", () => {
   test("upstream ids outside the safe charset are not stored", async () => {
     zp.saveConfig({ fallbackModels: [], cacheMs: 0, autoSyncIntervalMs: 0 })
     const evil = "x');alert(1)//-free"
-    const good = "deepseek-v4-flash-free"
+    const good = "space-bunny-free"
     globalThis.fetch = routeFetch([
       ["/models", jsonResponse({ data: [{ id: evil }, { id: good }] })],
       ["/chat/completions", jsonResponse({ model: "ok", choices: [] })],
@@ -1258,7 +1294,7 @@ describe("syncModels model-ID validation", () => {
 describe("router / health", () => {
   test("/health reports ok:true when upstream responds", async () => {
     zp.saveConfig({ cacheMs: 0 })
-    globalThis.fetch = routeFetch([["/models", jsonResponse({ data: [{ id: "deepseek-v4-flash-free" }] })]])
+    globalThis.fetch = routeFetch([["/models", jsonResponse({ data: [{ id: "space-bunny-free" }] })]])
     const res = mockRes()
     await zp.router(mockReq({ method: "GET", url: "/health" }), res)
     assert.equal(res.state.status, 200)

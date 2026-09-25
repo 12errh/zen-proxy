@@ -384,11 +384,17 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
       </div>
       <label>Fallback models (json array — tried in order on 429/5xx)</label>
       <textarea id="cfgFallback"></textarea>
-      <label>Model aliases (json map — e.g. {"gpt-4o":"deepseek-v4-flash-free"})</label>
+      <label>Model aliases (json map — e.g. {"gpt-4o":"space-bunny-free"})</label>
       <textarea id="cfgAliases"></textarea>
       <div class="checkbox"><input type="checkbox" id="cfgTrust"><span>Trust <code>x-forwarded-for</code> from a reverse proxy</span></div>
       <div class="checkbox"><input type="checkbox" id="cfgAutoSync"><span>Auto-sync models (probe upstream free models, prune dead ones)</span></div>
       <label>Auto-sync interval (ms)</label><input id="cfgSyncMs" type="number">
+      <label>Health-probe credentials</label>
+      <select id="cfgProbeAuth" style="width:100%">
+        <option value="auto">Auto — use my Zen key if set, else anonymous</option>
+        <option value="anonymous">Always anonymous (public free tier)</option>
+        <option value="key">Always my Zen key (tests my own quota)</option>
+      </select>
       <div class="checkbox"><input type="checkbox" id="cfgAutoUA"><span>Auto-track opencode releases &amp; update the User-Agent</span></div>
       <label>User-agent refresh interval (ms)</label><input id="cfgUaMs" type="number">
       <div class="checkbox"><input type="checkbox" id="cfgInject"><span>Inject <code>x-opencode-session</code> header per client (free tier needs it)</span></div>
@@ -671,6 +677,7 @@ async function populateConfigForm() {
   $("cfgTrust").checked = !!config.trustForwarded
   $("cfgAutoSync").checked = config.autoSync !== false
   $("cfgSyncMs").value = config.autoSyncIntervalMs ?? 3600000
+  $("cfgProbeAuth").value = ["auto", "key", "anonymous"].includes(config.probeAuth) ? config.probeAuth : "auto"
   $("cfgAutoUA").checked = config.autoUA !== false
   $("cfgUaMs").value = config.uaRefreshMs ?? 21600000
   $("cfgInject").checked = config.injectSession !== false
@@ -706,6 +713,7 @@ async function saveConfig() {
     trustForwarded: $("cfgTrust").checked,
     autoSync: $("cfgAutoSync").checked,
     autoSyncIntervalMs: Number($("cfgSyncMs").value || 3600000),
+    probeAuth: $("cfgProbeAuth").value,
     autoUA: $("cfgAutoUA").checked,
     uaRefreshMs: Number($("cfgUaMs").value || 21600000),
     injectSession: $("cfgInject").checked,

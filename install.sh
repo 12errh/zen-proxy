@@ -93,7 +93,7 @@ info ""
 info "Point your AI agent at:"
 info "  baseURL = http://127.0.0.1:$PORT/v1"
 info "  apiKey  = public"
-info "  model   = deepseek-v4-flash-free"
+info "  model   = space-bunny-free   (or any model listed in the dashboard)"
 
 if command -v systemctl >/dev/null 2>&1 && [ -w /etc/systemd/system ]; then
   info ""

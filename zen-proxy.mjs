@@ -19,9 +19,14 @@ const DEFAULT_CONFIG = {
   autoUA: ENV.AUTO_UA !== "0",
   uaRefreshMs: Number(ENV.UA_REFRESH_MS ?? 6 * 3600_000),
   injectSession: ENV.INJECT_SESSION !== "0",
+  // Which credentials the auto-sync health probe uses:
+  //   "auto"      — use defaultZenKey when set, otherwise anonymous `public`
+  //   "key"       — always use defaultZenKey (probe fails if none is set)
+  //   "anonymous" — always anonymous `public`, even when a key is configured
+  probeAuth: ENV.PROBE_AUTH ?? "auto",
   // "" = auto: at request time the first *healthy* free model becomes the default
-  // (see effectiveDefault), so a vanished model like deepseek-v4-flash-free never
-  // bricks new installs. Set an explicit model here to pin it.
+  // (see effectiveDefault), so a model that disappears upstream never bricks new
+  // installs. Set an explicit model here to pin it.
   defaultModel: ENV.DEFAULT_MODEL ?? "",
   fallbackModels: JSON.parse(
     ENV.FALLBACK_MODELS ??
@@ -35,7 +40,6 @@ const DEFAULT_CONFIG = {
         "muse-spark-1.2-contributor-free",
         "nemotron-3.5-lightning-free",
         "nemotron-3-ultra-free",
-        "deepseek-v4-flash-free",
       ]),
   ),
   modelAliases: JSON.parse(ENV.MODEL_ALIASES ?? "{}"),
@@ -625,6 +629,17 @@ function responsesRequest(body, model, isStream) {
   return payload
 }
 
+// Credentials used by the auto-sync health probe. Lets a user probe the
+// anonymous free tier (public) even while BYOK is configured, or require the
+// key so probes reflect their own quota.
+function probeAuthHeader() {
+  const mode = String(config.probeAuth ?? "auto").toLowerCase()
+  if (mode === "anonymous") return "Bearer public"
+  if (config.defaultZenKey) return `Bearer ${config.defaultZenKey}`
+  if (mode === "key") return "Bearer public" // no key configured; anonymous is all we can do
+  return "Bearer public"
+}
+
 // One-shot liveness probe for a model, using the endpoint family that model
 // actually lives on. Returns the raw Response so sync can classify it.
 async function probeModel(id, auth, session) {
@@ -807,7 +822,7 @@ async function syncModels() {
     // Only definitively-gone models are dropped from the user's list; `flaky`
     // ones stay configured so they recover on their own.
     const removeFromCurrent = new Set()
-    const auth = config.defaultZenKey ? `Bearer ${config.defaultZenKey}` : "Bearer public"
+    const auth = probeAuthHeader()
     let idx = 0
     const probe = async () => {
       while (idx < candidates.length) {
@@ -1004,6 +1019,9 @@ async function handleApiConfig(req, res) {
       cleaned.autoUA = toBool(cleaned.autoUA, config.autoUA)
       cleaned.injectSession = toBool(cleaned.injectSession, config.injectSession)
       if (cleaned.proxyKey === "••••••••") cleaned.proxyKey = config.proxyKey
+      if (cleaned.probeAuth != null && !["auto", "key", "anonymous"].includes(String(cleaned.probeAuth))) {
+        cleaned.probeAuth = "auto"
+      }
       if (cleaned.defaultZenKey === sanitize({ defaultZenKey: config.defaultZenKey }).defaultZenKey) {
         cleaned.defaultZenKey = config.defaultZenKey
       }
@@ -1047,6 +1065,7 @@ async function handleStatus(req, res) {
     auth: { mode: authMode, zenKey: maskKey(config.defaultZenKey), proxyKey: !!config.proxyKey },
     responsesModels: [...(config.responsesModels ?? [])],
     rateLimit: { max: config.rateLimitMax, windowMs: config.rateLimitWindowMs },
+    probeAuth: config.probeAuth ?? "auto",
     models: {
       total: cache.data.length,
       allowed: ALLOWED().size,
@@ -1258,6 +1277,7 @@ export {
   chatMessagesToInput,
   chatToolsToResponses,
   rateLimitFor,
+  probeAuthHeader,
   authForUpstream,
   clientIp,
   ipOmit,

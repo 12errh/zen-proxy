@@ -161,6 +161,7 @@ Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded wh
 | `autoUA` | `true` | Track opencode releases and update `ua` automatically (`opencode/<latest>`) |
 | `uaRefreshMs` | `21600000` | How often to check for a new opencode version (ms) |
 | `injectSession` | `true` | Mint an `x-opencode-session` header per client (upstream rejects requests without one) |
+| `probeAuth` | `auto` | Credentials for auto-sync health probes: `auto` (your Zen key if set, else anonymous), `anonymous` (always the public free tier), or `key` (always your key, so probes reflect your own quota) |
 | `defaultModel` | `""` | Empty = auto: pick the first *healthy* free model (no more hardcoded/vanished defaults) |
 | `fallbackModels` | `["space-bunny-free","mimo-v2.6-flash-free", …]` | Tried in order on `429`/`5xx` and unavailable-model `4xx`. Auto-sync **only removes a model the upstream says is gone** (`not supported`, 404) — temporary blocks like `403 FreeTierError` keep it configured so it recovers on its own |
 | `responsesModels` | `["gpt-5*","gpt-6*","grok-*","muse-spark-*"]` | Models served on `/v1/responses` (patterns may end in `*`); the proxy translates to/from chat completions for you |
@@ -173,7 +174,7 @@ Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded wh
 | `timeoutMs` | `120000` | Upstream timeout (streaming and non-streaming) |
 | `cacheMs` | `30000` | `/v1/models` cache TTL |
 
-Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION` (`0` to disable), `AUTO_UA` (`0` to disable), `UA_REFRESH_MS`, `RESPONSES_MODELS` (JSON), `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW_MS`, `DEFAULT_MODEL`, `FALLBACK_MODELS` (JSON), `MODEL_ALIASES` (JSON), `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED=1`, `TIMEOUT_MS`, `CACHE_MS`, `AUTO_SYNC` (`0` to disable), `AUTO_SYNC_MS`, `ZEN_PROXY_CONFIG` (custom config path).
+Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION` (`0` to disable), `AUTO_UA` (`0` to disable), `UA_REFRESH_MS`, `PROBE_AUTH`, `RESPONSES_MODELS` (JSON), `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW_MS`, `DEFAULT_MODEL`, `FALLBACK_MODELS` (JSON), `MODEL_ALIASES` (JSON), `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED=1`, `TIMEOUT_MS`, `CACHE_MS`, `AUTO_SYNC` (`0` to disable), `AUTO_SYNC_MS`, `ZEN_PROXY_CONFIG` (custom config path).
 
 ### bring your own key
 
