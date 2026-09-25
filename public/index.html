@@ -191,6 +191,51 @@ tbody tr:last-child td { border-bottom:none }
 .badge.bad { background:var(--coral); color:#fff; border:2px solid var(--ink) }
 .badge.warn { background:var(--grape); color:var(--ink); border:2px solid var(--ink) }
 .badge.mut { background:var(--paper2); color:var(--ink); border:2px solid var(--ink) }
+
+/* Tooltip — purpose-built for this dashboard. Sticker-card look that reuses the
+   same ink border + hard offset shadow as the badges and buttons, a two-tone
+   pointer so it reads as attached, and a spring entrance. Auto-width, so the
+   copy can never overflow, and it flips below the trigger near the top edge.
+   Zero dependencies. */
+[data-tip] { position:relative; cursor:help }
+[data-tip]:focus-visible { outline:2px solid var(--ink); outline-offset:2px }
+.ztip {
+  position:absolute; left:50%; bottom:calc(100% + 11px);
+  width:max-content; max-width:250px;
+  padding:8px 12px 9px;
+  background:var(--paper); color:var(--ink);
+  border:2px solid var(--ink); border-radius:10px;
+  box-shadow:3px 3px 0 var(--ink);
+  text-align:left; pointer-events:none; z-index:70;
+  opacity:0; visibility:hidden;
+  transform:translate(-50%, 5px) scale(.96); transform-origin:50% 100%;
+  transition:opacity .15s ease, transform .2s cubic-bezier(.34,1.35,.64,1), visibility 0s linear .2s;
+}
+.ztip.open { opacity:1; visibility:visible; transform:translate(-50%,0) scale(1); transition-delay:0s }
+.ztip-title {
+  display:flex; align-items:center; gap:6px; flex-wrap:wrap;
+  font-family:var(--mono); font-size:9.5px; font-weight:800;
+  letter-spacing:.09em; text-transform:uppercase; color:var(--ztip-accent, var(--ink));
+  overflow-wrap:anywhere;
+}
+.ztip-title::before {
+  content:""; width:8px; height:8px; flex:none;
+  background:var(--ztip-accent, var(--ink)); border:1.5px solid var(--ink); border-radius:2px;
+}
+.ztip-body { margin-top:4px; font-family:var(--sans); font-size:12px; line-height:1.45; color:var(--ink); overflow-wrap:anywhere; max-height:150px; overflow-y:auto }
+/* pointer: ink triangle with a paper triangle layered on top for a bordered join */
+.ztip::before, .ztip::after {
+  content:""; position:absolute; left:50%; width:0; height:0;
+  border-left:7px solid transparent; border-right:7px solid transparent;
+}
+.ztip::after { top:100%; transform:translateX(-50%); border-top:9px solid var(--ink); z-index:0 }
+.ztip::before { top:100%; z-index:1; transform:translateX(-50%) translateY(-2px); border-top:6px solid var(--paper) }
+.ztip.below { bottom:auto; top:calc(100% + 11px); transform:translate(-50%,-5px) scale(.96); transform-origin:50% 0 }
+.ztip.below.open { transform:translate(-50%,0) scale(1) }
+.ztip.below::after { top:auto; bottom:100%; border-top:0; border-bottom:9px solid var(--ink) }
+.ztip.below::before { top:auto; bottom:100%; border-top:0; border-bottom:6px solid var(--paper); transform:translateX(-50%) translateY(2px) }
+@media (prefers-reduced-motion: reduce) { .ztip { transition:none } }
+
 .empty { font-family:var(--serif); font-style:italic; color:var(--muted); text-align:center; padding:38px; font-size:15px }
 .pager { display:flex; align-items:center; justify-content:flex-end; gap:12px; margin-top:16px }
 .pager button { padding:6px 13px; font-size:10.5px; box-shadow:3px 3px 0 var(--ink) }
@@ -558,15 +603,16 @@ function renderModels(st) {
   const ms = modelStatus(m, sync)
   const aliasTarget = config.modelAliases[m]
   const display = aliasTarget ? escapeHtml(m) + ' <span class="badge mut">→ ' + escapeHtml(aliasTarget) + "</span>" : escapeHtml(m)
-  const msBadge = ms ? `<span class="badge ${ms.cls}" style="margin-left:7px">${ms.label}</span>` : ""
+  const msBadge = ms ? `<span class="badge ${ms.cls}" style="margin-left:7px" tabindex="0" data-tip-title="${escapeAttr(ms.title || ms.label)}" data-tip="${escapeAttr(ms.tip)}">${ms.label}</span>` : ""
   const isResp = (config.responsesModels || []).some((p) => (p.endsWith("*") ? m.startsWith(p.slice(0, -1)) : m === p))
-  const fmtBadge = isResp ? '<span class="badge mut" style="margin-left:6px">responses</span>' : ""
+  const fmtBadge = isResp ? `<span class="badge mut" style="margin-left:6px" tabindex="0" data-tip="${escapeAttr(TIP.responses)}">responses</span>` : ""
   const isDefault = m === config.defaultModel
   const isConfigured = config.fallbackModels.includes(m) || !!config.modelAliases[m]
   const notInFallback = !config.fallbackModels.includes(m) && !config.modelAliases[m]
+  const notCfgBadge = notInFallback ? `<span class="badge mut" style="margin-left:6px" tabindex="0" data-tip="${escapeAttr(TIP.notconfigured)}">not in fallback</span>` : ""
   const addBtn = notInFallback ? `<button onclick='addModel(${jsStr(m)})'>+ add</button>` : ""
   return `<tr${notInFallback ? ' style="opacity:.65"' : ""}>
-      <td class="mono">${display}${msBadge}${fmtBadge}</td>
+      <td class="mono">${display}${msBadge}${fmtBadge}${notCfgBadge}</td>
       <td><input type="radio" name="defaultModel" value="${escapeAttr(m)}" ${isDefault ? "checked" : ""} onchange='setDefault(${jsStr(m)})'></td>
       <td class="mono testCell" id="tc-${escapeAttr(m)}">–</td>
       <td class="row" style="gap:10px"><button onclick='testModel(${jsStr(m)})'>Test</button>${addBtn}${aliasTarget || !isConfigured ? "" : `<button onclick='removeModel(${jsStr(m)})'>✕</button>`}</td>
@@ -591,7 +637,7 @@ async function testModel(m) {
     if (r.gated) {
       // The free tier only accepts genuine agent traffic, so a bare ping can't
       // confirm or deny these. Say so instead of showing a red ✗.
-      cell.innerHTML = '<span style="color:var(--mut)">◦ agent-only</span> <span class="hint">works for real agents, not verifiable here</span>'
+      cell.innerHTML = `<span class="badge mut" tabindex="0" data-tip="${escapeAttr(TIP.gated)}">◦ agent-only</span> <span class="hint">works for real agents, not verifiable here</span>`
       toast(m + " is agent-only — real agent requests can use it", "ok")
       return
     }
@@ -601,28 +647,48 @@ async function testModel(m) {
   } catch { cell.textContent = "error" }
 }
 
+// Tooltip copy for each health state — kept short so it always fits the bubble.
+const TIP = {
+  live: "A real request through this proxy just succeeded.",
+  ok: "Health probe got a clean 200 upstream.",
+  gated: "Free tier takes real agent traffic only. A probe can't confirm it.",
+  flaky: "Temporary trouble — timeout or 5xx. Kept, it recovers.",
+  limited: "Upstream returned 429. Quota refills.",
+  dead: "Upstream says it's gone (404). Only state that removes it.",
+  untested: "No health check yet. Hit “Sync now”.",
+  responses: "Served on /v1/responses. Proxy translates it.",
+  notconfigured: "Upstream has it, your list doesn't.",
+  syncing: "Probing every free model right now.",
+  syncnever: "Auto-sync has not run yet.",
+  syncdone: "Last health check. Agent-only models are fine — a probe just can't confirm them.",
+}
+
 function modelStatus(m, sync) {
   if (sync && sync.observed && sync.observed[m]) {
     const o = sync.observed[m]
-    if (o.ok > o.fail) return { cls: "ok", label: "ok (live traffic)" }
+    if (o.ok > o.fail) return { cls: "ok", label: "ok (live traffic)", title: "live traffic", tip: TIP.live }
   }
-  if (!sync || !sync.at) return { cls: "mut", label: "untested" }
-  if (sync.working?.includes(m)) return { cls: "ok", label: "ok" }
-  if (sync.rateLimited?.includes(m)) return { cls: "warn", label: "rate-limited" }
-  if (sync.gated?.includes(m)) return { cls: "mut", label: "agent-only" }
-  if (sync.flaky?.includes(m)) return { cls: "warn", label: "flaky" }
-  if (sync.dead?.includes(m)) return { cls: "bad", label: "dead" }
-  return { cls: "mut", label: "untested" }
+  if (!sync || !sync.at) return { cls: "mut", label: "untested", tip: TIP.untested }
+  if (sync.working?.includes(m)) return { cls: "ok", label: "ok", tip: TIP.ok }
+  if (sync.rateLimited?.includes(m)) return { cls: "warn", label: "rate-limited", tip: TIP.limited }
+  if (sync.gated?.includes(m)) return { cls: "mut", label: "agent-only", tip: TIP.gated }
+  if (sync.flaky?.includes(m)) return { cls: "warn", label: "flaky", tip: TIP.flaky }
+  if (sync.dead?.includes(m)) return { cls: "bad", label: "dead", tip: TIP.dead }
+  return { cls: "mut", label: "untested", tip: TIP.untested }
 }
 
 function renderSync(s) {
   const el = $("syncStatus")
   if (!el) return
-  if (s.running) { el.textContent = "auto-sync: probing…"; el.className = "badge warn"; return }
-  if (!s.at) { el.textContent = "auto-sync: never"; el.className = "badge mut"; return }
+  // The label itself is long, so the tooltip always uses a short fixed title.
+  el.setAttribute("data-tip-title", "auto-sync")
+  el.setAttribute("tabindex", "0")
+  if (s.running) { el.textContent = "auto-sync: probing…"; el.className = "badge warn"; el.setAttribute("data-tip", TIP.syncing); return }
+  if (!s.at) { el.textContent = "auto-sync: never"; el.className = "badge mut"; el.setAttribute("data-tip", TIP.syncnever); return }
   const ago = fmtUp(Math.max(1, Math.floor((Date.now() - s.at) / 1000))) + " ago"
   el.textContent = `auto-sync: ${ago} · ${s.working.length} ok · ${s.rateLimited.length} rate-limited · ${(s.gated||[]).length} agent-only · ${s.flaky.length} flaky · ${s.dead.length} dead`
   el.className = "badge " + (s.ok ? (s.dead.length ? "warn" : "ok") : "bad")
+  el.setAttribute("data-tip", TIP.syncdone)
 }
 
 async function syncNow() {
@@ -801,9 +867,63 @@ function switchTab(name) {
 }
 document.querySelectorAll("nav button").forEach((b) => b.addEventListener("click", () => switchTab(b.dataset.tab)))
 
-function escapeHtml(s) {
-  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]))
+function escapeHtml(s) { return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])) }
+
+// --- badge tooltip (delegated, so it survives the 4s table re-render) ---
+// Purpose-built for this dashboard. One accent per badge tone, tuned dark
+// enough to read on the paper background. Title reuses the badge's own label
+// so the two never drift apart.
+const ZTIP_TONE = { ok: "#4d6b00", warn: "#6b3fbf", bad: "#d63a1c", mut: "#7d7461" }
+let ztipEl = null
+function ztipHide() {
+  if (!ztipEl) return
+  const el = ztipEl
+  ztipEl = null
+  el.classList.remove("open")
+  setTimeout(() => el.remove(), 220)
 }
+function ztipShow(target) {
+  const body = target.getAttribute("data-tip")
+  if (!body) return
+  ztipHide()
+  const tone = (target.className.match(/badge\s+(\w+)/) || [])[1] || "mut"
+  const bubble = document.createElement("div")
+  bubble.className = "ztip"
+  bubble.setAttribute("role", "tooltip")
+  bubble.style.setProperty("--ztip-accent", ZTIP_TONE[tone] || ZTIP_TONE.mut)
+  const title = document.createElement("div")
+  title.className = "ztip-title"
+  title.textContent = target.getAttribute("data-tip-title") || target.textContent.trim()
+  const text = document.createElement("div")
+  text.className = "ztip-body"
+  text.textContent = body
+  bubble.append(title, text)
+  target.appendChild(bubble)
+  ztipEl = bubble
+  // Flip below when there is not enough room above, then keep it on screen.
+  if (target.getBoundingClientRect().top < 150) bubble.classList.add("below")
+  const half = bubble.offsetWidth / 2
+  const r = target.getBoundingClientRect()
+  const shift = Math.round(r.left + r.width / 2 - (bubble.getBoundingClientRect().left + half))
+  if (shift) bubble.style.marginLeft = shift + "px"
+  requestAnimationFrame(() => bubble.classList.add("open"))
+}
+document.addEventListener("mouseover", (e) => {
+  const t = e.target.closest && e.target.closest("[data-tip]")
+  if (t) ztipShow(t)
+})
+document.addEventListener("mouseout", (e) => {
+  const t = e.target.closest && e.target.closest("[data-tip]")
+  if (t && (!e.relatedTarget || !t.contains(e.relatedTarget))) ztipHide()
+})
+document.addEventListener("focusin", (e) => {
+  const t = e.target.closest && e.target.closest("[data-tip]")
+  if (t) ztipShow(t)
+})
+document.addEventListener("focusout", ztipHide)
+window.addEventListener("scroll", ztipHide, true)
+window.addEventListener("resize", ztipHide)
+
 function escapeAttr(s) { return escapeHtml(s) }
 // Safe embedding of a JS string into a single-quoted HTML attribute: HTML attribute
 // parsing does not honor \" as an escape, so JSON.stringify alone breaks double-quoted
