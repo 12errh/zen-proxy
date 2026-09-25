@@ -162,7 +162,7 @@ Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded wh
 | `uaRefreshMs` | `21600000` | How often to check for a new opencode version (ms) |
 | `injectSession` | `true` | Mint an `x-opencode-session` header per client (upstream rejects requests without one) |
 | `defaultModel` | `""` | Empty = auto: pick the first *healthy* free model (no more hardcoded/vanished defaults) |
-| `fallbackModels` | `["space-bunny-free","mimo-v2.6-flash-free", …]` | Tried in order on `429`/`5xx` and dead-model `4xx`; auto-sync prunes vanished models and adds new ones |
+| `fallbackModels` | `["space-bunny-free","mimo-v2.6-flash-free", …]` | Tried in order on `429`/`5xx` and unavailable-model `4xx`. Auto-sync **only removes a model the upstream says is gone** (`not supported`, 404) — temporary blocks like `403 FreeTierError` keep it configured so it recovers on its own |
 | `responsesModels` | `["gpt-5*","gpt-6*","grok-*","muse-spark-*"]` | Models served on `/v1/responses` (patterns may end in `*`); the proxy translates to/from chat completions for you |
 | `rateLimitMax` | `0` (off) | Max chat requests per client per window — `0` disables the limiter |
 | `rateLimitWindowMs` | `60000` | Rate-limit window |
@@ -212,6 +212,7 @@ sudo systemctl enable --now zen-proxy
 ## caveats
 
 - This rides opencode's **anonymous free tier**: per-IP request/daily quotas and a shared pool that's sometimes saturated. Don't rotate/abuse IPs or run heavy workloads anonymously.
+- When the proxy falls back to a different model, the response includes `zen_served_by` so you can see which model actually answered.
 - opencode keeps **tightening the anonymous free tier** — most `-free` models now answer `403 FreeTierError: "OpenCode's free tier can only be used from within OpenCode"`, and that hits the real opencode client too. The proxy detects it and rolls to the next working model, so requests keep succeeding, but the pool is much smaller than it used to be. A Zen API key (BYOK) is the reliable path.
 - The `-free` models are "as-is" free tiers — expect rate limits and occasional provider errors.
 - For anything serious, **BYOK**.

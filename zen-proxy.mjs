@@ -250,7 +250,7 @@ function chatToolsToResponses(tools) {
 }
 
 // Responses API result -> chat.completion, preserving tool calls + reasoning.
-function responsesToChat(data, requested) {
+function responsesToChat(data, requested, servedBy) {
   const output = Array.isArray(data?.output) ? data.output : []
   let text = typeof data?.output_text === "string" ? data.output_text : ""
   if (!text) {
@@ -283,6 +283,7 @@ function responsesToChat(data, requested) {
     object: "chat.completion",
     created: Math.floor(Date.now() / 1000),
     model: requested,
+    ...(servedBy && servedBy !== requested ? { zen_served_by: servedBy } : {}),
     choices: [
       {
         index: 0,
@@ -516,9 +517,14 @@ async function handleChat(req, res) {
         const content = await upstreamRes.json()
         if (format === "responses") {
           recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
-          return json(res, 200, responsesToChat(content, requested))
+          return json(res, 200, responsesToChat(content, requested, model))
         }
-        if (content && typeof content === "object") content.model = requested
+        if (content && typeof content === "object") {
+          content.model = requested
+          // Tell the caller which model actually answered when we fell back, so
+          // "big-pickle works" isn't a mystery when space-bunny served it.
+          if (model !== requested) content.zen_served_by = model
+        }
         recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
         return json(res, 200, content)
       } catch {
@@ -798,6 +804,8 @@ async function syncModels() {
     const rateLimited = []
     const dead = []
     const flaky = []
+    // Only definitively-gone models are dropped from the user's list; `flaky`
+    // ones stay configured so they recover on their own.
     const removeFromCurrent = new Set()
     const auth = config.defaultZenKey ? `Bearer ${config.defaultZenKey}` : "Bearer public"
     let idx = 0
@@ -817,27 +825,36 @@ async function syncModels() {
           if (r.ok && !bodyErr) { working.push(id); modelHealth.set(id, 0) }
           else if (r.status === 429 && !bodyErr) { rateLimited.push(id); modelHealth.set(id, 0) }
           else {
-            // Model gone / not supported upstream ("Model hy3-free is not supported",
-            // "does not exist", 404…) → remove immediately, no grace period needed.
-            const notSupported =
+            // Only drop a model from the user's config on definitive proof that it
+            // is gone: "not supported", 404, "no such model". Everything else
+            // (403 FreeTierError, 429, timeouts, 5xx) is a *temporary* access or
+            // capacity condition — the model comes back on its own, so deleting it
+            // would silently shrink the user's list and lose it forever.
+            const gone =
               r.status === 404 ||
-              /model_not_found|no such model|does not exist|not supported/i.test(bodyErr)
-            // Key/auth problems are not model problems — never punish a healthy
-            // model because the configured key is bad.
+              /model_not_found|no such model|does not exist|is not supported|not supported/i.test(bodyErr)
+            // Key/auth problems are not model problems either.
             const authErr = /AuthError|invalid api key|missing api key/i.test(bodyErr)
-            const fails = (modelHealth.get(id) ?? 0) + 1
-            if (notSupported) { dead.push(id); removeFromCurrent.add(id) }
+            // Temporary blocks: keep the model, just remember it is unhealthy.
+            const temporary = /FreeTierError|free tier can only|RegionError|not available in your country|rate.?limit|overloaded|unavailable/i.test(bodyErr)
+            if (gone) { dead.push(id); removeFromCurrent.add(id) }
             else if (authErr) { flaky.push(id) }
             else {
-              modelHealth.set(id, fails)
-              if (fails >= 2) { dead.push(id); removeFromCurrent.add(id) }
-              else { flaky.push(id) }
+              if (temporary) {
+                modelHealth.set(id, 0)
+                flaky.push(id)
+              } else {
+                const fails = (modelHealth.get(id) ?? 0) + 1
+                modelHealth.set(id, fails)
+                if (fails >= 3) { dead.push(id) }
+                else flaky.push(id)
+              }
             }
           }
         } catch {
           const fails = (modelHealth.get(id) ?? 0) + 1
           modelHealth.set(id, fails)
-          if (fails >= 2) { dead.push(id); removeFromCurrent.add(id) }
+          if (fails >= 3) dead.push(id)
           else flaky.push(id)
         }
       }
@@ -1030,7 +1047,11 @@ async function handleStatus(req, res) {
     auth: { mode: authMode, zenKey: maskKey(config.defaultZenKey), proxyKey: !!config.proxyKey },
     responsesModels: [...(config.responsesModels ?? [])],
     rateLimit: { max: config.rateLimitMax, windowMs: config.rateLimitWindowMs },
-    models: { total: cache.data.length, allowed: ALLOWED().size },
+    models: {
+      total: cache.data.length,
+      allowed: ALLOWED().size,
+      served: cache.data.map((m) => m.id),
+    },
     sync: {
       ok: syncState.ok,
       at: syncState.at,

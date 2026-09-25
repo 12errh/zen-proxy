@@ -538,10 +538,14 @@ async function refreshModels() {
 
 function renderModels(st) {
   const tb = $("modelTable").querySelector("tbody")
-  const list = [...new Set([...config.fallbackModels, ...Object.keys(config.modelAliases)])]
-  $("modelCount").textContent = list.length + " configured"
+  // Show what upstream actually serves, unioned with the local config, so a
+  // model that exists but isn't configured yet is still visible (and addable).
+  const upstreamIds = ((st && st.models && st.models.served) || []).map((m) => (typeof m === "string" ? m : m.id))
+  const list = [...new Set([...upstreamIds, ...config.fallbackModels, ...Object.keys(config.modelAliases)])]
+  const unconfigured = upstreamIds.filter((m) => !config.fallbackModels.includes(m) && !config.modelAliases[m])
+  $("modelCount").textContent = list.length + " available" + (unconfigured.length ? ` · ${unconfigured.length} not in fallback` : "")
   if (st && st.sync) renderSync(st.sync)
-  if (!list.length) { tb.innerHTML = '<tr><td colspan="4" class="empty">no models configured — add one.</td></tr>'; return }
+  if (!list.length) { tb.innerHTML = '<tr><td colspan="4" class="empty">no models available right now.</td></tr>'; return }
   tb.innerHTML = list.map((m) => {
   const sync = st && st.sync
   const ms = modelStatus(m, sync)
@@ -551,11 +555,14 @@ function renderModels(st) {
   const isResp = (config.responsesModels || []).some((p) => (p.endsWith("*") ? m.startsWith(p.slice(0, -1)) : m === p))
   const fmtBadge = isResp ? '<span class="badge mut" style="margin-left:6px">responses</span>' : ""
   const isDefault = m === config.defaultModel
-  return `<tr>
+  const isConfigured = config.fallbackModels.includes(m) || !!config.modelAliases[m]
+  const notInFallback = !config.fallbackModels.includes(m) && !config.modelAliases[m]
+  const addBtn = notInFallback ? `<button onclick='addModel(${jsStr(m)})'>+ add</button>` : ""
+  return `<tr${notInFallback ? ' style="opacity:.65"' : ""}>
       <td class="mono">${display}${msBadge}${fmtBadge}</td>
       <td><input type="radio" name="defaultModel" value="${escapeAttr(m)}" ${isDefault ? "checked" : ""} onchange='setDefault(${jsStr(m)})'></td>
       <td class="mono testCell" id="tc-${escapeAttr(m)}">–</td>
-      <td class="row" style="gap:10px"><button onclick='testModel(${jsStr(m)})'>Test</button>${aliasTarget ? "" : `<button onclick='removeModel(${jsStr(m)})'>✕</button>`}</td>
+      <td class="row" style="gap:10px"><button onclick='testModel(${jsStr(m)})'>Test</button>${addBtn}${aliasTarget || !isConfigured ? "" : `<button onclick='removeModel(${jsStr(m)})'>✕</button>`}</td>
     </tr>`
   }).join("")
   if (st) $("ovModels").textContent = st.models.total
@@ -627,8 +634,8 @@ async function testZenKey() {
   } catch (e) { hint.textContent = "test failed"; toast("Test failed", "bad") }
 }
 
-async function addModel() {
-  const m = $("newModel").value.trim()
+async function addModel(preset) {
+  const m = (preset || $("newModel").value).trim()
   if (!m) return
   const cfg = await api("/api/config")
   if (!cfg.config.fallbackModels.includes(m)) cfg.config.fallbackModels.push(m)

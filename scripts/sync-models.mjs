@@ -83,10 +83,13 @@ async function probe(id, ua, session) {
     } catch {}
     if (res.ok && !err) return { status: "ok", ms: Date.now() - started }
     if (res.status === 429) return { status: "rate-limited", ms: Date.now() - started }
-    if (/RegionError|not available in your country/i.test(err) || res.status === 403)
-      return { status: "region-locked", ms: Date.now() - started }
+    // Definitive removal only when the model is genuinely gone. A 403
+    // (FreeTierError / RegionError) is a temporary access policy, so the model
+    // stays in the list and recovers on its own.
     if (res.status === 404 || /not supported|no such model|does not exist|model_not_found/i.test(err))
       return { status: "removed", ms: Date.now() - started, detail: err }
+    if (/FreeTierError|free tier can only|RegionError|not available in your country|overloaded|unavailable/i.test(err) || res.status === 403)
+      return { status: "unavailable", ms: Date.now() - started, detail: err }
     return { status: "unstable", ms: Date.now() - started, detail: err }
   } catch (e) {
     return { status: "unstable", ms: -1, detail: String(e?.message || e) }
@@ -169,10 +172,10 @@ async function main() {
   const bucket = (status) => ordered.filter((id) => results.get(id).status === status)
   const healthy = bucket("ok")
   const rateLimited = bucket("rate-limited")
-  const regionLocked = bucket("region-locked")
+  const unavailable = bucket("unavailable")
   const unstable = bucket("unstable")
   const removed = bucket("removed")
-  log(`ok=${healthy.length} rate-limited=${rateLimited.length} region-locked=${regionLocked.length} unstable=${unstable.length} removed=${removed.length}`)
+  log(`ok=${healthy.length} rate-limited=${rateLimited.length} unavailable=${unavailable.length} unstable=${unstable.length} removed=${removed.length}`)
 
   // Churn-free policy: keep the previous order, drop only models that are truly
   // gone upstream, and append brand-new free models. Status is diagnostic — a
@@ -186,7 +189,7 @@ async function main() {
     nextList,
     healthy,
     rateLimited,
-    regionLocked,
+    unavailable,
     unstable,
     removed,
     details: Object.fromEntries([...results].map(([id, r]) => [id, r])),

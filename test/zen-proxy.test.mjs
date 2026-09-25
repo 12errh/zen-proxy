@@ -399,6 +399,87 @@ describe("sync prunes unsupported models", () => {
     assert.ok(s.flaky.includes("mimo-v2.5-free"), "not counted as dead")
     assert.ok(zp.config.fallbackModels.includes("mimo-v2.5-free"), "still configured")
   })
+
+  test("repeated 403 FreeTierError never deletes the model from config", async () => {
+    // The free-tier block is temporary: the model must survive so it can come
+    // back on its own, and so the user does not silently lose their list.
+    const list = ["space-bunny-free", "mimo-v2.5-free", "big-pickle"]
+    zp.saveConfig({ fallbackModels: [...list], defaultModel: "", autoSyncIntervalMs: 0, cacheMs: 0 })
+    const blocked = () =>
+      jsonResponse({ type: "error", error: { type: "FreeTierError", message: "OpenCode's free tier can only be used from within OpenCode" } }, 403)
+    globalThis.fetch = routeFetch([
+      ["/models", () => jsonResponse({ data: list.map((id) => ({ id })) })],
+      ["/chat/completions", (u, opts) =>
+        JSON.parse(opts.body).model === "space-bunny-free" ? jsonResponse({ model: "ok", choices: [] }) : blocked(),
+      ],
+    ])
+    for (let i = 0; i < 3; i++) {
+      const s = await zp.syncModels()
+      assert.equal(s.ok, true)
+      assert.deepEqual([...zp.config.fallbackModels].sort(), [...list].sort(), `config intact after sync #${i + 1}`)
+      assert.ok(!s.dead.includes("mimo-v2.5-free"), "temporary block is not 'dead'")
+      assert.ok(s.flaky.includes("mimo-v2.5-free"), "reported as flaky/unavailable")
+    }
+  })
+
+  test("a model that comes back is reported working again", async () => {
+    const list = ["space-bunny-free", "mimo-v2.5-free"]
+    zp.saveConfig({ fallbackModels: [...list], defaultModel: "", autoSyncIntervalMs: 0, cacheMs: 0 })
+    let blocked = true
+    globalThis.fetch = routeFetch([
+      ["/models", () => jsonResponse({ data: list.map((id) => ({ id })) })],
+      [
+        "/chat/completions",
+        (u, opts) => {
+          const m = JSON.parse(opts.body).model
+          if (m === "space-bunny-free") return jsonResponse({ model: "ok", choices: [] })
+          return blocked
+            ? jsonResponse({ type: "error", error: { type: "FreeTierError", message: "free tier can only be used from within OpenCode" } }, 403)
+            : jsonResponse({ model: "ok", choices: [] })
+        },
+      ],
+    ])
+    await zp.syncModels()
+    assert.ok(zp.config.fallbackModels.includes("mimo-v2.5-free"))
+    blocked = false
+    const s = await zp.syncModels()
+    assert.ok(s.working.includes("mimo-v2.5-free"), "recovered model is working")
+    assert.equal(zp.effectiveDefault(), "space-bunny-free", "first healthy in list order still wins")
+  })
+})
+
+describe("fallback transparency", () => {
+  test("reply names the model that actually served it when it differs", async () => {
+    zp.saveConfig({ fallbackModels: ["big-pickle", "space-bunny-free"], defaultModel: "", autoSyncIntervalMs: 0, cacheMs: 0 })
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          const sent = JSON.parse(opts.body)
+          if (sent.model === "big-pickle") {
+            return jsonResponse({ type: "error", error: { type: "FreeTierError", message: "free tier can only be used from within OpenCode" } }, 403)
+          }
+          return jsonResponse({ model: "space-bunny-free", choices: [{ message: { role: "assistant", content: "hi" } }] })
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: "big-pickle", messages: [] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 200)
+    const data = JSON.parse(res.body)
+    assert.equal(data.model, "big-pickle", "client still sees the model it asked for")
+    assert.equal(data.zen_served_by, "space-bunny-free", "but knows who actually answered")
+  })
+
+  test("no served_by field when the requested model answered", async () => {
+    const m = zp.config.fallbackModels[0]
+    globalThis.fetch = routeFetch([["/chat/completions", () => jsonResponse({ model: m, choices: [] })]])
+    const req = mockReq({ _body: JSON.stringify({ model: m, messages: [] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(JSON.parse(res.body).zen_served_by, undefined)
+  })
 })
 
 describe("auth visibility & key test", () => {
