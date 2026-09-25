@@ -438,6 +438,212 @@ describe("auth visibility & key test", () => {
   })
 })
 
+describe("responses API translation", () => {
+  test("modelFormat resolves patterns, exact ids and defaults to chat", () => {
+    zp.saveConfig({ responsesModels: ["gpt-5*", "gpt-6*", "grok-*", "muse-spark-*", "exact-model"] })
+    assert.equal(zp.modelFormat("gpt-5.5"), "responses")
+    assert.equal(zp.modelFormat("gpt-6-astra"), "responses")
+    assert.equal(zp.modelFormat("grok-4.6"), "responses")
+    assert.equal(zp.modelFormat("muse-spark-1.3-contributor-free"), "responses")
+    assert.equal(zp.modelFormat("exact-model"), "responses")
+    assert.equal(zp.modelFormat("mimo-v2.5-free"), "chat")
+    assert.equal(zp.modelFormat("big-pickle"), "chat")
+  })
+
+  test("a new model works by config alone, no code change", () => {
+    zp.saveConfig({ responsesModels: ["brand-new-2*"] })
+    assert.equal(zp.modelFormat("brand-new-2-flash"), "responses")
+    assert.equal(zp.modelFormat("gpt-5.5"), "chat", "unknown patterns fall back to chat")
+  })
+
+  test("chat messages become Responses input items", () => {
+    const input = zp.chatMessagesToInput([
+      { role: "system", content: "be brief" },
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+      { role: "assistant", content: "", tool_calls: [{ id: "call_1", type: "function", function: { name: "ls", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "call_1", content: "file.txt" },
+    ])
+    assert.deepEqual(input[0], { role: "system", content: "be brief" })
+    assert.deepEqual(input[1], { role: "user", content: "hi" })
+    assert.deepEqual(input[2], { type: "function_call", call_id: "call_1", name: "ls", arguments: "{}" })
+    assert.deepEqual(input[3], { type: "function_call_output", call_id: "call_1", output: "file.txt" })
+  })
+
+  test("tool_calls survive the round trip", () => {
+    const out = zp.responsesToChat(
+      {
+        id: "resp_1",
+        output: [
+          { type: "reasoning", summary: [{ text: "thinking" }] },
+          { type: "message", content: [{ type: "output_text", text: "let me look" }] },
+          { type: "function_call", call_id: "call_9", name: "read", arguments: '{"p":"a"}' },
+        ],
+        usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 },
+      },
+      "gpt-5.5",
+    )
+    assert.equal(out.object, "chat.completion")
+    assert.equal(out.model, "gpt-5.5")
+    assert.equal(out.choices[0].message.content, "let me look")
+    assert.equal(out.choices[0].message.reasoning_content, "thinking")
+    assert.deepEqual(out.choices[0].message.tool_calls, [
+      { id: "call_9", type: "function", function: { name: "read", arguments: '{"p":"a"}' } },
+    ])
+    assert.equal(out.choices[0].finish_reason, "tool_calls")
+    assert.equal(out.usage.total_tokens, 14)
+  })
+
+  test("responsesRequest maps tools, sampling and token budget", () => {
+    const p = zp.responsesRequest(
+      {
+        messages: [{ role: "user", content: "hi" }],
+        temperature: 0.2,
+        top_p: 0.9,
+        max_tokens: 4096,
+        tools: [{ type: "function", function: { name: "read", description: "d", parameters: { type: "object" } } }],
+        tool_choice: "auto",
+      },
+      "gpt-5.5",
+      true,
+    )
+    assert.equal(p.model, "gpt-5.5")
+    assert.equal(p.stream, true)
+    assert.equal(p.max_output_tokens, 4096)
+    assert.equal(p.temperature, 0.2)
+    assert.deepEqual(p.tools, [{ type: "function", name: "read", description: "d", parameters: { type: "object" } }])
+    assert.equal(p.tool_choice, "auto")
+    assert.equal(p.messages, undefined, "chat-only fields are not forwarded")
+  })
+
+  test("SSE deltas translate to chat chunk deltas", () => {
+    const state = { tools: [] }
+    assert.deepEqual(zp.responsesEventToDeltas("", { type: "response.output_text.delta", delta: "he" }, state), [{ content: "he" }])
+    assert.deepEqual(zp.responsesEventToDeltas("", { type: "response.reasoning_text.delta", delta: "hm" }, state), [
+      { reasoning_content: "hm" },
+    ])
+    const added = zp.responsesEventToDeltas("", { type: "response.output_item.added", item: { type: "function_call", call_id: "c1", name: "ls" } }, state)
+    assert.equal(added[0].tool_calls[0].id, "c1")
+    const args = zp.responsesEventToDeltas("", { type: "response.function_call_arguments.delta", item_id: "c1", delta: "{}" }, state)
+    assert.deepEqual(args[0].tool_calls[0].function.arguments, "{}")
+  })
+
+  test("handleChat routes a responses model to /responses and returns chat shape", async () => {
+    zp.saveConfig({ responsesModels: ["gpt-5*"], fallbackModels: ["gpt-5.5"], defaultModel: "gpt-5.5" })
+    let hitUrl = ""
+    let sentBody = null
+    globalThis.fetch = routeFetch([
+      [
+        "/responses",
+        (u, opts) => {
+          hitUrl = u
+          sentBody = JSON.parse(opts.body)
+          return jsonResponse({ id: "resp_1", output: [{ type: "message", content: [{ type: "output_text", text: "yo" }] }], usage: { input_tokens: 3, output_tokens: 1 } })
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: "gpt-5.5", messages: [{ role: "user", content: "hi" }] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 200)
+    assert.match(hitUrl, /\/responses$/)
+    assert.equal(sentBody.model, "gpt-5.5")
+    assert.deepEqual(sentBody.input, [{ role: "user", content: "hi" }])
+    const data = JSON.parse(res.body)
+    assert.equal(data.object, "chat.completion")
+    assert.equal(data.model, "gpt-5.5")
+    assert.equal(data.choices[0].message.content, "yo")
+  })
+
+  test("streams a responses model back as chat.completion.chunk SSE", async () => {
+    zp.saveConfig({ responsesModels: ["gpt-5*"], fallbackModels: ["gpt-5.5"], defaultModel: "gpt-5.5" })
+    const sse =
+      `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "he" })}\n\n` +
+      `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "llo" })}\n\n` +
+      `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { usage: { input_tokens: 5, output_tokens: 2 } } })}\n\n`
+    globalThis.fetch = routeFetch([
+      ["/responses", () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } })],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: "gpt-5.5", messages: [], stream: true }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    await res.done
+    assert.equal(res.state.status, 200)
+    assert.match(res.body, /"object":"chat\.completion\.chunk"/)
+    assert.match(res.body, /"content":"he"/)
+    assert.match(res.body, /"content":"llo"/)
+    assert.match(res.body, /"finish_reason":"stop"/)
+    assert.match(res.body, /"total_tokens":7/)
+    assert.ok(res.body.includes("data: [DONE]"))
+  })
+})
+
+describe("rate limiting", () => {
+  test("disabled by default so the proxy never blocks itself", () => {
+    zp.saveConfig({ rateLimitMax: 0 })
+    for (let i = 0; i < 200; i++) assert.equal(zp.rateLimitFor(mockReq()).limited, false)
+  })
+
+  test("blocks the Nth+1 chat request and reports Retry-After", () => {
+    zp.saveConfig({ rateLimitMax: 3, rateLimitWindowMs: 60_000 })
+    const req = mockReq({ remoteAddress: "5.5.5.5" })
+    assert.equal(zp.rateLimitFor(req).limited, false)
+    assert.equal(zp.rateLimitFor(req).limited, false)
+    assert.equal(zp.rateLimitFor(req).limited, false)
+    const hit = zp.rateLimitFor(req)
+    assert.equal(hit.limited, true)
+    assert.ok(hit.retryAfter > 0 && hit.retryAfter <= 60, `retry-after sane: ${hit.retryAfter}`)
+  })
+
+  test("limits are per client, not global", () => {
+    zp.saveConfig({ rateLimitMax: 2, rateLimitWindowMs: 60_000 })
+    const a = mockReq({ remoteAddress: "5.5.5.5" })
+    const b = mockReq({ remoteAddress: "6.6.6.6" })
+    zp.rateLimitFor(a)
+    zp.rateLimitFor(a)
+    assert.equal(zp.rateLimitFor(a).limited, true)
+    assert.equal(zp.rateLimitFor(b).limited, false, "second client is unaffected")
+  })
+
+  test("dashboard polling and /health are never throttled", async () => {
+    zp.saveConfig({ rateLimitMax: 1, rateLimitWindowMs: 60_000, cacheMs: 0 })
+    globalThis.fetch = routeFetch([["/models", jsonResponse({ data: [] })]])
+    const req = mockReq({ method: "GET", url: "/health", remoteAddress: "5.5.5.5" })
+    for (let i = 0; i < 5; i++) {
+      const res = mockRes()
+      await zp.router(req, res)
+      assert.equal(res.state.status, 200, `health check #${i} must stay open`)
+    }
+  })
+
+  test("chat endpoint returns 429 with retry-after once over the limit", async () => {
+    zp.saveConfig({ rateLimitMax: 1, rateLimitWindowMs: 60_000, fallbackModels: ["mimo-v2.5-free"], defaultModel: "mimo-v2.5-free" })
+    globalThis.fetch = routeFetch([
+      ["/chat/completions", () => jsonResponse({ model: "ok", choices: [] })],
+      ["/responses", () => jsonResponse({ output: [] })],
+    ])
+    const body = JSON.stringify({ model: "mimo-v2.5-free", messages: [] })
+    const first = mockReq({ _body: body, remoteAddress: "7.7.7.7" })
+    const r1 = mockRes()
+    await zp.router(first, r1)
+    assert.equal(r1.state.status, 200)
+    const second = mockReq({ _body: body, remoteAddress: "7.7.7.7" })
+    const r2 = mockRes()
+    await zp.router(second, r2)
+    assert.equal(r2.state.status, 429)
+    assert.ok(Number(r2.state.headers["retry-after"]) > 0, "sets Retry-After")
+  })
+})
+
+describe("FreeTierError handling", () => {
+  test("403 free-tier block rotates to the next model", () => {
+    assert.equal(zp.retryableUpstream(403, { error: { type: "FreeTierError", message: "OpenCode's free tier can only be used from within OpenCode" } }), true)
+  })
+
+  test("real auth 403 is not treated as retryable", () => {
+    assert.equal(zp.retryableUpstream(403, { error: { type: "auth_error", message: "bad token" } }), false)
+  })
+})
+
 describe("recordReq stats", () => {
   test("dedups consecutive identical records", () => {
     const req = mockReq()
@@ -637,8 +843,10 @@ describe("handleChat", () => {
   })
 
   test("all candidates 429 → final 429 with last upstream error", async () => {
+    const err429 = () => jsonResponse({ error: { message: "FreeUsageLimitError" } }, 429)
     globalThis.fetch = routeFetch([
-      ["/chat/completions", () => jsonResponse({ error: { message: "FreeUsageLimitError" } }, 429)],
+      ["/chat/completions", err429],
+      ["/responses", err429],
     ])
     const req = mockReq({ _body: JSON.stringify({ model: "whatever", messages: [] }) })
     const res = mockRes()
@@ -696,13 +904,12 @@ describe("handleChat", () => {
   })
 
   test("upstream network failure → 502, no hang", async () => {
+    const boom = () => {
+      throw new Error("ECONNREFUSED")
+    }
     globalThis.fetch = routeFetch([
-      [
-        "/chat/completions",
-        () => {
-          throw new Error("ECONNREFUSED")
-        },
-      ],
+      ["/chat/completions", boom],
+      ["/responses", boom],
     ])
     const req = mockReq({ _body: JSON.stringify({ model: "whatever", messages: [] }) })
     const res = mockRes()

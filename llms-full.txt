@@ -144,7 +144,10 @@ Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded wh
 | `uaRefreshMs` | `21600000` | How often to check for a new opencode version (ms) |
 | `injectSession` | `true` | Mint an `x-opencode-session` header per client (upstream rejects requests without one) |
 | `defaultModel` | `""` | Empty = auto: pick the first *healthy* free model (no more hardcoded/vanished defaults) |
-| `fallbackModels` | `["mimo-v2.5-free","big-pickle", …]` | Tried in order on `429`/`5xx` and dead-model `4xx`; auto-sync prunes vanished models and adds new ones |
+| `fallbackModels` | `["space-bunny-free","mimo-v2.6-flash-free", …]` | Tried in order on `429`/`5xx` and dead-model `4xx`; auto-sync prunes vanished models and adds new ones |
+| `responsesModels` | `["gpt-5*","gpt-6*","grok-*","muse-spark-*"]` | Models served on `/v1/responses` (patterns may end in `*`); the proxy translates to/from chat completions for you |
+| `rateLimitMax` | `0` (off) | Max chat requests per client per window — `0` disables the limiter |
+| `rateLimitWindowMs` | `60000` | Rate-limit window |
 | `modelAliases` | `{}` | e.g. `{"gpt-4o":"mimo-v2.5-free"}` — reply model rewritten back |
 | `proxyKey` | `""` | If set, clients must send it as `Bearer`; locks the dashboard too |
 | `defaultZenKey` | `""` | Your own Zen key (BYOK) instead of anonymous `public` |
@@ -152,7 +155,7 @@ Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded wh
 | `timeoutMs` | `120000` | Upstream timeout for non-streaming |
 | `cacheMs` | `30000` | `/v1/models` cache TTL |
 
-Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION` (`0` to disable), `AUTO_UA` (`0` to disable), `UA_REFRESH_MS`, `DEFAULT_MODEL`, `FALLBACK_MODELS` (JSON), `MODEL_ALIASES` (JSON), `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED=1`, `TIMEOUT_MS`, `CACHE_MS`, `ZEN_PROXY_CONFIG` (custom config path).
+Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION` (`0` to disable), `AUTO_UA` (`0` to disable), `UA_REFRESH_MS`, `RESPONSES_MODELS` (JSON), `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW_MS`, `DEFAULT_MODEL`, `FALLBACK_MODELS` (JSON), `MODEL_ALIASES` (JSON), `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED=1`, `TIMEOUT_MS`, `CACHE_MS`, `ZEN_PROXY_CONFIG` (custom config path).
 
 ### bring your own key
 
@@ -191,6 +194,7 @@ sudo systemctl enable --now zen-proxy
 ## caveats
 
 - This rides opencode's **anonymous free tier**: per-IP request/daily quotas and a shared pool that's sometimes saturated. Don't rotate/abuse IPs or run heavy workloads anonymously.
+- opencode keeps **tightening the anonymous free tier** — most `-free` models now answer `403 FreeTierError: "OpenCode's free tier can only be used from within OpenCode"`, and that hits the real opencode client too. The proxy detects it and rolls to the next working model, so requests keep succeeding, but the pool is much smaller than it used to be. A Zen API key (BYOK) is the reliable path.
 - The `-free` models are "as-is" free tiers — expect rate limits and occasional provider errors.
 - For anything serious, **BYOK**.
 

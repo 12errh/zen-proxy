@@ -18,9 +18,11 @@ zen-proxy solves this by injecting the correct `User-Agent` and a stable per-cli
 - **Auth**: anonymous via `Bearer public`; BYOK via `defaultZenKey` config or an `x-zen-key` / real bearer token.
 - **Session**: opencode's free tier requires `x-opencode-session`. The proxy mints one per client (stable per source IP, or one shared id for local clients) when the caller doesn't send one; set `injectSession: false` to disable.
 - **Quota**: the free tier is per-IP; the proxy forwards the real client IP (`x-real-ip`/`x-forwarded-for` when `trustForwarded` is on), but for local/loopback clients it omits `x-real-ip` so upstream counts your machine's real IP — matching opencode direct usage and avoiding a bogus shared `127.0.0.1` bucket. Do not abuse or rotate IPs.
-- **Model fallback**: tries `fallbackModels` in order on 429/5xx **and** on dead-model 4xx responses (e.g. `Model is unavailable`, geo-blocked free models, `Model not supported`), honors `retry-after`.
+- **Model fallback**: tries `fallbackModels` in order on 429/5xx **and** on model-level 4xx (`Model is unavailable`, `FreeTierError`, geo-blocked or unsupported models), honors `retry-after`.
+- **Endpoint routing**: Zen serves each model on either `/v1/chat/completions` or `/v1/responses`. `responsesModels` lists the patterns (`*` allowed); the proxy translates requests, tool calls, reasoning and SSE streams in both directions, so any OpenAI-compatible client works either way.
+- **Rate limiting**: optional per-client limit on chat requests (`rateLimitMax`, `0` = off). `/health` and the dashboard are never throttled.
 - **Model aliases**: `modelAliases` maps any name (e.g. `gpt-4o`) to a free model; reply model is rewritten back.
-- **Config**: `zen-proxy.json` (hot-reloaded) or env vars: `PORT`, `HOST`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION`, `AUTO_UA`, `UA_REFRESH_MS`, `DEFAULT_MODEL`, `FALLBACK_MODELS`, `MODEL_ALIASES`, `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED`, `TIMEOUT_MS`, `CACHE_MS`, `AUTO_SYNC`, `AUTO_SYNC_MS`, `ZEN_PROXY_CONFIG`.
+- **Config**: `zen-proxy.json` (hot-reloaded) or env vars: `PORT`, `HOST`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION`, `AUTO_UA`, `UA_REFRESH_MS`, `RESPONSES_MODELS`, `RATE_LIMIT_MAX`, `DEFAULT_MODEL`, `FALLBACK_MODELS`, `MODEL_ALIASES`, `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED`, `TIMEOUT_MS`, `CACHE_MS`, `AUTO_SYNC`, `AUTO_SYNC_MS`, `ZEN_PROXY_CONFIG`.
 - **Auto model sync**: probes every upstream free model with a tiny completion (sending a session header, matching real traffic), prunes vanished/unsupported models immediately, re-adds recovered ones, and updates the config automatically — no hand-tuning. A GitHub Action keeps the shipped list in the repo current too.
 - **Requirements**: Node.js >= 18. Zero npm dependencies.
 
@@ -44,7 +46,7 @@ Or clone and run: `git clone https://github.com/12errh/zen-proxy.git && cd zen-p
     "zen": {
       "baseURL": "http://127.0.0.1:8787/v1",
       "apiKey": "public",
-      "models": { "mimo-v2.5-free": {} }
+      "models": { "space-bunny-free": {} }
     }
   }
 }
@@ -55,7 +57,7 @@ Quick test:
 ```bash
 curl -s http://127.0.0.1:8787/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"mimo-v2.5-free","messages":[{"role":"user","content":"say hi"}]}'
+  -d '{"model":"space-bunny-free","messages":[{"role":"user","content":"say hi"}]}'
 ```
 
 ## More

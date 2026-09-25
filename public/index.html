@@ -392,6 +392,13 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
       <div class="checkbox"><input type="checkbox" id="cfgAutoUA"><span>Auto-track opencode releases &amp; update the User-Agent</span></div>
       <label>User-agent refresh interval (ms)</label><input id="cfgUaMs" type="number">
       <div class="checkbox"><input type="checkbox" id="cfgInject"><span>Inject <code>x-opencode-session</code> header per client (free tier needs it)</span></div>
+      <div class="checkbox"><input type="checkbox" id="cfgRateLimit"><span>Rate-limit chat requests per client (0 = off)</span></div>
+      <div class="row" style="gap:10px;margin-top:6px">
+        <div><label>Requests / window</label><input id="cfgRateMax" type="number" min="0" style="width:120px"></div>
+        <div><label>Window (ms)</label><input id="cfgRateWindow" type="number" min="1000" style="width:140px"></div>
+      </div>
+      <label>Responses-API models (json array — patterns may end in *)</label>
+      <textarea id="cfgResponses"></textarea>
       <div class="row" style="margin-top:22px">
         <button class="primary" onclick="saveConfig()">Save &amp; apply</button>
         <button onclick="reloadConfig()">Discard / reload</button>
@@ -541,9 +548,11 @@ function renderModels(st) {
   const aliasTarget = config.modelAliases[m]
   const display = aliasTarget ? escapeHtml(m) + ' <span class="badge mut">→ ' + escapeHtml(aliasTarget) + "</span>" : escapeHtml(m)
   const msBadge = ms ? `<span class="badge ${ms.cls}" style="margin-left:7px">${ms.label}</span>` : ""
+  const isResp = (config.responsesModels || []).some((p) => (p.endsWith("*") ? m.startsWith(p.slice(0, -1)) : m === p))
+  const fmtBadge = isResp ? '<span class="badge mut" style="margin-left:6px">responses</span>' : ""
   const isDefault = m === config.defaultModel
   return `<tr>
-      <td class="mono">${display}${msBadge}</td>
+      <td class="mono">${display}${msBadge}${fmtBadge}</td>
       <td><input type="radio" name="defaultModel" value="${escapeAttr(m)}" ${isDefault ? "checked" : ""} onchange='setDefault(${jsStr(m)})'></td>
       <td class="mono testCell" id="tc-${escapeAttr(m)}">–</td>
       <td class="row" style="gap:10px"><button onclick='testModel(${jsStr(m)})'>Test</button>${aliasTarget ? "" : `<button onclick='removeModel(${jsStr(m)})'>✕</button>`}</td>
@@ -658,6 +667,10 @@ async function populateConfigForm() {
   $("cfgAutoUA").checked = config.autoUA !== false
   $("cfgUaMs").value = config.uaRefreshMs ?? 21600000
   $("cfgInject").checked = config.injectSession !== false
+  $("cfgRateLimit").checked = Number(config.rateLimitMax) > 0
+  $("cfgRateMax").value = config.rateLimitMax ?? 0
+  $("cfgRateWindow").value = config.rateLimitWindowMs ?? 60000
+  $("cfgResponses").value = JSON.stringify(config.responsesModels ?? [], null, 2)
   try {
     const st = await api("/api/status")
     const auth = st.auth || {}
@@ -689,7 +702,10 @@ async function saveConfig() {
     autoUA: $("cfgAutoUA").checked,
     uaRefreshMs: Number($("cfgUaMs").value || 21600000),
     injectSession: $("cfgInject").checked,
+    rateLimitMax: $("cfgRateLimit").checked ? Number($("cfgRateMax").value || 0) : 0,
+    rateLimitWindowMs: Number($("cfgRateWindow").value || 60000),
   }
+  try { body.responsesModels = JSON.parse($("cfgResponses").value || "[]") } catch { toast("Invalid JSON — responses models", "bad"); return }
   if ($("cfgZenKey").value !== savedZenKeyMasked) body.defaultZenKey = $("cfgZenKey").value
   try {
     await api("/api/config", { method: "PUT", body: JSON.stringify(body) })

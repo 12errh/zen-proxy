@@ -19,6 +19,20 @@ const UA = "opencode/1.18.30"
 const CONCURRENCY = 3
 const TIMEOUT_MS = 20_000
 const KNOWN_FREE = new Set(["big-pickle"])
+// Free models that are NOT reachable through /chat/completions or /responses.
+// jev-* is served on /v1/systemone (structured classification), so routing it
+// through a chat endpoint can only ever fail.
+const NOT_CHAT_SERVABLE = [/^jev-/]
+// Endpoint family is read from zen-proxy.mjs (see readResponsesModels) so the
+// script and the proxy can never drift apart.
+
+let RESPONSES_PATTERNS = []
+function modelFormat(id) {
+  for (const p of RESPONSES_PATTERNS) {
+    if (p.endsWith("*") ? id.startsWith(p.slice(0, -1)) : id === p) return "responses"
+  }
+  return "chat"
+}
 
 function log(...args) {
   console.log(new Date().toISOString(), ...args)
@@ -41,8 +55,9 @@ async function latestOpencodeVersion() {
 
 async function probe(id, ua, session) {
   const started = Date.now()
+  const format = modelFormat(id)
   try {
-    const res = await fetch(`${UPSTREAM}/chat/completions`, {
+    const res = await fetch(`${UPSTREAM}${format === "responses" ? "/responses" : "/chat/completions"}`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -51,7 +66,11 @@ async function probe(id, ua, session) {
         "user-agent": ua,
         "x-opencode-session": session,
       },
-      body: JSON.stringify({ model: id, messages: [{ role: "user", content: "ping" }], max_tokens: 5 }),
+      body: JSON.stringify(
+        format === "responses"
+          ? { model: id, input: "ping", max_output_tokens: 32 }
+          : { model: id, messages: [{ role: "user", content: "ping" }], max_tokens: 5 },
+      ),
       signal: AbortSignal.timeout(TIMEOUT_MS),
     })
     let err = ""
@@ -76,6 +95,14 @@ async function probe(id, ua, session) {
 
 function readDefaultList(src) {
   const m = src.match(/JSON\.stringify\(\[([\s\S]*?)\]\),\n\s*\),\n\s*modelAliases:/)
+  if (!m) return []
+  return [...m[1].matchAll(/"([^"]+)"/g)].map((x) => x[1])
+}
+
+// Endpoint family comes from zen-proxy.mjs itself so there is a single source
+// of truth (no drift between the proxy and this script).
+function readResponsesModels(src) {
+  const m = src.match(/responsesModels: JSON\.parse\(\s*ENV\.RESPONSES_MODELS \?\?\s*JSON\.stringify\(\[([\s\S]*?)\]\)/)
   if (!m) return []
   return [...m[1].matchAll(/"([^"]+)"/g)].map((x) => x[1])
 }
@@ -115,12 +142,16 @@ async function main() {
 
   const listRes = await getJSON(`${UPSTREAM}/models`)
   const upstream = (listRes.data ?? []).map((m) => m.id)
-  const catalog = [...new Set(upstream.filter((id) => id.endsWith("-free") || KNOWN_FREE.has(id)))]
+  const catalog = [
+    ...new Set(upstream.filter((id) => (id.endsWith("-free") || KNOWN_FREE.has(id)) && !NOT_CHAT_SERVABLE.some((re) => re.test(id)))),
+  ]
   if (!catalog.length) throw new Error("no free models found upstream")
   log(`upstream free catalog: ${catalog.length} models`)
 
   // Keep the previous order as a stable prefix, then append brand-new models.
   const src = fs.readFileSync(MAIN, "utf8")
+  RESPONSES_PATTERNS = readResponsesModels(src)
+  log(`responses-endpoint patterns: ${RESPONSES_PATTERNS.join(", ") || "(none)"}`)
   const previous = readDefaultList(src).filter((id) => catalog.includes(id))
   const ordered = [...previous, ...catalog.filter((id) => !previous.includes(id))]
 

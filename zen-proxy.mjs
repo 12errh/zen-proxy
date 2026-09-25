@@ -26,20 +26,28 @@ const DEFAULT_CONFIG = {
   fallbackModels: JSON.parse(
     ENV.FALLBACK_MODELS ??
       JSON.stringify([
+        "space-bunny-free",
+        "mimo-v2.6-flash-free",
         "mimo-v2.5-free",
         "big-pickle",
         "ling-3.0-flash-fin-free",
-        "deepseek-v4-flash-free",
-        "nemotron-3.5-lightning-free",
-        "nemotron-3-ultra-free",
         "muse-spark-1.3-contributor-free",
         "muse-spark-1.2-contributor-free",
-        "jev-1.13-free",
-        "mimo-v2.6-flash-free",
-        "space-bunny-free",
+        "nemotron-3.5-lightning-free",
+        "nemotron-3-ultra-free",
+        "deepseek-v4-flash-free",
       ]),
   ),
   modelAliases: JSON.parse(ENV.MODEL_ALIASES ?? "{}"),
+  // opencode Zen serves each model on a specific endpoint family
+  // (chat/completions | responses | messages). Patterns may end in `*`.
+  // Source of truth: https://opencode.ai/docs/zen
+  responsesModels: JSON.parse(
+    ENV.RESPONSES_MODELS ??
+      JSON.stringify(["gpt-5*", "gpt-6*", "grok-*", "muse-spark-*"]),
+  ),
+  rateLimitMax: Number(ENV.RATE_LIMIT_MAX ?? 0),
+  rateLimitWindowMs: Number(ENV.RATE_LIMIT_WINDOW_MS ?? 60_000),
   proxyKey: ENV.PROXY_KEY ?? "",
   defaultZenKey: ENV.ZEN_KEY ?? "",
   trustForwarded: ENV.TRUST_FORWARDED === "1",
@@ -108,6 +116,9 @@ const ALLOWED = () => new Set([...config.fallbackModels, ...Object.values(config
 const requestStats = { total: 0, errors: 0, recent: [], perMinute: new Map(), window60: [] }
 const VALID_MODEL_ID = /^[A-Za-z0-9._:@+/%-]+$/
 const MAX_BODY = 1024 * 1024
+// jev-* free models are served on /v1/systemone (structured classification),
+// not on a chat/responses endpoint, so they are never routable here.
+const NOT_CHAT_SERVABLE = [/^jev-/]
 
 // opencode's free tier requires every request to carry an `x-opencode-session`
 // header (upstream returns 400 `MissingSessionID` otherwise). Generic agents
@@ -149,6 +160,7 @@ const RETRYABLE_ERROR_TYPES = new Set([
   "ModelError",
   "MissingSessionID",
   "RegionError",
+  "FreeTierError",
   "model_not_found",
 ])
 // Free-tier backends fail with 4xx errors that are really per-model / per-provider
@@ -162,7 +174,157 @@ function retryableUpstream(status, body) {
   const t = body?.error?.type ?? body?.type ?? ""
   const msg = String(body?.error?.message ?? body?.message ?? "")
   if (RETRYABLE_ERROR_TYPES.has(t)) return true
-  return /model is unavailable|not supported|only be used in opencode|no such model|does not exist|overloaded|temporarily.*limit|upstream request failed/i.test(msg)
+  return /model is unavailable|not supported|only be used in opencode|free tier can only|no such model|does not exist|overloaded|temporarily.*limit|upstream request failed/i.test(msg)
+}
+
+// ---- endpoint family resolution -------------------------------------------
+// Zen serves each model on one endpoint family. We translate to/from the
+// Responses API ourselves instead of pattern-matching a single vendor in code,
+// so new models work by adding a pattern to `responsesModels` in config.
+function modelFormat(id) {
+  const s = String(id ?? "")
+  for (const p of config.responsesModels ?? []) {
+    if (typeof p !== "string" || !p) continue
+    if (p.endsWith("*") ? s.startsWith(p.slice(0, -1)) : s === p) return "responses"
+  }
+  return "chat"
+}
+
+function textOf(content) {
+  if (typeof content === "string") return content
+  if (Array.isArray(content)) {
+    return content
+      .map((p) => (typeof p === "string" ? p : (p?.text ?? p?.content ?? p?.input_text ?? "")))
+      .filter(Boolean)
+      .join("")
+  }
+  return content == null ? "" : String(content)
+}
+
+// chat.completions messages -> Responses API `input` items.
+// Keeps tool calls and tool results as first-class items so agent tool loops
+// survive the translation (the naive "join everything into one string" approach
+// silently destroys them).
+function chatMessagesToInput(messages) {
+  if (!Array.isArray(messages)) return String(messages ?? "")
+  const items = []
+  for (const m of messages) {
+    const role = m?.role ?? "user"
+    if (role === "tool" || role === "function") {
+      items.push({
+        type: "function_call_output",
+        call_id: m?.tool_call_id ?? m?.call_id ?? m?.id ?? "call_0",
+        output: textOf(m?.content) || " ",
+      })
+      continue
+    }
+    const text = textOf(m?.content)
+    if (text) items.push({ role: role === "assistant" ? "assistant" : role, content: text })
+    for (const tc of m?.tool_calls ?? []) {
+      items.push({
+        type: "function_call",
+        call_id: tc?.id ?? "call_0",
+        name: tc?.function?.name ?? tc?.name ?? "unknown",
+        arguments: tc?.function?.arguments ?? tc?.arguments ?? "{}",
+      })
+    }
+  }
+  return items.length ? items : [{ role: "user", content: "" }]
+}
+
+function chatToolsToResponses(tools) {
+  if (!Array.isArray(tools)) return undefined
+  const out = []
+  for (const t of tools) {
+    const fn = t?.type === "function" ? (t.function ?? t) : null
+    if (!fn?.name) continue
+    out.push({
+      type: "function",
+      name: fn.name,
+      ...(fn.description ? { description: fn.description } : {}),
+      ...(fn.parameters ? { parameters: fn.parameters } : {}),
+      ...(fn.strict != null ? { strict: fn.strict } : {}),
+    })
+  }
+  return out.length ? out : undefined
+}
+
+// Responses API result -> chat.completion, preserving tool calls + reasoning.
+function responsesToChat(data, requested) {
+  const output = Array.isArray(data?.output) ? data.output : []
+  let text = typeof data?.output_text === "string" ? data.output_text : ""
+  if (!text) {
+    const parts = []
+    for (const item of output) {
+      if (item?.type === "message" && Array.isArray(item.content)) {
+        for (const c of item.content) if (c?.type === "output_text" && c.text) parts.push(c.text)
+      }
+    }
+    text = parts.join("")
+  }
+  const toolCalls = output
+    .filter((i) => i?.type === "function_call")
+    .map((i, n) => ({
+      id: i.call_id ?? i.id ?? `call_${n}`,
+      type: "function",
+      function: { name: i.name ?? "unknown", arguments: typeof i.arguments === "string" ? i.arguments : JSON.stringify(i.arguments ?? {}) },
+    }))
+  const reasoning = output
+    .filter((i) => i?.type === "reasoning")
+    .flatMap((i) => (Array.isArray(i.summary) ? i.summary.map((s) => s?.text ?? "") : []))
+    .filter(Boolean)
+    .join("\n")
+  const u = data?.usage ?? {}
+  const message = { role: "assistant", content: text || null }
+  if (reasoning) message.reasoning_content = reasoning
+  if (toolCalls.length) message.tool_calls = toolCalls
+  return {
+    id: data?.id ?? `chatcmpl-${randomBytes(12).toString("hex")}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: requested,
+    choices: [
+      {
+        index: 0,
+        message,
+        finish_reason: toolCalls.length ? "tool_calls" : data?.status === "incomplete" ? "length" : "stop",
+      },
+    ],
+    usage: {
+      prompt_tokens: u.input_tokens ?? 0,
+      completion_tokens: u.output_tokens ?? 0,
+      total_tokens: u.total_tokens ?? (u.input_tokens ?? 0) + (u.output_tokens ?? 0),
+    },
+  }
+}
+
+// Responses SSE event -> chat.completion.chunk deltas.
+function responsesEventToDeltas(event, data, state) {
+  const type = event || data?.type || ""
+  const out = []
+  if (type === "response.output_text.delta" && data?.delta) out.push({ content: data.delta })
+  else if ((type === "response.reasoning_text.delta" || type === "response.reasoning_summary_text.delta") && data?.delta)
+    out.push({ reasoning_content: data.delta })
+  else if (type === "response.output_item.added" && data?.item?.type === "function_call") {
+    const item = data.item
+    const index = state.tools.length
+    state.tools.push({ id: item.call_id ?? item.id ?? `call_${index}` })
+    out.push({ tool_calls: [{ index, id: item.call_id ?? item.id ?? `call_${index}`, type: "function", function: { name: item.name ?? "unknown", arguments: "" } }] })
+  } else if (type === "response.function_call_arguments.delta" && data?.delta) {
+    let index = state.tools.findIndex((t) => t.id === (data.item_id ?? data.call_id ?? data.call_id))
+    if (index < 0) index = 0
+    if (!state.tools[index]) state.tools[index] = { id: data.call_id ?? `call_${index}` }
+    out.push({ tool_calls: [{ index, function: { arguments: data.delta } }] })
+  }
+  return out
+}
+
+function usageToChat(u = {}) {
+  return {
+    prompt_tokens: u.input_tokens ?? 0,
+    completion_tokens: u.output_tokens ?? 0,
+    total_tokens: u.total_tokens ?? (u.input_tokens ?? 0) + (u.output_tokens ?? 0),
+  }
 }
 
 function toBool(v, dflt) {
@@ -323,10 +485,12 @@ async function handleChat(req, res) {
   let used = requested
   for (const model of candidates) {
     used = model
-    const payload = { ...body, model }
+    const format = modelFormat(model)
+    const payload =
+      format === "responses" ? responsesRequest(body, model, isStream) : { ...body, model }
     let upstreamRes
     try {
-      upstreamRes = await fetch(`${config.upstream}/chat/completions`, {
+      upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
         method: "POST",
         headers: zenHeaders(req, auth),
         body: JSON.stringify(payload),
@@ -339,14 +503,21 @@ async function handleChat(req, res) {
     }
 
     if (upstreamRes.ok) {
-      const contentType = upstreamRes.headers.get("content-type") ?? "application/json"
       if (isStream) {
-        relayStream(req, res, upstreamRes, requested)
+        if (format === "responses") {
+          relayResponsesStream(req, res, upstreamRes, requested)
+        } else {
+          relayStream(req, res, upstreamRes, requested)
+        }
         res.on("finish", () => recordReq(req, `${requested}→${model}`, Date.now() - start, 200))
         return
       }
       try {
         const content = await upstreamRes.json()
+        if (format === "responses") {
+          recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
+          return json(res, 200, responsesToChat(content, requested))
+        }
         if (content && typeof content === "object") content.model = requested
         recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
         return json(res, 200, content)
@@ -419,6 +590,122 @@ function relayStream(req, res, upstreamRes, requested) {
           if (out) res.write(out)
         }
       }
+    } catch {
+      res.end()
+    } finally {
+      cleanup()
+    }
+  }
+  return pump()
+}
+
+// Build a Responses API request from a chat.completions body.
+function responsesRequest(body, model, isStream) {
+  const payload = { model, input: chatMessagesToInput(body.messages), stream: !!isStream }
+  if (body.temperature != null) payload.temperature = body.temperature
+  if (body.top_p != null) payload.top_p = body.top_p
+  if (body.parallel_tool_calls != null) payload.parallel_tool_calls = body.parallel_tool_calls
+  const tools = chatToolsToResponses(body.tools)
+  if (tools) payload.tools = tools
+  if (body.tool_choice != null) {
+    const tc = body.tool_choice
+    payload.tool_choice = typeof tc === "string" ? tc : { type: "function", name: tc?.function?.name ?? tc?.name }
+  }
+  // Reasoning-first models (muse-spark, gpt-5/6) burn hundreds of tokens on
+  // reasoning before emitting text, so a tiny cap yields an empty completion.
+  // Only forward a budget the caller actually asked for.
+  const mt = body.max_completion_tokens ?? body.max_tokens
+  if (mt != null && Number.isFinite(Number(mt)) && Number(mt) > 0) payload.max_output_tokens = Number(mt)
+  return payload
+}
+
+// One-shot liveness probe for a model, using the endpoint family that model
+// actually lives on. Returns the raw Response so sync can classify it.
+async function probeModel(id, auth, session) {
+  const format = modelFormat(id)
+  const headers = {
+    "content-type": "application/json",
+    accept: "application/json",
+    authorization: auth,
+    "user-agent": config.ua,
+  }
+  if (session) headers["x-opencode-session"] = session
+  const payload =
+    format === "responses"
+      ? { model: id, input: "ping", max_output_tokens: 32 }
+      : { model: id, messages: [{ role: "user", content: "ping" }], max_tokens: 5 }
+  return fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(Math.min(config.timeoutMs, 30_000)),
+  })
+}
+
+// Stream a Responses SSE body back as chat.completion.chunk SSE.
+function relayResponsesStream(req, res, upstreamRes, requested) {
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+  })
+  const id = `chatcmpl-${randomBytes(12).toString("hex")}`
+  const created = Math.floor(Date.now() / 1000)
+  const base = { id, object: "chat.completion.chunk", created, model: requested }
+  const state = { tools: [], usage: null, finish: "stop" }
+  const reader = upstreamRes.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  const ctrl = new AbortController()
+  const onAbort = () => ctrl.abort()
+  if (req.signal?.addEventListener) req.signal.addEventListener("abort", onAbort)
+  const timer = setTimeout(() => ctrl.abort(), config.timeoutMs)
+  ctrl.signal.addEventListener("abort", () => {
+    reader.cancel().catch(() => {})
+  })
+  const cleanup = () => {
+    clearTimeout(timer)
+    if (req.signal?.removeEventListener) req.signal.removeEventListener("abort", onAbort)
+  }
+  const send = (choices, extra) =>
+    res.write(`data: ${JSON.stringify({ ...base, choices, ...(extra ?? {}) })}\n\n`)
+
+  const pump = async () => {
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        let idx
+        while ((idx = buffer.indexOf("\n\n")) !== -1) {
+          const block = buffer.slice(0, idx)
+          buffer = buffer.slice(idx + 2)
+          if (!block.trim()) continue
+          let event = ""
+          let raw = ""
+          for (const line of block.split("\n")) {
+            if (line.startsWith("event:")) event = line.slice(6).trim()
+            else if (line.startsWith("data:")) raw = line.slice(5).trim()
+          }
+          if (!raw || raw === "[DONE]") continue
+          let data
+          try {
+            data = JSON.parse(raw)
+          } catch {
+            continue
+          }
+          if (data?.response?.usage) state.usage = data.response.usage
+          if (data?.type === "response.completed" || data?.type === "response.incomplete") {
+            state.finish = data.type === "response.incomplete" ? "length" : state.tools.length ? "tool_calls" : "stop"
+            continue
+          }
+          if (data?.type === "error" || data?.error) continue
+          for (const delta of responsesEventToDeltas(event, data, state)) send([{ index: 0, delta, finish_reason: null }])
+        }
+      }
+      send([{ index: 0, delta: {}, finish_reason: state.finish }], state.usage ? { usage: usageToChat(state.usage) } : {})
+      res.write("data: [DONE]\n\n")
+      res.end()
     } catch {
       res.end()
     } finally {
@@ -505,8 +792,8 @@ async function syncModels() {
     if (!res.ok) throw new Error(`upstream /models → ${res.status}`)
     const parsed = await res.json()
     const upstreamIds = new Set((parsed.data ?? []).map((m) => m.id))
-    const current = [...config.fallbackModels].filter((id) => VALID_MODEL_ID.test(id))
-    const candidates = [...new Set([...current, ...[...upstreamIds].filter((id) => id.endsWith("-free") && VALID_MODEL_ID.test(id))])]
+    const current = [...config.fallbackModels].filter((id) => VALID_MODEL_ID.test(id) && !NOT_CHAT_SERVABLE.some((re) => re.test(id)))
+    const candidates = [...new Set([...current, ...[...upstreamIds].filter((id) => id.endsWith("-free") && VALID_MODEL_ID.test(id) && !NOT_CHAT_SERVABLE.some((re) => re.test(id)))])]
     const working = []
     const rateLimited = []
     const dead = []
@@ -518,22 +805,7 @@ async function syncModels() {
       while (idx < candidates.length) {
         const id = candidates[idx++]
         try {
-          const r = await fetch(`${config.upstream}/chat/completions`, {
-            method: "POST",
-            headers: (() => {
-              const h = {
-                "content-type": "application/json",
-                accept: "application/json",
-                authorization: auth,
-                "user-agent": config.ua,
-              }
-              const sess = sessionHeader()
-              if (sess) h["x-opencode-session"] = sess
-              return h
-            })(),
-            body: JSON.stringify({ model: id, messages: [{ role: "user", content: "ping" }], max_tokens: 5 }),
-            signal: AbortSignal.timeout(Math.min(config.timeoutMs, 30_000)),
-          })
+          const r = await probeModel(id, auth, sessionHeader())
           let bodyErr = ""
           try {
             const j = await r.json()
@@ -596,6 +868,32 @@ async function syncModels() {
   syncState.ms = Date.now() - start
   syncState.running = false
   return syncState
+}
+
+// ---- per-IP rate limiting (CWE-770) ---------------------------------------
+// Scoped to the inference endpoints only: the dashboard, /health and the
+// admin API stay reachable, otherwise the UI's own polling would trip it.
+const rateBuckets = new Map()
+function rateLimitFor(req) {
+  const max = Number(config.rateLimitMax ?? 0)
+  if (!Number.isFinite(max) || max <= 0) return { limited: false }
+  const window = Number(config.rateLimitWindowMs) > 0 ? Number(config.rateLimitWindowMs) : 60_000
+  const key = clientIp(req) || "unknown"
+  const now = Date.now()
+  let hits = rateBuckets.get(key)
+  if (!hits) {
+    hits = []
+    rateBuckets.set(key, hits)
+  }
+  while (hits.length && now - hits[0] >= window) hits.shift()
+  if (hits.length >= max) {
+    return { limited: true, retryAfter: Math.max(1, Math.ceil((hits[0] + window - now) / 1000)) }
+  }
+  hits.push(now)
+  if (rateBuckets.size > 10_000) {
+    for (const [k, v] of rateBuckets) if (!v.length || now - v[v.length - 1] >= window) rateBuckets.delete(k)
+  }
+  return { limited: false }
 }
 
 let syncTimer = null
@@ -679,6 +977,10 @@ async function handleApiConfig(req, res) {
       cleaned.cacheMs = num(cleaned.cacheMs ?? config.cacheMs, config.cacheMs)
       cleaned.autoSyncIntervalMs = num(cleaned.autoSyncIntervalMs ?? config.autoSyncIntervalMs, config.autoSyncIntervalMs)
       cleaned.uaRefreshMs = num(cleaned.uaRefreshMs ?? config.uaRefreshMs, config.uaRefreshMs)
+      cleaned.rateLimitMax = num(cleaned.rateLimitMax ?? config.rateLimitMax, config.rateLimitMax)
+      cleaned.rateLimitWindowMs = num(cleaned.rateLimitWindowMs ?? config.rateLimitWindowMs, config.rateLimitWindowMs)
+      if (cleaned.rateLimitMax < 0) cleaned.rateLimitMax = 0
+      if (cleaned.rateLimitWindowMs <= 0) cleaned.rateLimitWindowMs = config.rateLimitWindowMs
       if (cleaned.cacheMs < 0) cleaned.cacheMs = config.cacheMs
       cleaned.trustForwarded = toBool(cleaned.trustForwarded, config.trustForwarded)
       cleaned.autoSync = toBool(cleaned.autoSync, config.autoSync)
@@ -689,6 +991,7 @@ async function handleApiConfig(req, res) {
         cleaned.defaultZenKey = config.defaultZenKey
       }
       if (!Array.isArray(cleaned.fallbackModels)) cleaned.fallbackModels = config.fallbackModels
+      if (!Array.isArray(cleaned.responsesModels)) cleaned.responsesModels = config.responsesModels
       if (typeof cleaned.modelAliases !== "object" || cleaned.modelAliases === null) {
         cleaned.modelAliases = config.modelAliases
       }
@@ -725,6 +1028,8 @@ async function handleStatus(req, res) {
     defaultModel: config.defaultModel,
     effectiveDefault: effectiveDefault(),
     auth: { mode: authMode, zenKey: maskKey(config.defaultZenKey), proxyKey: !!config.proxyKey },
+    responsesModels: [...(config.responsesModels ?? [])],
+    rateLimit: { max: config.rateLimitMax, windowMs: config.rateLimitWindowMs },
     models: { total: cache.data.length, allowed: ALLOWED().size },
     sync: {
       ok: syncState.ok,
@@ -759,7 +1064,8 @@ async function handleTest(req, res) {
       typeof body.zenKey === "string" && body.zenKey.trim()
         ? `Bearer ${body.zenKey.trim()}`
         : (authForUpstream(req) ?? "Bearer public")
-    const upstreamRes = await fetch(`${config.upstream}/chat/completions`, {
+    const format = modelFormat(model)
+    const upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
       method: "POST",
       headers: (() => {
         const h = {
@@ -774,15 +1080,27 @@ async function handleTest(req, res) {
         if (!ipOmit(ip)) h["x-real-ip"] = ip
         return h
       })(),
-      body: JSON.stringify({ model, messages: [{ role: "user", content: "ping" }], max_tokens: 5 }),
+      body: JSON.stringify(
+        format === "responses"
+          ? { model, input: "ping", max_output_tokens: 32 }
+          : { model, messages: [{ role: "user", content: "ping" }], max_tokens: 5 },
+      ),
       signal: AbortSignal.timeout(config.timeoutMs),
     })
     let detail = ""
     try {
       const parsed = await upstreamRes.json()
-      detail = parsed.error?.message ?? parsed.choices?.[0]?.message?.content ?? ""
+      if (format === "responses") detail = parsed.error?.message ?? (typeof parsed.output_text === "string" ? parsed.output_text : "")
+      else detail = parsed.error?.message ?? parsed.choices?.[0]?.message?.content ?? ""
     } catch {}
-    json(res, 200, { ok: upstreamRes.ok, model, status: upstreamRes.status, ms: Date.now() - start, detail })
+    json(res, 200, {
+      ok: upstreamRes.ok,
+      model,
+      format,
+      status: upstreamRes.status,
+      ms: Date.now() - start,
+      detail,
+    })
   } catch (err) {
     json(res, 400, { ok: false, error: err.message })
   }
@@ -848,6 +1166,17 @@ async function router(req, res) {
 
   if (req.method === "GET" && (p === "/v1/models" || p === "/models")) return handleModels(req, res)
   if (req.method === "POST" && (p === "/v1/chat/completions" || p === "/chat/completions" || p === "/v1/responses" || p === "/responses")) {
+    // Throttle only the inference endpoints — the dashboard, /health and the
+    // admin API must never be locked out by a client's burst.
+    const rl = rateLimitFor(req)
+    if (rl.limited) {
+      res.writeHead(429, { "content-type": "application/json", "retry-after": String(rl.retryAfter) })
+      return res.end(
+        JSON.stringify({
+          error: { type: "rate_limit_error", message: `rate limit exceeded, retry in ${rl.retryAfter}s` },
+        }),
+      )
+    }
     return handleChat(req, res)
   }
   json(res, 404, { error: { type: "not_found", message: p } })
@@ -900,6 +1229,14 @@ export {
   maskKey,
   resolveModel,
   effectiveDefault,
+  modelFormat,
+  responsesRequest,
+  responsesToChat,
+  responsesEventToDeltas,
+  usageToChat,
+  chatMessagesToInput,
+  chatToolsToResponses,
+  rateLimitFor,
   authForUpstream,
   clientIp,
   ipOmit,
