@@ -40,6 +40,7 @@ const DEFAULT_CONFIG = {
         "muse-spark-1.2-contributor-free",
         "nemotron-3.5-lightning-free",
         "nemotron-3-ultra-free",
+        "deepseek-v4-flash-free",
       ]),
   ),
   modelAliases: JSON.parse(ENV.MODEL_ALIASES ?? "{}"),
