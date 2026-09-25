@@ -761,6 +761,85 @@ describe("probe auth toggle", () => {
   })
 })
 
+describe("model list self-healing", () => {
+  test("a list trimmed by an older build regains every upstream free model", async () => {
+    // The bug that trapped users on a 5-model list: a previous build removed
+    // temporarily-blocked models, and the shrunken list never recovered.
+    const shipped = [...zp.config.fallbackModels]
+    const trimmed = ["space-bunny-free", "big-pickle"]
+    zp.saveConfig({ fallbackModels: [...trimmed], autoSyncIntervalMs: 0, cacheMs: 0 })
+    const upstream = [...new Set([...shipped, "brand-new-flash-free"])]
+    globalThis.fetch = routeFetch([
+      ["/models", () => jsonResponse({ data: upstream.map((id) => ({ id })) })],
+      ["/chat/completions", () => jsonResponse({ model: "ok", choices: [] })],
+      ["/responses", () => jsonResponse({ output: [] })],
+    ])
+    const s = await zp.syncModels()
+    assert.equal(s.ok, true)
+    for (const id of shipped) {
+      assert.ok(zp.config.fallbackModels.includes(id), `${id} was restored to the list`)
+    }
+    assert.ok(zp.config.fallbackModels.includes("brand-new-flash-free"), "brand-new upstream model appears")
+    assert.ok(zp.config.fallbackModels.includes("space-bunny-free"))
+    assert.ok(zp.config.fallbackModels.includes("big-pickle"), "user's own entries are kept")
+  })
+
+  test("models that are only temporarily blocked are still added back", async () => {
+    zp.saveConfig({ fallbackModels: [], autoSyncIntervalMs: 0, cacheMs: 0 })
+    globalThis.fetch = routeFetch([
+      ["/models", () => jsonResponse({ data: [{ id: "space-bunny-free" }, { id: "blocked-flash-free" }] })],
+      [
+        "/chat/completions",
+        (u, opts) =>
+          JSON.parse(opts.body).model === "space-bunny-free"
+            ? jsonResponse({ model: "ok", choices: [] })
+            : jsonResponse({ type: "error", error: { type: "FreeTierError", message: "free tier can only be used from within OpenCode" } }, 403),
+      ],
+    ])
+    const s = await zp.syncModels()
+    assert.equal(s.ok, true)
+    assert.ok(s.flaky.includes("blocked-flash-free"), "reported flaky")
+    assert.ok(zp.config.fallbackModels.includes("blocked-flash-free"), "but still added to the list so it can recover")
+  })
+
+  test("definitively gone models are still dropped", async () => {
+    zp.saveConfig({ fallbackModels: ["space-bunny-free", "removed-flash-free"], autoSyncIntervalMs: 0, cacheMs: 0 })
+    globalThis.fetch = routeFetch([
+      ["/models", () => jsonResponse({ data: [{ id: "space-bunny-free" }] })],
+      [
+        "/chat/completions",
+        (u, opts) =>
+          JSON.parse(opts.body).model === "space-bunny-free"
+            ? jsonResponse({ model: "ok", choices: [] })
+            : jsonResponse({ error: { type: "ModelError", message: "Model removed-flash-free is not supported" } }, 401),
+      ],
+    ])
+    await zp.syncModels()
+    assert.ok(!zp.config.fallbackModels.includes("removed-flash-free"), "unsupported model removed")
+    assert.ok(zp.config.fallbackModels.includes("space-bunny-free"))
+  })
+})
+
+describe("restore model list", () => {
+  test("POST /api/config re-adds shipped models without touching keys", async () => {
+    zp.saveConfig({ fallbackModels: ["space-bunny-free"], defaultZenKey: "zen-keep-me", proxyKey: "" })
+    const res = mockRes()
+    await zp.handleApiConfig(mockReq({ method: "POST", _body: JSON.stringify({ fallbackModels: true }) }), res)
+    assert.equal(res.state.status, 200)
+    const data = JSON.parse(res.body)
+    for (const m of zp.config.fallbackModels) {
+      if (m !== "space-bunny-free") assert.ok(data.config.fallbackModels.includes(m), `${m} restored`)
+    }
+    assert.equal(zp.config.defaultZenKey, "zen-keep-me", "zen key preserved")
+  })
+
+  test("unknown POST body is rejected", async () => {
+    const res = mockRes()
+    await zp.handleApiConfig(mockReq({ method: "POST", _body: JSON.stringify({ bogus: true }) }), res)
+    assert.equal(res.state.status, 400)
+  })
+})
+
 describe("recordReq stats", () => {
   test("dedups consecutive identical records", () => {
     const req = mockReq()

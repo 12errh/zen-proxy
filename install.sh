@@ -15,8 +15,15 @@ set -euo pipefail
 REPO="${ZEN_PROXY_REPO:-12errh/zen-proxy}"
 INSTALL_DIR="${ZEN_PROXY_DIR:-$HOME/.zen-proxy}"
 PORT="${ZEN_PROXY_PORT:-8787}"
-LOCAL_SRC="${1:-}"
-if [[ "${1:-}" == "--local" && "$#" -ge 2 ]]; then LOCAL_SRC="$2"; fi
+LOCAL_SRC=""
+RESET_MODELS=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --local) LOCAL_SRC="${2:-}"; shift 2 ;;
+    --reset-models) RESET_MODELS=1; shift ;;
+    *) shift ;;
+  esac
+done
 
 info()  { printf "\033[32m%s\033[0m\n" "$*"; }
 warn()  { printf "\033[33m%s\033[0m\n" "$*"; }
@@ -70,6 +77,18 @@ fi
 if [ ! -f "$INSTALL_DIR/zen-proxy.json" ]; then
   printf '{ "host": "127.0.0.1", "port": %s }\n' "$PORT" > "$INSTALL_DIR/zen-proxy.json"
   info "Created default config with port $PORT"
+elif [ "$RESET_MODELS" = "1" ]; then
+  # Drop a model list that an older build may have trimmed, keeping every other
+  # setting (keys, port, aliases) untouched.
+  if command -v node >/dev/null 2>&1; then
+    node -e '
+      const fs = require("fs");
+      const p = process.argv[1];
+      const c = JSON.parse(fs.readFileSync(p, "utf8"));
+      delete c.fallbackModels;
+      fs.writeFileSync(p, JSON.stringify(c, null, 2));
+    ' "$INSTALL_DIR/zen-proxy.json" && info "Reset model list to defaults (keys preserved)"
+  fi
 fi
 
 cat > "$INSTALL_DIR/zen-proxy" <<EOF

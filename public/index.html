@@ -408,6 +408,7 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
       <div class="row" style="margin-top:22px">
         <button class="primary" onclick="saveConfig()">Save &amp; apply</button>
         <button onclick="reloadConfig()">Discard / reload</button>
+        <button onclick="restoreModels()" title="Re-add any model the proxy is missing (keeps your keys)">Restore model list</button>
       </div>
     </div>
   </section>
@@ -728,6 +729,16 @@ async function saveConfig() {
     config = null
     refreshAll()
   } catch (e) { toast("Invalid JSON — check config", "bad") }
+}
+
+async function restoreModels() {
+  try {
+    const r = await api("/api/config", { method: "POST", body: JSON.stringify({ fallbackModels: true }) })
+    config = r.config
+    toast("Model list restored (" + config.fallbackModels.length + " models) — syncing now")
+    await api("/api/sync", { method: "POST" })
+    refreshAll()
+  } catch { toast("Restore failed", "bad") }
 }
 
 async function reloadConfig() { config = null; await populateConfigForm(); toast("Reloaded from file") }

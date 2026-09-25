@@ -813,8 +813,13 @@ async function syncModels() {
     if (!res.ok) throw new Error(`upstream /models → ${res.status}`)
     const parsed = await res.json()
     const upstreamIds = new Set((parsed.data ?? []).map((m) => m.id))
-    const current = [...config.fallbackModels].filter((id) => VALID_MODEL_ID.test(id) && !NOT_CHAT_SERVABLE.some((re) => re.test(id)))
-    const candidates = [...new Set([...current, ...[...upstreamIds].filter((id) => id.endsWith("-free") && VALID_MODEL_ID.test(id) && !NOT_CHAT_SERVABLE.some((re) => re.test(id)))])]
+    const isFree = (id) => VALID_MODEL_ID.test(id) && !NOT_CHAT_SERVABLE.some((re) => re.test(id))
+    const current = [...config.fallbackModels].filter(isFree)
+    // Everything the upstream currently offers for free. The user's list is
+    // merged with this, so a model that exists but is temporarily blocked still
+    // gets (re)added — the list self-heals instead of staying shrunken.
+    const discovered = [...upstreamIds].filter((id) => id.endsWith("-free") && isFree(id))
+    const candidates = [...new Set([...current, ...discovered])]
     const working = []
     const rateLimited = []
     const dead = []
@@ -875,7 +880,11 @@ async function syncModels() {
       }
     }
     await Promise.all([probe(), probe(), probe()])
+    // Keep the user's order, drop only definitively-gone models, then append
+    // anything upstream offers that the user doesn't have yet. Temporary blocks
+    // never remove a model, and new models appear without any manual step.
     const newList = current.filter((id) => !removeFromCurrent.has(id))
+    for (const id of discovered) if (!newList.includes(id) && !removeFromCurrent.has(id)) newList.push(id)
     for (const id of working) if (!newList.includes(id)) newList.push(id)
     const changed = newList.join(",") !== current.join(",")
     if (changed && newList.length) {
@@ -996,6 +1005,24 @@ function adminAuth(req, res) {
 async function handleApiConfig(req, res) {
   if (!adminAuth(req, res)) return
   if (req.method === "GET") return json(res, 200, { config: sanitize(config) })
+  if (req.method === "POST") {
+    // Reset the model list back to the shipped defaults (useful if the list was
+    // trimmed by an older build or edited by hand). User keys are untouched.
+    try {
+      const body = await readBody(req)
+      const parsed = body ? JSON.parse(body) : {}
+      if (parsed.fallbackModels !== true) return json(res, 400, { error: "unsupported action" })
+      const shipped = JSON.parse(JSON.stringify(DEFAULT_CONFIG.fallbackModels))
+      const kept = config.fallbackModels.filter((m) => !shipped.includes(m))
+      const merged = [...new Set([...kept, ...shipped])]
+      saveConfig({ fallbackModels: merged })
+      scheduleSync()
+      log(`model list restored to defaults (${merged.length} models)`)
+      return json(res, 200, { ok: true, config: sanitize(config) })
+    } catch (err) {
+      return json(res, 400, { error: err.message })
+    }
+  }
   if (req.method === "PUT") {
     try {
       const body = JSON.parse(await readBody(req))
