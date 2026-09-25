@@ -143,6 +143,7 @@ Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded wh
 | `autoUA` | `true` | Track opencode releases and update `ua` automatically (`opencode/<latest>`) |
 | `uaRefreshMs` | `21600000` | How often to check for a new opencode version (ms) |
 | `injectSession` | `true` | Mint an `x-opencode-session` header per client (upstream rejects requests without one) |
+| `gated` (sync state) | — | Models answering `403 FreeTierError`: the free tier only accepts genuine agent requests, so our probe can't verify them. Shown as **agent-only**, kept in the list, never removed |
 | `probeAuth` | `auto` | Credentials for auto-sync health probes: `auto` (your Zen key if set, else anonymous), `anonymous` (always the public free tier), or `key` (always your key, so probes reflect your own quota) |
 | `defaultModel` | `""` | Empty = auto: pick the first *healthy* free model (no more hardcoded/vanished defaults) |
 | `fallbackModels` | `["space-bunny-free","mimo-v2.6-flash-free", …]` | Tried in order on `429`/`5xx` and dead-model `4xx`; auto-sync prunes vanished models and adds new ones |

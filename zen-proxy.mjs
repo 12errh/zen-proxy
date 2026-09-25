@@ -342,7 +342,19 @@ function num(v, dflt) {
   const n = Number(v)
   return Number.isFinite(n) ? n : dflt
 }
-const syncState = { at: 0, ok: false, running: false, working: [], rateLimited: [], flaky: [], dead: [], error: "", ms: 0 }
+const syncState = { at: 0, ok: false, running: false, working: [], rateLimited: [], flaky: [], gated: [], dead: [], error: "", ms: 0 }
+// Health learned from real client traffic. The free tier rejects our synthetic
+// health probe (it only accepts genuine agent-shaped requests), so real traffic
+// is the only trustworthy signal that a model is actually serving.
+const observed = new Map()
+function recordObserved(model, ok) {
+  if (!model) return
+  const cur = observed.get(model) ?? { ok: 0, fail: 0, last: 0 }
+  if (ok) cur.ok++
+  else cur.fail++
+  cur.last = Date.now()
+  observed.set(model, cur)
+}
 const modelHealth = new Map()
 const MAX_LOG = 500
 const logLines = []
@@ -514,22 +526,27 @@ async function handleChat(req, res) {
         } else {
           relayStream(req, res, upstreamRes, requested)
         }
-        res.on("finish", () => recordReq(req, `${requested}→${model}`, Date.now() - start, 200))
+        res.on("finish", () => { recordReq(req, `${requested}→${model}`, Date.now() - start, 200); recordObserved(model, true) })
         return
       }
       try {
         const content = await upstreamRes.json()
         if (format === "responses") {
           recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
+          recordObserved(model, true)
           return json(res, 200, responsesToChat(content, requested, model))
+        }
+        if (model !== requested) {
+          // Make the fallback visible to any client, not just JSON readers.
+          res.setHeader?.("x-zen-served-by", model)
+          res.setHeader?.("x-zen-fallback", "true")
         }
         if (content && typeof content === "object") {
           content.model = requested
-          // Tell the caller which model actually answered when we fell back, so
-          // "big-pickle works" isn't a mystery when space-bunny served it.
           if (model !== requested) content.zen_served_by = model
         }
         recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
+        recordObserved(model, true)
         return json(res, 200, content)
       } catch {
         recordReq(req, requested, Date.now() - start, 502)
@@ -548,10 +565,12 @@ async function handleChat(req, res) {
     // temporarily "unavailable", a geo-blocked free model, or a stale model id)
     // so one dead model doesn't brick the whole request.
     if (retryableUpstream(upstreamRes.status, lastErr)) {
+      recordObserved(model, false)
       const wait = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
       if (wait > 0) await new Promise((r) => setTimeout(r, wait))
       continue
     }
+    recordObserved(model, false)
     break
   }
 
@@ -824,6 +843,7 @@ async function syncModels() {
     const rateLimited = []
     const dead = []
     const flaky = []
+    const gated = []
     // Only definitively-gone models are dropped from the user's list; `flaky`
     // ones stay configured so they recover on their own.
     const removeFromCurrent = new Set()
@@ -855,9 +875,14 @@ async function syncModels() {
               /model_not_found|no such model|does not exist|is not supported|not supported/i.test(bodyErr)
             // Key/auth problems are not model problems either.
             const authErr = /AuthError|invalid api key|missing api key/i.test(bodyErr)
+            // 403 FreeTierError means "only real opencode clients may use this".
+            // Our probe is not a real client, so this tells us nothing about
+            // whether the model works — don't call it flaky, and never remove it.
+            const isGated = /FreeTierError|free tier can only/i.test(bodyErr)
             // Temporary blocks: keep the model, just remember it is unhealthy.
-            const temporary = /FreeTierError|free tier can only|RegionError|not available in your country|rate.?limit|overloaded|unavailable/i.test(bodyErr)
+            const temporary = /RegionError|not available in your country|rate.?limit|overloaded/i.test(bodyErr)
             if (gone) { dead.push(id); removeFromCurrent.add(id) }
+            else if (isGated) { gated.push(id) }
             else if (authErr) { flaky.push(id) }
             else {
               if (temporary) {
@@ -866,7 +891,7 @@ async function syncModels() {
               } else {
                 const fails = (modelHealth.get(id) ?? 0) + 1
                 modelHealth.set(id, fails)
-                if (fails >= 3) { dead.push(id) }
+                if (fails >= 3) { dead.push(id); removeFromCurrent.add(id) }
                 else flaky.push(id)
               }
             }
@@ -884,19 +909,25 @@ async function syncModels() {
     // anything upstream offers that the user doesn't have yet. Temporary blocks
     // never remove a model, and new models appear without any manual step.
     const newList = current.filter((id) => !removeFromCurrent.has(id))
-    for (const id of discovered) if (!newList.includes(id) && !removeFromCurrent.has(id)) newList.push(id)
+    // Only auto-add newly discovered models that are actually reachable (ok,
+    // rate-limited or free-tier-gated). A model that errors on its first probe
+    // is retired upstream and shouldn't be pushed at the user.
+    for (const id of discovered) {
+      if (!newList.includes(id) && !removeFromCurrent.has(id) && !flaky.includes(id)) newList.push(id)
+    }
     for (const id of working) if (!newList.includes(id)) newList.push(id)
     const changed = newList.join(",") !== current.join(",")
     if (changed && newList.length) {
       config.fallbackModels = newList
       try { saveConfig({ fallbackModels: newList }) } catch {}
-      log(`auto-sync: updated model list (${working.length} ok, ${rateLimited.length} rate-limited, ${flaky.length} flaky, ${dead.length} dead)`)
+      log(`auto-sync: updated model list (${working.length} ok, ${rateLimited.length} rate-limited, ${gated.length} agent-only, ${flaky.length} flaky, ${dead.length} dead)`)
     } else {
-      log(`auto-sync: list unchanged (${working.length} ok, ${rateLimited.length} rate-limited, ${flaky.length} flaky, ${dead.length} dead)`)
+      log(`auto-sync: list unchanged (${working.length} ok, ${rateLimited.length} rate-limited, ${gated.length} agent-only, ${flaky.length} flaky, ${dead.length} dead)`)
     }
     syncState.working = working
     syncState.rateLimited = rateLimited
     syncState.flaky = flaky
+    syncState.gated = gated
     syncState.dead = dead
     syncState.error = ""
     syncState.ok = true
@@ -1105,8 +1136,12 @@ async function handleStatus(req, res) {
       ms: syncState.ms,
       working: [...syncState.working],
       rateLimited: [...syncState.rateLimited],
+      gated: [...syncState.gated],
       flaky: [...syncState.flaky],
       dead: [...syncState.dead],
+      // Health learned from real client requests — the only reliable signal for
+      // models the free tier hides from the synthetic probe.
+      observed: Object.fromEntries(observed),
       error: syncState.error,
     },
     requests: { total: requestStats.total, errors: requestStats.errors, lastMinute, last5m },

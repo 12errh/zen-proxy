@@ -595,9 +595,14 @@ async function testModel(m) {
 }
 
 function modelStatus(m, sync) {
+  if (sync && sync.observed && sync.observed[m]) {
+    const o = sync.observed[m]
+    if (o.ok > o.fail) return { cls: "ok", label: "ok (live traffic)" }
+  }
   if (!sync || !sync.at) return { cls: "mut", label: "untested" }
   if (sync.working?.includes(m)) return { cls: "ok", label: "ok" }
   if (sync.rateLimited?.includes(m)) return { cls: "warn", label: "rate-limited" }
+  if (sync.gated?.includes(m)) return { cls: "mut", label: "agent-only" }
   if (sync.flaky?.includes(m)) return { cls: "warn", label: "flaky" }
   if (sync.dead?.includes(m)) return { cls: "bad", label: "dead" }
   return { cls: "mut", label: "untested" }
@@ -609,7 +614,7 @@ function renderSync(s) {
   if (s.running) { el.textContent = "auto-sync: probing…"; el.className = "badge warn"; return }
   if (!s.at) { el.textContent = "auto-sync: never"; el.className = "badge mut"; return }
   const ago = fmtUp(Math.max(1, Math.floor((Date.now() - s.at) / 1000))) + " ago"
-  el.textContent = `auto-sync: ${ago} · ${s.working.length} ok · ${s.rateLimited.length} rate-limited · ${s.flaky.length} flaky · ${s.dead.length} dead`
+  el.textContent = `auto-sync: ${ago} · ${s.working.length} ok · ${s.rateLimited.length} rate-limited · ${(s.gated||[]).length} agent-only · ${s.flaky.length} flaky · ${s.dead.length} dead`
   el.className = "badge " + (s.ok ? (s.dead.length ? "warn" : "ok") : "bad")
 }
 

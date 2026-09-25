@@ -418,7 +418,7 @@ describe("sync prunes unsupported models", () => {
       assert.equal(s.ok, true)
       assert.deepEqual([...zp.config.fallbackModels].sort(), [...list].sort(), `config intact after sync #${i + 1}`)
       assert.ok(!s.dead.includes("mimo-v2.5-free"), "temporary block is not 'dead'")
-      assert.ok(s.flaky.includes("mimo-v2.5-free"), "reported as flaky/unavailable")
+      assert.ok(s.gated.includes("mimo-v2.5-free"), "reported as agent-only (gated), not flaky")
     }
   })
 
@@ -445,6 +445,37 @@ describe("sync prunes unsupported models", () => {
     const s = await zp.syncModels()
     assert.ok(s.working.includes("mimo-v2.5-free"), "recovered model is working")
     assert.equal(zp.effectiveDefault(), "space-bunny-free", "first healthy in list order still wins")
+  })
+  test("a retired model that is still listed upstream is not added", async () => {
+    // deepseek-v4-flash-free case: present in /models, but every call 400s with
+    // "Model is unavailable" and it is gone from opencode's own free-model list.
+    zp.saveConfig({ fallbackModels: ["space-bunny-free"], autoSyncIntervalMs: 0, cacheMs: 0 })
+    globalThis.fetch = routeFetch([
+      ["/models", () => jsonResponse({ data: [{ id: "space-bunny-free" }, { id: "deepseek-v4-flash-free" }] })],
+      [
+        "/chat/completions",
+        (u, opts) =>
+          JSON.parse(opts.body).model === "space-bunny-free"
+            ? jsonResponse({ model: "ok", choices: [] })
+            : jsonResponse({ error: { type: "server_error", message: "Error from provider (Console): Upstream request failed: Model is unavailable." } }, 400),
+      ],
+    ])
+    const s = await zp.syncModels()
+    assert.equal(s.ok, true)
+    assert.ok(!zp.config.fallbackModels.includes("deepseek-v4-flash-free"), "retired model not added to the list")
+    assert.ok(zp.config.fallbackModels.includes("space-bunny-free"), "working model kept")
+  })
+
+  test("free-tier gated models are still added, since agents can use them", async () => {
+    zp.saveConfig({ fallbackModels: [], autoSyncIntervalMs: 0, cacheMs: 0 })
+    globalThis.fetch = routeFetch([
+      ["/models", () => jsonResponse({ data: [{ id: "gated-flash-free" }] })],
+      ["/chat/completions", () => jsonResponse({ type: "error", error: { type: "FreeTierError", message: "OpenCode's free tier can only be used from within OpenCode" } }, 403)],
+    ])
+    const s = await zp.syncModels()
+    assert.equal(s.ok, true)
+    assert.ok(s.gated.includes("gated-flash-free"), "reported as agent-only")
+    assert.ok(zp.config.fallbackModels.includes("gated-flash-free"), "added, because real agents can use it")
   })
 })
 
@@ -798,7 +829,7 @@ describe("model list self-healing", () => {
     ])
     const s = await zp.syncModels()
     assert.equal(s.ok, true)
-    assert.ok(s.flaky.includes("blocked-flash-free"), "reported flaky")
+    assert.ok(s.gated.includes("blocked-flash-free"), "reported as agent-only, not flaky")
     assert.ok(zp.config.fallbackModels.includes("blocked-flash-free"), "but still added to the list so it can recover")
   })
 
