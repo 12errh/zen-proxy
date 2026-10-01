@@ -42,6 +42,7 @@ const DEFAULT_CONFIG = {
         "nemotron-3-ultra-free",
         "deepseek-v4-flash-free",
         "longcat-2.5-preview-free",
+        "fledge-alpha-free",
       ]),
   ),
   modelAliases: JSON.parse(ENV.MODEL_ALIASES ?? "{}"),
