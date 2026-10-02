@@ -43,6 +43,7 @@ const DEFAULT_CONFIG = {
         "deepseek-v4-flash-free",
         "longcat-2.5-preview-free",
         "fledge-alpha-free",
+        "ling-3.1-flash-free",
       ]),
   ),
   modelAliases: JSON.parse(ENV.MODEL_ALIASES ?? "{}"),
