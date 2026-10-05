@@ -219,12 +219,45 @@ function chatMessagesToInput(messages) {
   for (const m of messages) {
     const role = m?.role ?? "user"
     if (role === "tool" || role === "function") {
+      const callId = m?.tool_call_id ?? m?.call_id ?? m?.id ?? "call_0"
       items.push({
         type: "function_call_output",
-        call_id: m?.tool_call_id ?? m?.call_id ?? m?.id ?? "call_0",
+        call_id: callId,
         output: textOf(m?.content) || " ",
       })
+      // Images inside tool results survive as a follow-up user input_image item.
+      if (Array.isArray(m?.content)) {
+        const imgs = m.content.filter((p) => p?.type === "image_url" && p?.image_url?.url)
+        if (imgs.length) {
+          items.push({ role: "user", content: imgs.map((p) => ({ type: "input_image", image_url: p.image_url.url })) })
+        }
+      }
       continue
+    }
+    // Preserve image_url parts as Responses input_image content blocks.
+    if (Array.isArray(m?.content)) {
+      const parts = []
+      let hasImage = false
+      for (const p of m.content) {
+        if (typeof p === "string") { if (p) parts.push({ type: "input_text", text: p }) }
+        else if (p?.type === "text" && p.text) parts.push({ type: "input_text", text: p.text })
+        else if (p?.type === "image_url" && p?.image_url?.url) {
+          parts.push({ type: "input_image", image_url: p.image_url.url })
+          hasImage = true
+        }
+      }
+      if (hasImage && parts.length) {
+        items.push({ role: role === "assistant" ? "assistant" : role, content: parts })
+        for (const tc of m?.tool_calls ?? []) {
+          items.push({
+            type: "function_call",
+            call_id: tc?.id ?? "call_0",
+            name: tc?.function?.name ?? tc?.name ?? "unknown",
+            arguments: tc?.function?.arguments ?? tc?.arguments ?? "{}",
+          })
+        }
+        continue
+      }
     }
     const text = textOf(m?.content)
     if (text) items.push({ role: role === "assistant" ? "assistant" : role, content: text })
