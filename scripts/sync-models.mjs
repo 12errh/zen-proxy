@@ -15,10 +15,11 @@ const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..")
 const MAIN = path.join(ROOT, "zen-proxy.mjs")
 const SNAPSHOT = path.join(ROOT, "free-models.json")
 const UPSTREAM = "https://opencode.ai/zen/v1"
-const UA = "opencode/1.18.30"
+const UA = "opencode/latest/2.0.9/cli"
 const CONCURRENCY = 3
 const TIMEOUT_MS = 20_000
 const KNOWN_FREE = new Set(["big-pickle"])
+const OFFICIAL_TOOLS = ["edit", "glob", "grep", "question", "read", "shell"]
 // Free models that are NOT reachable through /chat/completions or /responses.
 // jev-* is served on /v1/systemone (structured classification), so routing it
 // through a chat endpoint can only ever fail.
@@ -45,44 +46,100 @@ async function getJSON(url, headers = {}) {
 }
 
 async function latestOpencodeVersion() {
-  try {
-    const d = await getJSON("https://registry.npmjs.org/opencode-ai/latest")
-    return String(d?.version ?? "").match(/^\d+\.\d+\.\d+/) ? d.version : ""
-  } catch {
-    return ""
+  // Official CLI moved from `opencode-ai` to `@opencode/cli` (2.x).
+  for (const pkg of ["@opencode/cli", "opencode-ai"]) {
+    try {
+      const d = await getJSON(`https://registry.npmjs.org/${pkg}/latest`)
+      const v = String(d?.version ?? "")
+      if (/^\d+\.\d+\.\d+/.test(v)) return v
+    } catch {}
   }
+  return ""
 }
 
-async function probe(id, ua, session) {
+function genOfficialSession() {
+  // Replicates opencode descending ID so probes look official.
+  const cur = Date.now()
+  // simple per-process counter
+  genOfficialSession._c = (genOfficialSession._c ?? 0) + 1
+  let now = BigInt(cur) * BigInt(0x1000) + BigInt(genOfficialSession._c)
+  now = ~now
+  const low = now & ((1n << 48n) - 1n)
+  const hex = low.toString(16).padStart(12, "0")
+  const chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+  const bytes = randomBytes(14)
+  let rand = ""
+  for (let i = 0; i < 14; i++) rand += chars[bytes[i] % 62]
+  return `ses_${hex}${rand}`
+}
+
+async function probe(id, ua, session, authKey) {
   const started = Date.now()
   const format = modelFormat(id)
+  const url = `${UPSTREAM}${format === "responses" ? "/responses" : "/chat/completions"}`
+  const proj = randomBytes(20).toString("hex")
+  const headers = {
+    "content-type": "application/json",
+    accept: "application/json, text/event-stream",
+    authorization: `Bearer ${authKey}`,
+    "user-agent": ua,
+    "x-opencode-session": session,
+    "x-opencode-client": "cli",
+    "x-opencode-project": proj,
+    "x-session-affinity": session,
+    "x-session-id": session,
+  }
+  // Free-tier probes must look like opencode: valid session + UA + tools +
+  // stream. Minimal ping bodies without tools always 403 FreeTierError.
+  const body = format === "responses"
+    ? {
+        model: id,
+        input: [{ role: "user", content: [{ type: "input_text", text: "ping" }] }],
+        tools: OFFICIAL_TOOLS.map((n) => ({
+          type: "function", name: n,
+          description: `opencode tool ${n}`,
+          parameters: { type: "object", properties: {} },
+        })),
+        store: false,
+        prompt_cache_key: session,
+        include: ["reasoning.encrypted_content"],
+        stream: true,
+      }
+    : {
+        model: id,
+        messages: [{ role: "user", content: "ping" }],
+        tools: OFFICIAL_TOOLS.map((n) => ({
+          type: "function",
+          function: { name: n, description: `opencode tool ${n}`, parameters: { type: "object", properties: {} } },
+        })),
+        stream: true,
+        stream_options: { include_usage: true },
+      }
   try {
-    const res = await fetch(`${UPSTREAM}${format === "responses" ? "/responses" : "/chat/completions"}`, {
+    const res = await fetch(url, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        accept: "application/json",
-        authorization: "Bearer public",
-        "user-agent": ua,
-        "x-opencode-session": session,
-      },
-      body: JSON.stringify(
-        format === "responses"
-          ? { model: id, input: "ping", max_output_tokens: 32 }
-          : { model: id, messages: [{ role: "user", content: "ping" }], max_tokens: 5 },
-      ),
+      headers,
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(TIMEOUT_MS),
     })
+    // stream:true => success is 200 SSE (not JSON). Read text once.
+    const text = await res.text().catch(() => "")
     let err = ""
-    try {
-      const j = await res.json()
-      if (j && (j.error || j.type === "error")) {
+    if (!res.ok) {
+      try {
+        const j = JSON.parse(text)
         const e = j.error ?? j
         err = `${e.type || ""} ${e.message || ""}`
+      } catch {
+        err = text.slice(0, 300)
       }
-    } catch {}
+    }
     if (res.ok && !err) return { status: "ok", ms: Date.now() - started }
     if (res.status === 429) return { status: "rate-limited", ms: Date.now() - started }
+    // Without a real SK (CI), every free model 403 FreeTierError. Don't nuke
+    // the list in that case — treat as unknown/ok-needs-key.
+    if (/only be used in opencode|FreeTierError/i.test(err) && authKey === "public")
+      return { status: "ok-needs-key", ms: Date.now() - started, detail: err }
     // Definitive removal only when the model is genuinely gone. A 403
     // (FreeTierError / RegionError) is a temporary access policy, so the model
     // stays in the list and recovers on its own.
@@ -138,10 +195,13 @@ function patchDefaults(src, list) {
 }
 
 async function main() {
-  const session = "ses_" + randomBytes(13).toString("hex")
   const version = await latestOpencodeVersion()
-  const ua = version ? `opencode/${version}` : UA
+  const ua = version ? `opencode/latest/${version}/cli` : UA
   log(`latest opencode: ${version || "unknown"} (UA ${ua})`)
+  // In CI there is no opencode.db anonymous key; use ZEN_KEY if provided,
+  // otherwise probes will get FreeTierError and be marked ok-needs-key.
+  const authKey = process.env.ZEN_KEY || process.env.OPENCODE_ZEN_KEY || "public"
+  if (authKey === "public") log("no ZEN_KEY: free probes will be marked ok-needs-key on FreeTierError")
 
   const listRes = await getJSON(`${UPSTREAM}/models`)
   const upstream = (listRes.data ?? []).map((m) => m.id)
@@ -163,14 +223,15 @@ async function main() {
   async function worker() {
     while (i < ordered.length) {
       const id = ordered[i++]
-      results.set(id, await probe(id, ua, session))
+      const session = genOfficialSession()
+      results.set(id, await probe(id, ua, session, authKey))
       log(`probed ${id} -> ${results.get(id).status}`)
     }
   }
   await Promise.all(Array.from({ length: CONCURRENCY }, worker))
 
   const bucket = (status) => ordered.filter((id) => results.get(id).status === status)
-  const healthy = bucket("ok")
+  const healthy = [...bucket("ok"), ...bucket("ok-needs-key")]
   const rateLimited = bucket("rate-limited")
   const unavailable = bucket("unavailable")
   const unstable = bucket("unstable")

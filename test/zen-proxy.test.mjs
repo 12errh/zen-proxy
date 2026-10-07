@@ -9,6 +9,11 @@ import { fileURLToPath } from "node:url"
 // Must be set before importing the module (CONFIG_PATH is computed at load).
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "zen-proxy-test-"))
 process.env.ZEN_PROXY_CONFIG = path.join(tmpDir, "zen-proxy.json")
+// Isolate from the developer's real opencode.db anonymous key so
+// auth tests are deterministic (otherwise loadLocalZenKey would return a real sk-...).
+process.env.OPENCODE_DB = path.join(tmpDir, "nonexistent-opencode.db")
+process.env.HOME = tmpDir
+process.env.USERPROFILE = tmpDir
 delete process.env.PORT
 delete process.env.HOST
 delete process.env.ZEN_URL
@@ -196,6 +201,11 @@ describe("authForUpstream", () => {
     assert.equal(zp.authForUpstream(req), "Bearer sk-abc")
   })
 
+  test("x-zen-key header is honored without proxyKey", () => {
+    const req = mockReq({ headers: { "x-zen-key": "zen-custom-123" } })
+    assert.equal(zp.authForUpstream(req), "Bearer zen-custom-123")
+  })
+
   test("defaultZenKey used when no bearer", () => {
     zp.saveConfig({ defaultZenKey: "zen-123" })
     const req = mockReq({ headers: {} })
@@ -249,37 +259,54 @@ describe("ip handling", () => {
   })
 
   test("zenHeaders sends x-real-ip for public IPs, omits for loopback", () => {
-    const pub = zp.zenHeaders(mockReq({ remoteAddress: "8.8.8.8" }), "Bearer public")
+    const pub = zp.zenHeaders(mockReq({ remoteAddress: "8.8.8.8" }), "Bearer public").headers
     assert.equal(pub["x-real-ip"], "8.8.8.8")
     assert.equal(pub["user-agent"], zp.config.ua)
-    const loop = zp.zenHeaders(mockReq({ remoteAddress: "127.0.0.1" }), "Bearer public")
+    const loop = zp.zenHeaders(mockReq({ remoteAddress: "127.0.0.1" }), "Bearer public").headers
     assert.equal(loop["x-real-ip"], undefined)
   })
 
   test("zenHeaders forwards x-opencode-* headers", () => {
-    const h = zp.zenHeaders(mockReq({ headers: { "x-opencode-session": "sess-1" } }), "Bearer public")
-    assert.equal(h["x-opencode-session"], "sess-1")
+    const valid = zp.genOfficialId("ses")
+    const h = zp.zenHeaders(mockReq({ headers: { "x-opencode-session": valid } }), "Bearer public").headers
+    assert.equal(h["x-opencode-session"], valid)
   })
 })
 
 describe("session injection", () => {
   test("zenHeaders injects a synthetic session when none is sent", () => {
-    const h = zp.zenHeaders(mockReq({ remoteAddress: "8.8.8.8" }), "Bearer public")
+    const h = zp.zenHeaders(mockReq({ remoteAddress: "8.8.8.8" }), "Bearer public").headers
     assert.ok(h["x-opencode-session"], "session header present")
     assert.ok(h["x-opencode-session"].startsWith("ses_"), `session looks like opencode: ${h["x-opencode-session"]}`)
+    // official 2.x headers are also injected
+    assert.equal(h["x-opencode-client"], "cli")
+    assert.ok(h["x-session-affinity"], "affinity present")
+    assert.ok(h["x-session-id"], "session-id present")
   })
 
   test("client-provided session is passed through untouched", () => {
+    const valid = zp.genOfficialId("ses")
+    const h = zp.zenHeaders(
+      mockReq({ remoteAddress: "8.8.8.8", headers: { "x-opencode-session": valid } }),
+      "Bearer public",
+    ).headers
+    assert.equal(h["x-opencode-session"], valid)
+  })
+
+  test("invalid client session is replaced with an official one", () => {
     const h = zp.zenHeaders(
       mockReq({ remoteAddress: "8.8.8.8", headers: { "x-opencode-session": "real-session-1" } }),
       "Bearer public",
-    )
-    assert.equal(h["x-opencode-session"], "real-session-1")
+    ).headers
+    assert.notEqual(h["x-opencode-session"], "real-session-1")
+    assert.match(h["x-opencode-session"], /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
   })
 
   test("injectSession=false disables injection", () => {
     zp.saveConfig({ injectSession: false })
-    const h = zp.zenHeaders(mockReq({ remoteAddress: "8.8.8.8" }), "Bearer public")
+    const h = zp.zenHeaders(mockReq({ remoteAddress: "8.8.8.8" }), "Bearer public").headers
+    // when disabled, no synthetic session is minted (headers still carry
+    // whatever the client sent, which here is nothing)
     assert.equal(h["x-opencode-session"], undefined)
   })
 
@@ -289,8 +316,173 @@ describe("session injection", () => {
     assert.equal(a1, a2, "same client → same session")
     const b = zp.sessionFor(mockReq({ remoteAddress: "9.9.9.9" })).value
     assert.notEqual(a1, b, "different client → different session")
-    assert.match(a1, /^ses_[0-9a-f]{26}$/)
+    assert.match(a1, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
     assert.ok(zp.sessionFor(mockReq()).injected, "local client gets an injected id")
+  })
+})
+
+describe("opencode 2.x free-tier emulation", () => {
+  test("genOfficialId mints valid descending session ids", () => {
+    const a = zp.genOfficialId("ses")
+    const b = zp.genOfficialId("ses")
+    assert.match(a, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+    assert.match(b, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+    assert.notEqual(a, b, "ids are unique")
+  })
+
+  test("ensureChatFreeTier injects official tools and forces stream", () => {
+    const { payload, clientStream } = zp.ensureChatFreeTier({ model: "m", messages: [] })
+    assert.equal(clientStream, false)
+    assert.equal(payload.stream, true)
+    assert.ok(payload.tools.length >= 6, "at least 6 official tools injected")
+    assert.deepEqual(payload.stream_options, { include_usage: true })
+    const tools = ["edit", "glob", "grep", "question", "read", "shell", "write"].map((n) => ({
+      type: "function",
+      function: { name: n },
+    }))
+    const kept = zp.ensureChatFreeTier({ model: "m", messages: [], tools, stream: true })
+    assert.equal(kept.clientStream, true)
+    assert.equal(kept.payload.tools, tools, "caller tools preserved when already official")
+  })
+
+  test("free non-stream chat is served via upstream stream + destream", async () => {
+    zp.saveConfig({ fallbackModels: ["space-bunny-free"], defaultModel: "space-bunny-free" })
+    let sent
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          const sse =
+            `data: ${JSON.stringify({ id: "chatcmpl-up", model: "up-model", choices: [{ delta: { content: "hel" } }] })}\n\n` +
+            `data: ${JSON.stringify({ model: "up-model", choices: [{ delta: { content: "lo" } }] })}\n\n` +
+            "data: [DONE]\n\n"
+          return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } })
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: "space-bunny-free", messages: [{ role: "user", content: "hi" }] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 200)
+    assert.equal(sent.stream, true, "upstream forced to stream for free models")
+    assert.ok(Array.isArray(sent.tools) && sent.tools.length >= 6, "official tools injected upstream")
+    const data = JSON.parse(res.body)
+    assert.equal(data.object, "chat.completion")
+    assert.equal(data.model, "space-bunny-free", "client still sees the model it asked for")
+    assert.equal(data.choices[0].message.content, "hello", "SSE destreamed into one completion")
+  })
+
+  test("non-free non-stream is not forced to stream", async () => {
+    zp.saveConfig({ responsesModels: [], fallbackModels: ["some-paid-model"], defaultModel: "some-paid-model" })
+    let sent
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          return jsonResponse({ model: "ok", choices: [{ message: { role: "assistant", content: "hi" } }] })
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: "some-paid-model", messages: [] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 200)
+    assert.notEqual(sent.stream, true, "paid models keep the client's non-stream shape")
+    assert.equal(sent.tools, undefined, "no tools injected for paid models")
+  })
+
+  test("POST /v1/responses passes Responses bodies through to upstream /responses", async () => {
+    zp.saveConfig({ fallbackModels: ["space-bunny-free"], defaultModel: "space-bunny-free" })
+    let hitUrl = ""
+    let sent
+    globalThis.fetch = routeFetch([
+      [
+        "/responses",
+        (u, opts) => {
+          hitUrl = u
+          sent = JSON.parse(opts.body)
+          return jsonResponse({
+            id: "resp_1",
+            object: "response",
+            model: "space-bunny-free",
+            output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "yo" }] }],
+          })
+        },
+      ],
+    ])
+    const res = mockRes()
+    await zp.router(
+      mockReq({ method: "POST", url: "/v1/responses", _body: JSON.stringify({ model: "space-bunny-free", input: "hi", stream: false }) }),
+      res,
+    )
+    assert.match(hitUrl, /\/responses$/)
+    assert.equal(sent.model, "space-bunny-free")
+    assert.equal(sent.stream, true, "free responses force upstream stream")
+    assert.ok(sent.tools.length >= 6, "responses tools injected")
+    assert.equal(sent.store, false)
+    assert.ok(sent.prompt_cache_key, "session cache key set")
+    assert.equal(res.state.status, 200)
+    const data = JSON.parse(res.body)
+    assert.equal(data.object, "response")
+    assert.equal(data.model, "space-bunny-free")
+    assert.equal(data.output[0].content[0].text, "yo")
+  })
+
+  test("POST /v1/responses streams Responses SSE with model rewritten", async () => {
+    zp.saveConfig({ fallbackModels: ["space-bunny-free"], defaultModel: "space-bunny-free" })
+    const sse =
+      `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "he", model: "up-model" })}\n\n` +
+      `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "llo", model: "up-model" })}\n\n`
+    globalThis.fetch = routeFetch([
+      ["/responses", () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } })],
+    ])
+    const res = mockRes()
+    await zp.router(
+      mockReq({ method: "POST", url: "/v1/responses", _body: JSON.stringify({ model: "space-bunny-free", input: "hi", stream: true }) }),
+      res,
+    )
+    await res.done
+    assert.equal(res.state.status, 200)
+    assert.match(res.body, /"model":"space-bunny-free"/, "embedded model rewritten to requested")
+    assert.doesNotMatch(res.body, /up-model/, "no upstream model leaks")
+    assert.match(res.body, /"delta":"he"/)
+  })
+
+  test("sync probes look like the official client", async () => {
+    zp.saveConfig({ fallbackModels: ["space-bunny-free"], autoSyncIntervalMs: 0, cacheMs: 0 })
+    let seen
+    globalThis.fetch = routeFetch([
+      ["/models", () => jsonResponse({ data: [{ id: "space-bunny-free" }] })],
+      [
+        "/chat/completions",
+        (u, opts) => {
+          seen = { headers: opts.headers, body: JSON.parse(opts.body) }
+          return jsonResponse({ model: "ok", choices: [] })
+        },
+      ],
+    ])
+    await zp.syncModels()
+    assert.match(seen.headers["x-opencode-session"], /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+    assert.equal(seen.headers["x-opencode-client"], "cli")
+    assert.ok(seen.headers["x-session-affinity"], "affinity sent")
+    assert.ok(seen.headers["x-session-id"], "session-id sent")
+    assert.equal(seen.body.stream, true, "probes stream like the official client")
+    assert.ok(seen.body.tools.length >= 6, "probes carry official tools")
+  })
+
+  test("sync classifies SSE FreeTierError text as gated", async () => {
+    zp.saveConfig({ fallbackModels: ["space-bunny-free"], autoSyncIntervalMs: 0, cacheMs: 0 })
+    const sseErr =
+      `event: error\ndata: ${JSON.stringify({ error: { type: "FreeTierError", message: "OpenCode's free tier can only be used from within OpenCode" } })}\n\n`
+    globalThis.fetch = routeFetch([
+      ["/models", () => jsonResponse({ data: [{ id: "space-bunny-free" }] })],
+      ["/chat/completions", () => new Response(sseErr, { status: 403, headers: { "content-type": "text/event-stream" } })],
+    ])
+    const s = await zp.syncModels()
+    assert.ok(s.gated.includes("space-bunny-free"), "SSE error text recognized as a free-tier gate")
+    assert.ok(zp.config.fallbackModels.includes("space-bunny-free"), "gated model kept in the list")
   })
 })
 
@@ -357,30 +549,30 @@ describe("effectiveDefault", () => {
 
 describe("auto-UA tracking", () => {
   test("refreshUA adopts a newer opencode version and persists it", async () => {
-    zp.saveConfig({ autoUA: true, ua: "opencode/1.18.30" })
+    zp.saveConfig({ autoUA: true, ua: "opencode/latest/1.18.30/cli" })
     globalThis.fetch = routeFetch([
-      ["registry.npmjs.org/opencode-ai/latest", jsonResponse({ version: "9.9.9" })],
+      ["registry.npmjs.org/@opencode/cli/latest", jsonResponse({ version: "9.9.9" })],
     ])
     await zp.refreshUA(true)
-    assert.equal(zp.config.ua, "opencode/9.9.9", "UA must track the latest opencode version")
+    assert.equal(zp.config.ua, "opencode/latest/9.9.9/cli", "UA must track the latest opencode version")
   })
 
   test("refreshUA leaves custom User-Agents untouched", async () => {
     zp.saveConfig({ autoUA: true, ua: "my-agent/1.0" })
     globalThis.fetch = routeFetch([
-      ["registry.npmjs.org/opencode-ai/latest", jsonResponse({ version: "9.9.9" })],
+      ["registry.npmjs.org/@opencode/cli/latest", jsonResponse({ version: "9.9.9" })],
     ])
     await zp.refreshUA(true)
     assert.equal(zp.config.ua, "my-agent/1.0", "custom UA must not be overwritten")
   })
 
   test("refreshUA is a no-op when autoUA is disabled", async () => {
-    zp.saveConfig({ autoUA: false, ua: "opencode/1.18.30" })
+    zp.saveConfig({ autoUA: false, ua: "opencode/latest/1.18.30/cli" })
     let hit = false
     globalThis.fetch = async () => { hit = true; return jsonResponse({ version: "9.9.9" }) }
     await zp.refreshUA(true)
     assert.equal(hit, false, "must not fetch when disabled")
-    assert.equal(zp.config.ua, "opencode/1.18.30")
+    assert.equal(zp.config.ua, "opencode/latest/1.18.30/cli")
   })
 })
 

@@ -2,6 +2,8 @@
 import http from "node:http"
 import fs from "node:fs"
 import path from "node:path"
+import os from "node:os"
+import { execFileSync } from "node:child_process"
 import { randomBytes } from "node:crypto"
 import { fileURLToPath } from "node:url"
 
@@ -19,7 +21,9 @@ const DEFAULT_CONFIG = {
   host: ENV.HOST ?? "0.0.0.0",
   port: Number(ENV.PORT ?? 8787),
   upstream: (ENV.ZEN_URL ?? "https://opencode.ai/zen/v1").replace(/\/+$/, ""),
-  ua: ENV.ZEN_UA ?? "opencode/1.18.30",
+  // opencode 2.x official client sends `opencode/<channel>/<version>/<client>`
+  // e.g. `opencode/latest/2.0.9/cli`. The free tier checks this.
+  ua: ENV.ZEN_UA ?? "opencode/latest/2.0.9/cli",
   autoUA: ENV.AUTO_UA !== "0",
   uaRefreshMs: Number(ENV.UA_REFRESH_MS ?? 6 * 3600_000),
   injectSession: ENV.INJECT_SESSION !== "0",
@@ -139,19 +143,90 @@ const MAX_BODY = 1024 * 1024
 // not on a chat/responses endpoint, so they are never routable here.
 const NOT_CHAT_SERVABLE = [/^jev-/]
 
+// ---- opencode official client emulation (zen free tier, opencode 2.x) ----
+// Upstream `Console` rejects free requests that don't look like opencode:
+//   `403 FreeTierError: OpenCode's free tier can only be used from within OpenCode`
+// Real requirements (verified by replaying the official binary):
+//   - Authorization must be a real auto-provisioned `sk-...` (not `public`)
+//   - User-Agent `opencode/<channel>/<version>/<client>` e.g. `opencode/latest/2.0.9/cli`
+//   - x-opencode-session must be a valid descending ID (timestamp prefix), random hex fails
+//   - x-opencode-client / x-opencode-project / x-session-affinity / x-session-id required
+//   - body must have stream:true + >=6 real opencode tools (or full title prompt)
+const OFFICIAL_TOOLS = ["edit", "glob", "grep", "question", "read", "shell",
+  "skill", "subagent", "webfetch", "websearch", "write", "execute"]
+const MIN_OFFICIAL_TOOLS = ["edit", "glob", "grep", "question", "read", "shell"]
+
+function isFreeModel(id) {
+  const m = String(id ?? "").split("/").pop()
+  return m === "big-pickle" || m.endsWith("-free")
+}
+
+function mkOfficialTools(names) {
+  const list = names ?? MIN_OFFICIAL_TOOLS
+  return list.map((n) => ({
+    type: "function",
+    function: { name: n, description: `opencode tool ${n}`, parameters: { type: "object", properties: {} } },
+  }))
+}
+
+function hasEnoughOfficialTools(tools) {
+  if (!Array.isArray(tools)) return false
+  const names = new Set(tools.map((t) => t?.function?.name ?? t?.name).filter(Boolean))
+  let hits = 0
+  for (const n of OFFICIAL_TOOLS) if (names.has(n)) hits++
+  return hits >= 6
+}
+
+// Replicates opencode/src/id/id.ts `create(prefix, descending)`.
+// Session IDs are `ses_<12hex timestamp><14 base62>` where the hex part is the
+// low 48 bits of `~(Date.now()*0x1000 + counter)`. Pure random `ses_` fails.
+let _idLastTs = 0
+let _idCounter = 0
+function genOfficialId(prefix = "ses") {
+  const cur = Date.now()
+  if (cur !== _idLastTs) {
+    _idLastTs = cur
+    _idCounter = 0
+  }
+  _idCounter++
+  let now = BigInt(cur) * BigInt(0x1000) + BigInt(_idCounter)
+  now = ~now
+  const mask = (1n << 48n) - 1n
+  const low = now & mask
+  const hexpart = low.toString(16).padStart(12, "0")
+  const chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+  const bytes = randomBytes(14)
+  let rand = ""
+  for (let i = 0; i < 14; i++) rand += chars[bytes[i] % 62]
+  return `${prefix}_${hexpart}${rand}`
+}
+
+function genProjectId() {
+  return randomBytes(20).toString("hex")
+}
+
 // opencode's free tier requires every request to carry an `x-opencode-session`
 // header (upstream returns 400 `MissingSessionID` otherwise). Generic agents
 // never send one, so we mint stable per-client session IDs and inject them.
 const sessionPool = new Map()
 function genSessionId() {
-  return "ses_" + randomBytes(13).toString("hex")
+  return genOfficialId("ses")
+}
+function isValidOfficialSession(v) {
+  return typeof v === "string" && /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/.test(v.trim())
 }
 function sessionFor(req) {
   const incoming = req?.headers?.["x-opencode-session"]
-  if (typeof incoming === "string" && incoming.trim()) return { value: incoming.trim(), injected: false }
+  if (isValidOfficialSession(incoming)) return { value: incoming.trim(), injected: false }
+  // Invalid/random incoming would 403 as non-official; replace with a valid one.
+  // If injectSession is disabled and incoming is invalid, still return incoming
+  // so behavior is explicit (will fail upstream, as requested).
+  if (typeof incoming === "string" && incoming.trim() && !config.injectSession) {
+    return { value: incoming.trim(), injected: false }
+  }
   const key = req ? (ipOmit(clientIp(req)) ? "local" : clientIp(req)) : "server"
   let id = sessionPool.get(key)
-  if (!id) {
+  if (!id || !isValidOfficialSession(id)) {
     id = genSessionId()
     sessionPool.set(key, id)
   }
@@ -473,27 +548,106 @@ function ipOmit(ip) {
   return false
 }
 
-function zenHeaders(req, auth) {
+function zenHeaders(req, auth, opts = {}) {
+  // Official 2.x headers: UA + session + client + project + affinity.
+  // Missing/invalid ones are minted so generic agents look like opencode.
   const headers = {
     "content-type": "application/json",
     accept: "application/json, text/event-stream",
     authorization: auth,
     "user-agent": config.ua,
   }
+  if (config.injectSession === false) {
+    // Explicit opt-out: forward whatever the client sent, mint nothing.
+    for (const h of ["x-opencode-session", "x-opencode-client", "x-opencode-project", "x-session-affinity", "x-session-id", "x-opencode-request"]) {
+      const v = req.headers[h]
+      if (typeof v === "string" && v) headers[h] = v
+    }
+    const ip = clientIp(req)
+    if (!ipOmit(ip)) headers["x-real-ip"] = ip
+    return { headers, session: headers["x-opencode-session"] }
+  }
   const sess = sessionFor(req)
-  if (sess.injected && config.injectSession) headers["x-opencode-session"] = sess.value
+  const session = sess.value
+  headers["x-opencode-session"] = session
+  headers["x-session-affinity"] = session
+  headers["x-session-id"] = session
+  const incomingClient = req.headers["x-opencode-client"]
+  headers["x-opencode-client"] =
+    typeof incomingClient === "string" && incomingClient ? incomingClient : "cli"
+  const incomingProject = req.headers["x-opencode-project"]
+  headers["x-opencode-project"] =
+    typeof incomingProject === "string" && incomingProject ? incomingProject : (opts.project ?? genProjectId())
+  // legacy passthrough (harmless)
+  const legacy = req.headers["x-opencode-request"]
+  if (typeof legacy === "string" && legacy) headers["x-opencode-request"] = legacy
   const ip = clientIp(req)
   if (!ipOmit(ip)) headers["x-real-ip"] = ip
-  for (const h of ["x-opencode-session", "x-opencode-request", "x-opencode-client", "x-opencode-project"]) {
-    const v = req.headers[h]
-    if (typeof v === "string" && v) headers[h] = v
-  }
-  return headers
+  return { headers, session }
 }
 
 function bearer(req) {
   const v = req.headers["authorization"]
   return typeof v === "string" && v.startsWith("Bearer ") ? v.slice(7).trim() : ""
+}
+
+// Auto-load the anonymous `sk-...` that official opencode provisions on first
+// run (`~/.local/share/opencode/opencode.db` credential integration `opencode`).
+// `Bearer public` only works for GET /models; inference needs the real key.
+let _localZenKey = null
+let _localZenKeyAt = 0
+function loadLocalZenKey() {
+  const now = Date.now()
+  if (_localZenKey && now - _localZenKeyAt < 60_000) return _localZenKey
+  try {
+    // If OPENCODE_DB is explicitly set (e.g. tests), only use that path
+    // so tests can isolate from the developer's real key.
+    const explicit = process.env.OPENCODE_DB
+    const candidates = explicit
+      ? [explicit]
+      : (() => {
+          const home = os.homedir() || process.env.HOME || process.env.USERPROFILE || ""
+          return home ? [`${home}/.local/share/opencode/opencode.db`] : []
+        })()
+    for (const dbPath of candidates) {
+      try {
+        if (!dbPath || !fs.existsSync(dbPath)) continue
+        const out = tryReadCredentialViaCli(dbPath)
+        if (out) {
+          _localZenKey = out
+          _localZenKeyAt = now
+          return out
+        }
+      } catch {}
+    }
+  } catch {}
+  return _localZenKey
+}
+
+function tryReadCredentialViaCli(dbPath) {
+  try {
+    const sql = "SELECT value FROM credential WHERE integration_id='opencode' LIMIT 1"
+    const raw = execFileSync("sqlite3", [dbPath, sql], { encoding: "utf8", timeout: 3000 })
+    const txt = String(raw ?? "").trim()
+    if (!txt) return null
+    try {
+      const j = JSON.parse(txt)
+      if (j?.key) return j.key
+    } catch {}
+    // sqlite3 may output the JSON string directly
+    const m = txt.match(/"key"\s*:\s*"([^"]+)"/)
+    if (m) return m[1]
+    return null
+  } catch {
+    return null
+  }
+}
+
+function resolveZenKey() {
+  if (config.defaultZenKey) return config.defaultZenKey
+  const local = loadLocalZenKey()
+  if (local) return local
+  return ""
 }
 
 function authForUpstream(req) {
@@ -502,10 +656,15 @@ function authForUpstream(req) {
     if (incoming !== config.proxyKey) return null
     const zen = req.headers["x-zen-key"]
     if (typeof zen === "string" && zen && zen !== "public") return `Bearer ${zen}`
-    if (config.defaultZenKey) return `Bearer ${config.defaultZenKey}`
+    const resolved = resolveZenKey()
+    if (resolved) return `Bearer ${resolved}`
     return "Bearer public"
   }
   if (incoming && incoming !== "public") return `Bearer ${incoming}`
+  const zenHeader = req.headers["x-zen-key"]
+  if (typeof zenHeader === "string" && zenHeader && zenHeader !== "public") return `Bearer ${zenHeader}`
+  const resolved = resolveZenKey()
+  if (resolved) return `Bearer ${resolved}`
   if (config.defaultZenKey) return `Bearer ${config.defaultZenKey}`
   return "Bearer public"
 }
@@ -966,6 +1125,136 @@ function relayMessagesResponsesStream(req, res, upstreamRes, requested, inputFal
   return pump()
 }
 
+function ensureChatFreeTier(body) {
+  // Returns { payload, clientStream } where payload is upstream-ready.
+  // Free tier needs stream:true + >=6 real tools; non-stream clients are
+  // served by upstream-streaming + destreaming (see collectChatSSE).
+  const clientStream = !!body.stream
+  const payload = { ...body }
+  if (!hasEnoughOfficialTools(payload.tools)) {
+    payload.tools = mkOfficialTools()
+  }
+  payload.stream = true
+  if (payload.stream_options == null) payload.stream_options = { include_usage: true }
+  return { payload, clientStream }
+}
+
+function ensureResponsesFreeTier(body, session) {
+  const clientStream = body.stream !== false
+  const payload = { ...body }
+  // responses tools are flat: {type:"function", name, ...}
+  const names = new Set(
+    (Array.isArray(payload.tools) ? payload.tools : [])
+      .map((t) => t?.name ?? t?.function?.name)
+      .filter(Boolean),
+  )
+  let hits = 0
+  for (const n of OFFICIAL_TOOLS) if (names.has(n)) hits++
+  if (hits < 6) {
+    payload.tools = MIN_OFFICIAL_TOOLS.map((n) => ({
+      type: "function",
+      name: n,
+      description: `opencode tool ${n}`,
+      parameters: { type: "object", properties: {} },
+    }))
+  }
+  if (payload.store == null) payload.store = false
+  if (payload.prompt_cache_key == null) payload.prompt_cache_key = session
+  if (payload.include == null) payload.include = ["reasoning.encrypted_content"]
+  payload.stream = true
+  return { payload, clientStream }
+}
+
+async function collectChatSSE(upstreamRes) {
+  const text = await upstreamRes.text()
+  // Robustness: if upstream answered plain JSON (not SSE), extract content
+  // directly instead of failing the destream.
+  try {
+    const j = JSON.parse(text)
+    if (j && typeof j === "object" && Array.isArray(j.choices)) {
+      const msg = j.choices[0]?.message ?? j.choices[0]?.delta ?? {}
+      const content = typeof msg.content === "string" ? msg.content : ""
+      const toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : undefined
+      const finish = typeof j.choices[0]?.finish_reason === "string" ? j.choices[0].finish_reason : "stop"
+      return {
+        content,
+        tool_calls: toolCalls,
+        finish,
+        model: typeof j.model === "string" ? j.model : "",
+        id: typeof j.id === "string" ? j.id : `chatcmpl-${Date.now().toString(36)}`,
+        usage: j.usage,
+      }
+    }
+  } catch {}
+  let content = ""
+  let finish = "stop"
+  let model = ""
+  let id = `chatcmpl-${Date.now().toString(36)}`
+  for (const line of text.split("\n")) {
+    const t = line.trim()
+    if (!t.startsWith("data:")) continue
+    const payload = t.slice(5).trim()
+    if (!payload || payload === "[DONE]") continue
+    try {
+      const j = JSON.parse(payload)
+      if (typeof j.id === "string") id = j.id
+      if (typeof j.model === "string") model = j.model
+      const fr = j.choices?.[0]?.finish_reason
+      if (typeof fr === "string" && fr) finish = fr
+      const delta = j.choices?.[0]?.delta
+      if (delta && typeof delta.content === "string") content += delta.content
+      // some providers put final content in message instead of delta
+      const msg = j.choices?.[0]?.message
+      if (msg && typeof msg.content === "string" && !content) content = msg.content
+    } catch {}
+  }
+  return { content, model, id, finish, tool_calls: undefined, usage: undefined }
+}
+
+async function collectResponsesSSE(upstreamRes) {
+  const text = await upstreamRes.text()
+  // Robustness: plain-JSON Responses bodies (not SSE) extract directly.
+  try {
+    const j = JSON.parse(text)
+    if (j && typeof j === "object") {
+      if (typeof j.output_text === "string" && j.output_text) return j.output_text
+      const out = Array.isArray(j.output) ? j.output : []
+      const parts = []
+      for (const item of out) {
+        for (const p of item.content ?? []) {
+          if (p?.type === "output_text" && typeof p.text === "string") parts.push(p.text)
+        }
+      }
+      if (parts.length) return parts.sort((a, b) => b.length - a.length)[0]
+    }
+  } catch {}
+  const deltas = []
+  const completed = []
+  for (const chunk of text.split("\n\n")) {
+    const c = chunk.trim()
+    if (!c || !c.includes("data:")) continue
+    for (const line of c.split("\n")) {
+      const t = line.trim()
+      if (!t.startsWith("data:")) continue
+      try {
+        const j = JSON.parse(t.slice(5).trim())
+        if (typeof j.delta === "string") deltas.push(j.delta)
+        else if (j.delta && typeof j.delta.text === "string") deltas.push(j.delta.text)
+        const out = j.response?.output
+        if (Array.isArray(out)) {
+          for (const item of out) {
+            for (const p of item.content ?? []) {
+              if (p?.type === "output_text" && typeof p.text === "string") completed.push(p.text)
+            }
+          }
+        }
+      } catch {}
+    }
+  }
+  const full = completed.length ? completed.sort((a, b) => b.length - a.length)[0] : deltas.join("")
+  return full
+}
+
 async function handleChat(req, res) {
   const start = Date.now()
   let body
@@ -1045,18 +1334,36 @@ async function runChatLoop(req, res, { body, requested, candidates, auth, start,
   for (const model of candidates) {
     used = model
     const format = modelFormat(model)
-    const payload =
+    const free = isFreeModel(model)
+    // Free-tier body hardening: inject official tools + force upstream stream.
+    // Non-stream clients are served via destreaming below.
+    let payload =
       format === "responses" ? responsesRequest(body, model, isStream) : { ...body, model }
+    let wantStream = isStream
+    let forcedStream = false
+    const { headers: upHeaders, session: upSession } = zenHeaders(req, auth)
+    if (free) {
+      forcedStream = !isStream
+      if (format === "responses") {
+        const fixed = ensureResponsesFreeTier(payload, upSession)
+        payload = fixed.payload
+      } else {
+        const fixed = ensureChatFreeTier(payload)
+        payload = fixed.payload
+      }
+      // upstream always streams for free; client non-stream gets converted
+      wantStream = true
+    }
     let upstreamRes
     try {
       upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
         method: "POST",
-        headers: zenHeaders(req, auth),
+        headers: upHeaders,
         body: JSON.stringify(payload),
         // Newer Node aborts IncomingMessage.signal as soon as the request
         // body is consumed, so it can never gate a long-lived upstream
         // fetch — reuse it only while still armed, else use a timeout.
-        signal: isStream && req.signal && !req.signal.aborted ? req.signal : AbortSignal.timeout(config.timeoutMs),
+        signal: wantStream && req.signal && !req.signal.aborted ? req.signal : AbortSignal.timeout(config.timeoutMs),
       })
     } catch (err) {
       lastErr = { error: { type: "upstream_error", message: err.message } }
@@ -1072,6 +1379,41 @@ async function runChatLoop(req, res, { body, requested, candidates, auth, start,
         res.on("finish", () => { recordReq(req, `${requested}→${model}`, Date.now() - start, 200); recordObserved(model, true) })
         return streamed
       }
+      if (forcedStream) {
+        // Client asked non-stream but upstream streamed (free-tier requirement):
+        // collect SSE and synthesize a non-stream body for onJson.
+        try {
+          if (format === "responses") {
+            const full = await collectResponsesSSE(upstreamRes)
+            const out = {
+              id: `resp_${Date.now().toString(36)}`,
+              output: [{
+                type: "message",
+                role: "assistant",
+                content: [{ type: "output_text", text: full }],
+              }],
+            }
+            return onJson(out, model, format)
+          }
+          const { content, tool_calls: tcalls, finish, model: upModel, id, usage } = await collectChatSSE(upstreamRes)
+          const out = {
+            id: id || `chatcmpl-${Date.now().toString(36)}`,
+            object: "chat.completion",
+            created: Math.floor(Date.now() / 1000),
+            model: upModel || model,
+            choices: [{
+              index: 0,
+              message: { role: "assistant", content, ...(tcalls?.length ? { tool_calls: tcalls } : {}) },
+              finish_reason: finish ?? "stop",
+            }],
+            ...(usage ? { usage } : {}),
+          }
+          return onJson(out, model, format)
+        } catch {
+          recordReq(req, requested, Date.now() - start, 502)
+          return onError(502, { error: { type: "upstream_error", message: "bad upstream response" } })
+        }
+      }
       try {
         const content = await upstreamRes.json()
         return onJson(content, model, format)
@@ -1084,7 +1426,13 @@ async function runChatLoop(req, res, { body, requested, candidates, auth, start,
     try {
       lastErr = await upstreamRes.json()
     } catch {
-      lastErr = { error: { type: "upstream_error", message: `upstream returned ${upstreamRes.status}` } }
+      // Upstream SSE error (stream:true always) may not be JSON; read text.
+      try {
+        const t = await upstreamRes.text()
+        lastErr = { error: { type: "upstream_error", message: t.slice(0, 500) } }
+      } catch {
+        lastErr = { error: { type: "upstream_error", message: `upstream returned ${upstreamRes.status}` } }
+      }
     }
     lastStatus = upstreamRes.status
     lastRetryAfter = parseRetryAfter(upstreamRes.headers.get("retry-after"))
@@ -1104,6 +1452,178 @@ async function runChatLoop(req, res, { body, requested, candidates, auth, start,
 
   recordReq(req, `${requested}→${used}`, Date.now() - start, lastStatus)
   return onError(lastStatus, lastErr, lastRetryAfter)
+}
+
+async function handleResponses(req, res) {
+  // Direct Responses API passthrough (POST /v1/responses, /responses).
+  // Unlike handleChat (which translates chat bodies for responses-family
+  // models), this preserves the Responses shape end to end.
+  const start = Date.now()
+  let body
+  try {
+    const raw = await readBody(req)
+    if (raw.length > MAX_BODY) {
+      return json(res, 413, { error: { type: "invalid_request_error", message: "request body too large" } })
+    }
+    body = JSON.parse(raw)
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      return json(res, 400, { error: { type: "invalid_request_error", message: "body must be a JSON object" } })
+    }
+  } catch {
+    return json(res, 400, { error: { type: "invalid_request_error", message: "invalid JSON body" } })
+  }
+
+  const { requested, candidates } = resolveModel(body.model)
+  const clientStream = body.stream !== false
+  const auth = authForUpstream(req)
+  if (!auth) {
+    recordReq(req, requested, Date.now() - start, 401)
+    return json(res, 401, { error: { type: "invalid_request_error", message: "invalid proxy key" } })
+  }
+
+  let lastErr = null
+  let lastStatus = 502
+  let used = requested
+  for (const model of candidates) {
+    used = model
+    let payload = { ...body, model }
+    if (isFreeModel(model)) {
+      // Responses free also needs tools + stream; reuse session for cache key.
+      const { session: sess } = zenHeaders(req, auth)
+      const fixed = ensureResponsesFreeTier(payload, sess)
+      payload = fixed.payload
+    }
+    const { headers: upHeaders } = zenHeaders(req, auth)
+    let upstreamRes
+    try {
+      upstreamRes = await fetch(`${config.upstream}/responses`, {
+        method: "POST",
+        headers: upHeaders,
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(config.timeoutMs),
+      })
+    } catch (err) {
+      lastErr = { error: { type: "upstream_error", message: err.message } }
+      lastStatus = 502
+      continue
+    }
+
+    if (upstreamRes.ok) {
+      if (clientStream) {
+        relayResponsesPassthrough(req, res, upstreamRes, requested)
+        res.on("finish", () => recordReq(req, `${requested}→${model}`, Date.now() - start, 200))
+        return
+      }
+      try {
+        const full = await collectResponsesSSE(upstreamRes)
+        const out = {
+          id: `resp_${Date.now().toString(36)}`,
+          object: "response",
+          model: requested,
+          output: [{
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: full }],
+          }],
+        }
+        recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
+        return json(res, 200, out)
+      } catch {
+        recordReq(req, requested, Date.now() - start, 502)
+        return json(res, 502, { error: { type: "upstream_error", message: "bad upstream response" } })
+      }
+    }
+
+    try {
+      lastErr = await upstreamRes.json()
+    } catch {
+      try {
+        const t = await upstreamRes.text()
+        lastErr = { error: { type: "upstream_error", message: t.slice(0, 500) } }
+      } catch {
+        lastErr = { error: { type: "upstream_error", message: `upstream returned ${upstreamRes.status}` } }
+      }
+    }
+    lastStatus = upstreamRes.status
+    if (retryableUpstream(upstreamRes.status, lastErr)) {
+      const wait = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait))
+      continue
+    }
+    break
+  }
+
+  recordReq(req, `${requested}→${used}`, Date.now() - start, lastStatus)
+  res.writeHead(lastStatus, { "content-type": "application/json" })
+  res.end(
+    JSON.stringify(lastErr ?? { error: { type: "free_usage_limit_error", message: "all free models are rate-limited" } }),
+  )
+}
+
+function relayResponsesPassthrough(req, res, upstreamRes, requested) {
+  // Responses SSE is `event: ...\ndata: {...}\n\n`; rewrite embedded model fields.
+  res.writeHead(200, {
+    "content-type": upstreamRes.headers.get("content-type") ?? "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+  })
+  const reader = upstreamRes.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  const ctrl = new AbortController()
+  const onAbort = () => ctrl.abort()
+  if (req.signal?.addEventListener) req.signal.addEventListener("abort", onAbort)
+  const timer = setTimeout(() => ctrl.abort(), config.timeoutMs)
+  ctrl.signal.addEventListener("abort", () => {
+    reader.cancel().catch(() => {})
+  })
+  const cleanup = () => {
+    clearTimeout(timer)
+    if (req.signal?.removeEventListener) req.signal.removeEventListener("abort", onAbort)
+  }
+  const pump = async () => {
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) {
+          if (buffer.trim()) res.write(buffer)
+          res.end()
+          return
+        }
+        buffer += decoder.decode(value, { stream: true })
+        let idx
+        while ((idx = buffer.indexOf("\n\n")) !== -1) {
+          const block = buffer.slice(0, idx)
+          buffer = buffer.slice(idx + 2)
+          if (!block.trim()) continue
+          // rewrite model inside data payloads
+          const lines = block.split("\n")
+          const out = []
+          for (const line of lines) {
+            if (line.startsWith("data: ")) {
+              const payload = line.slice(6)
+              try {
+                const j = JSON.parse(payload)
+                if (j?.response?.model) j.response.model = requested
+                if (j?.model) j.model = requested
+                out.push(`data: ${JSON.stringify(j)}`)
+              } catch {
+                out.push(line)
+              }
+            } else {
+              out.push(line)
+            }
+          }
+          res.write(out.join("\n") + "\n\n")
+        }
+      }
+    } catch {
+      res.end()
+    } finally {
+      cleanup()
+    }
+  }
+  return pump()
 }
 
 async function handleMessages(req, res) {
@@ -1266,6 +1786,8 @@ function responsesRequest(body, model, isStream) {
 function probeAuthHeader() {
   const mode = String(config.probeAuth ?? "auto").toLowerCase()
   if (mode === "anonymous") return "Bearer public"
+  const resolved = resolveZenKey()
+  if (resolved) return `Bearer ${resolved}`
   if (config.defaultZenKey) return `Bearer ${config.defaultZenKey}`
   if (mode === "key") return "Bearer public" // no key configured; anonymous is all we can do
   return "Bearer public"
@@ -1273,19 +1795,45 @@ function probeAuthHeader() {
 
 // One-shot liveness probe for a model, using the endpoint family that model
 // actually lives on. Returns the raw Response so sync can classify it.
+// Free-tier probes must look like opencode: valid session + UA + tools +
+// stream. Minimal ping bodies without tools always 403 FreeTierError.
 async function probeModel(id, auth, session) {
   const format = modelFormat(id)
+  const sess = session && isValidOfficialSession(session) ? session : genOfficialId("ses")
+  const proj = genProjectId()
   const headers = {
     "content-type": "application/json",
-    accept: "application/json",
+    accept: "application/json, text/event-stream",
     authorization: auth,
     "user-agent": config.ua,
+    "x-opencode-session": sess,
+    "x-opencode-client": "cli",
+    "x-opencode-project": proj,
+    "x-session-affinity": sess,
+    "x-session-id": sess,
   }
-  if (session) headers["x-opencode-session"] = session
   const payload =
     format === "responses"
-      ? { model: id, input: "ping", max_output_tokens: 32 }
-      : { model: id, messages: [{ role: "user", content: "ping" }], max_tokens: 5 }
+      ? {
+          model: id,
+          input: [{ role: "user", content: [{ type: "input_text", text: "ping" }] }],
+          tools: MIN_OFFICIAL_TOOLS.map((n) => ({
+            type: "function", name: n,
+            description: `opencode tool ${n}`,
+            parameters: { type: "object", properties: {} },
+          })),
+          store: false,
+          prompt_cache_key: sess,
+          include: ["reasoning.encrypted_content"],
+          stream: true,
+        }
+      : {
+          model: id,
+          messages: [{ role: "user", content: "ping" }],
+          tools: mkOfficialTools(),
+          stream: true,
+          stream_options: { include_usage: true },
+        }
   return fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
     method: "POST",
     headers,
@@ -1413,7 +1961,7 @@ async function fetchModels() {
           const live = new Set([...syncState.working, ...syncState.rateLimited])
           free = upstreamModels.filter((m) => (live.has(m.id) || allowed.has(m.id)) && !dead.has(m.id))
         } else {
-          free = upstreamModels.filter((m) => (m.id.endsWith("-free") || allowed.has(m.id)) && !dead.has(m.id))
+          free = upstreamModels.filter((m) => (m.id.endsWith("-free") || m.id === "big-pickle" || allowed.has(m.id)) && !dead.has(m.id))
         }
         modelsCache = { at: Date.now(), data: free, ok: true }
       } else {
@@ -1449,7 +1997,7 @@ async function syncModels() {
     // Everything the upstream currently offers for free. The user's list is
     // merged with this, so a model that exists but is temporarily blocked still
     // gets (re)added — the list self-heals instead of staying shrunken.
-    const discovered = [...upstreamIds].filter((id) => id.endsWith("-free") && isFree(id))
+    const discovered = [...upstreamIds].filter((id) => (id.endsWith("-free") || id === "big-pickle") && isFree(id))
     const candidates = [...new Set([...current, ...discovered])]
     const working = []
     const rateLimited = []
@@ -1468,10 +2016,19 @@ async function syncModels() {
           const r = await probeModel(id, auth, sessionHeader())
           let bodyErr = ""
           try {
-            const j = await r.json()
-            if (j && (j.error || j.type === "error")) {
-              const e = j.error ?? j
-              bodyErr = (e.type || "") + " " + (e.message || "")
+            // stream:true probes answer 200 SSE (not JSON) on success; errors
+            // may be JSON or SSE text, so read text once and try to parse.
+            const t = await r.text()
+            try {
+              const j = JSON.parse(t)
+              if (j && (j.error || j.type === "error")) {
+                const e = j.error ?? j
+                bodyErr = (e.type || "") + " " + (e.message || "")
+              } else if (!r.ok) {
+                bodyErr = t.slice(0, 300)
+              }
+            } catch {
+              if (!r.ok) bodyErr = t.slice(0, 300)
             }
           } catch {}
           if (r.ok && !bodyErr) { working.push(id); modelHealth.set(id, 0) }
@@ -1592,7 +2149,7 @@ function scheduleSync() {
 }
 
 // Auto-UA: opencode ships new versions regularly; keeping the injected
-// `opencode/<version>` User-Agent current future-proofs the free-tier unlock.
+// `opencode/latest/<version>/cli` User-Agent current future-proofs the free-tier unlock.
 const uaAutoState = { at: 0, version: "" }
 async function refreshUA(force = false) {
   if (!config.autoUA) return ""
@@ -1600,17 +2157,28 @@ async function refreshUA(force = false) {
   if (!force && uaAutoState.at && now - uaAutoState.at < config.uaRefreshMs) return uaAutoState.version
   uaAutoState.at = now
   try {
-    const res = await fetch("https://registry.npmjs.org/opencode-ai/latest", {
-      headers: { accept: "application/json" },
-      signal: AbortSignal.timeout(10_000),
-    })
-    if (!res.ok) return uaAutoState.version
-    const data = await res.json()
-    const v = String(data?.version ?? "")
-    if (!/^\d+\.\d+\.\d+/.test(v)) return uaAutoState.version
+    // Official CLI is now `@opencode/cli` (2.x); old `opencode-ai` is stale.
+    // Try new package first, fall back to legacy.
+    let v = ""
+    for (const pkg of ["@opencode/cli", "opencode-ai"]) {
+      try {
+        const res = await fetch(`https://registry.npmjs.org/${pkg}/latest`, {
+          headers: { accept: "application/json" },
+          signal: AbortSignal.timeout(10_000),
+        })
+        if (!res.ok) continue
+        const data = await res.json()
+        const cand = String(data?.version ?? "")
+        if (/^\d+\.\d+\.\d+/.test(cand)) {
+          v = cand
+          break
+        }
+      } catch {}
+    }
+    if (!v) return uaAutoState.version
     uaAutoState.version = v
-    const next = `opencode/${v}`
-    if (next !== config.ua && /^opencode\/\d+\.\d+\.\d+/.test(config.ua)) {
+    const next = `opencode/latest/${v}/cli`
+    if (next !== config.ua && /^opencode\/(latest\/)?\d+\.\d+\.\d+(\/cli)?$/.test(config.ua)) {
       log(`auto-UA: opencode ${v} released — updating User-Agent`)
       try { saveConfig({ ua: next }) } catch {}
     }
@@ -1779,34 +2347,68 @@ async function handleTest(req, res) {
         ? `Bearer ${body.zenKey.trim()}`
         : (authForUpstream(req) ?? "Bearer public")
     const format = modelFormat(model)
+    const testSess = genOfficialId("ses")
+    const testProj = genProjectId()
+    const testBody =
+      format === "responses"
+        ? {
+            model,
+            input: [{ role: "user", content: [{ type: "input_text", text: "ping" }] }],
+            tools: MIN_OFFICIAL_TOOLS.map((n) => ({
+              type: "function", name: n,
+              description: `opencode tool ${n}`,
+              parameters: { type: "object", properties: {} },
+            })),
+            store: false,
+            prompt_cache_key: testSess,
+            include: ["reasoning.encrypted_content"],
+            stream: false,
+          }
+        : {
+            model,
+            messages: [{ role: "user", content: "ping" }],
+            tools: mkOfficialTools(),
+            stream: false,
+          }
+    // For free models, force stream:true for the probe (else always 403).
+    if (isFreeModel(model)) {
+      testBody.stream = true
+      if (format !== "responses") testBody.stream_options = { include_usage: true }
+    }
+    const ip = clientIp(req)
     const upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
       method: "POST",
-      headers: (() => {
-        const h = {
-          "content-type": "application/json",
-          accept: "application/json",
-          authorization: auth,
-          "user-agent": config.ua,
-        }
-        const sess = sessionHeader(req)
-        if (sess) h["x-opencode-session"] = sess
-        const ip = req.socket.remoteAddress ?? ""
-        if (!ipOmit(ip)) h["x-real-ip"] = ip
-        return h
-      })(),
-      body: JSON.stringify(
-        format === "responses"
-          ? { model, input: "ping", max_output_tokens: 32 }
-          : { model, messages: [{ role: "user", content: "ping" }], max_tokens: 5 },
-      ),
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        authorization: auth,
+        "user-agent": config.ua,
+        "x-opencode-session": testSess,
+        "x-opencode-client": "cli",
+        "x-opencode-project": testProj,
+        "x-session-affinity": testSess,
+        "x-session-id": testSess,
+        ...(!ipOmit(ip) ? { "x-real-ip": ip } : {}),
+      },
+      body: JSON.stringify(testBody),
       signal: AbortSignal.timeout(config.timeoutMs),
     })
     let detail = ""
     let gated = false
     try {
-      const parsed = await upstreamRes.json()
-      if (format === "responses") detail = parsed.error?.message ?? (typeof parsed.output_text === "string" ? parsed.output_text : "")
-      else detail = parsed.error?.message ?? parsed.choices?.[0]?.message?.content ?? ""
+      const ctype = upstreamRes.headers.get("content-type") ?? ""
+      if (ctype.includes("text/event-stream")) {
+        const t = await upstreamRes.text()
+        detail = t.slice(0, 300)
+        // SSE 200 means working even though it's not JSON
+        if (upstreamRes.ok && !detail.includes("FreeTierError") && !detail.includes("error")) {
+          detail = "stream ok: " + detail.slice(0, 200)
+        }
+      } else {
+        const parsed = await upstreamRes.json()
+        if (format === "responses") detail = parsed.error?.message ?? (typeof parsed.output_text === "string" ? parsed.output_text : "")
+        else detail = parsed.error?.message ?? parsed.choices?.[0]?.message?.content ?? ""
+      }
       // A free-tier gate here is not a failure of the model: the free tier only
       // accepts genuine agent traffic, which a bare ping never is.
       if (upstreamRes.status === 403 && /FreeTierError|free tier can only/i.test(detail)) gated = true
@@ -1890,7 +2492,7 @@ async function router(req, res) {
   }
 
   if (req.method === "GET" && (p === "/v1/models" || p === "/models")) return handleModels(req, res)
-  if (req.method === "POST" && (p === "/v1/chat/completions" || p === "/chat/completions" || p === "/v1/responses" || p === "/responses")) {
+  if (req.method === "POST" && (p === "/v1/chat/completions" || p === "/chat/completions")) {
     // Throttle only the inference endpoints — the dashboard, /health and the
     // admin API must never be locked out by a client's burst.
     const rl = rateLimitFor(req)
@@ -1903,6 +2505,18 @@ async function router(req, res) {
       )
     }
     return handleChat(req, res)
+  }
+  if (req.method === "POST" && (p === "/v1/responses" || p === "/responses")) {
+    const rl = rateLimitFor(req)
+    if (rl.limited) {
+      res.writeHead(429, { "content-type": "application/json", "retry-after": String(rl.retryAfter) })
+      return res.end(
+        JSON.stringify({
+          error: { type: "rate_limit_error", message: `rate limit exceeded, retry in ${rl.retryAfter}s` },
+        }),
+      )
+    }
+    return handleResponses(req, res)
   }
   if (req.method === "POST" && (p === "/v1/messages" || p === "/messages")) {
     // Anthropic Messages API — same throttling as the chat route.
@@ -1985,6 +2599,7 @@ export {
   requestStats,
   syncState,
   handleChat,
+  handleResponses,
   handleMessages,
   anthropicToChat,
   anthropicStopReason,
@@ -1992,6 +2607,8 @@ export {
   relayMessagesResponsesStream,
   chatToAnthropic,
   relayStream,
+  relayResponsesStream,
+  relayResponsesPassthrough,
   rewriteSSE,
   fetchModels,
   handleModels,
@@ -2010,6 +2627,17 @@ export {
   toBool,
   sessionFor,
   sessionHeader,
+  genOfficialId,
+  genProjectId,
+  mkOfficialTools,
+  hasEnoughOfficialTools,
+  isFreeModel,
+  ensureChatFreeTier,
+  ensureResponsesFreeTier,
+  collectChatSSE,
+  collectResponsesSSE,
+  loadLocalZenKey,
+  resolveZenKey,
   MAX_BODY,
   VALID_MODEL_ID,
 }

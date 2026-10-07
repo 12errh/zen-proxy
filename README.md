@@ -39,9 +39,9 @@ opencode's free `-free` models (`mimo-v2.5-free`, `big-pickle`, `nemotron`, …)
 <div style="background-color:#1a1612;border-radius:14px;padding:20px;color:#efe8d9;margin:16px 0;">
   <p style="margin:0;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:#ccf73a;">▸ feature list</p>
   <ul style="margin:10px 0 0;padding-left:20px;line-height:1.9;font-size:14px;">
-    <li><b>OpenAI-compatible API</b> — <code>/v1/chat/completions</code> (stream + non-stream), <code>/v1/models</code>, <code>/v1/responses</code>, <code>/v1/messages</code> (Anthropic Messages API)</li>
-    <li><b>UA unlock</b> — injects <code>User-Agent: opencode/1.18.30</code> plus a stable per-client <code>x-opencode-session</code> upstream, the two things that open the free tier</li>
-    <li><b>BYOK</b> — ride anonymous <code>public</code> or bring your own Zen key (stable + no shared-pool throttling)</li>
+    <li><b>OpenAI-compatible API</b> — <code>/v1/chat/completions</code> (stream + non-stream, non-stream auto-destreamed), <code>/v1/models</code>, <code>/v1/responses</code>, <code>/v1/messages</code> (Anthropic Messages API)</li>
+    <li><b>Official-client emulation</b> — injects <code>User-Agent: opencode/latest/2.0.9/cli</code>, valid descending <code>x-opencode-session</code>, <code>x-opencode-client/project</code>, <code>x-session-affinity/id</code>, plus ≥6 real tools + <code>stream:true</code> for free models — the full set that opens the current free tier (plain <code>public</code> + session no longer suffices)</li>
+    <li><b>Anonymous key auto-load</b> — reuses the <code>sk-...</code> that official opencode auto-provisions in <code>~/.local/share/opencode/opencode.db</code>; falls back to <code>public</code> for <code>/models</code>. BYOK via <code>defaultZenKey</code>/<code>x-zen-key</code> still supported</li>
     <li><b>Smart fallback</b> — tries models in order on <code>429</code>/<code>5xx</code>, honors <code>retry-after</code></li>
     <li><b>Model aliases</b> — e.g. <code>gpt-4o → mimo-v2.5-free</code>, replies rewritten back</li>
     <li><b>Per-IP fairness</b> — real client IPs forwarded; local clients fall back to your real IP (same quota bucket as opencode direct)</li>
@@ -157,7 +157,7 @@ Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded wh
 | `host` | `127.0.0.1` | Bind address (restart needed) |
 | `port` | `8787` | Listen port (restart needed) |
 | `upstream` | `https://opencode.ai/zen/v1` | Zen API base |
-| `ua` | `opencode/1.18.30` | The `User-Agent` that unlocks the free tier (auto-updates to new opencode releases) |
+| `ua` | `opencode/latest/2.0.9/cli` | The `User-Agent` that unlocks the free tier (auto-updates to new opencode releases as `opencode/latest/<v>/cli`) |
 | `autoUA` | `true` | Track opencode releases and update `ua` automatically (`opencode/<latest>`) |
 | `uaRefreshMs` | `21600000` | How often to check for a new opencode version (ms) |
 | `injectSession` | `true` | Mint an `x-opencode-session` header per client (upstream rejects requests without one) |
