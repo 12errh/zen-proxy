@@ -37,7 +37,7 @@ jobs:
       - name: Ask a free model a question
         run: |
           : "${PROXY_URL:=https://zen-proxy-49xk.onrender.com}"
-          : "${MODEL:=mimo-v2.6-flash-free}"
+          : "${MODEL:=big-pickle}"
           auth=()
           [ -n "${PROXY_KEY:-}" ] && auth=(-H "Authorization: Bearer $PROXY_KEY")
           echo "Asking $MODEL via $PROXY_URL ..."

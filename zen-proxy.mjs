@@ -39,9 +39,9 @@ const DEFAULT_CONFIG = {
   fallbackModels: JSON.parse(
     ENV.FALLBACK_MODELS ??
       JSON.stringify([
+        "big-pickle",
         "space-bunny-free",
         "mimo-v2.6-flash-free",
-        "big-pickle",
         "ling-3.0-flash-fin-free",
         "muse-spark-1.3-contributor-free",
         "muse-spark-1.2-contributor-free",
