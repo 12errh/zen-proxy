@@ -785,7 +785,7 @@ async function populateConfigForm() {
 
 async function saveConfig() {
   const body = {
-    host: $("cfgHost").value.trim() || "127.0.0.1",
+    host: $("cfgHost").value.trim() || "0.0.0.0",
     port: Number($("cfgPort").value || 8787),
     upstream: $("cfgUpstream").value.trim(),
     ua: $("cfgUa").value.trim(),

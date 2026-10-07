@@ -12,7 +12,11 @@ const UI_PATH = path.join(__dirname, "public", "index.html")
 const ENV = process.env
 
 const DEFAULT_CONFIG = {
-  host: ENV.HOST ?? "127.0.0.1",
+  // NOTE: default host is 0.0.0.0 so PaaS hosts (Render/Railway/Fly/Koyeb)
+  // that require binding to all interfaces pass their port scan.
+  // Local access via http://127.0.0.1:<port> still works when bound to 0.0.0.0.
+  // Set HOST=127.0.0.1 to restrict to loopback only.
+  host: ENV.HOST ?? "0.0.0.0",
   port: Number(ENV.PORT ?? 8787),
   upstream: (ENV.ZEN_URL ?? "https://opencode.ai/zen/v1").replace(/\/+$/, ""),
   ua: ENV.ZEN_UA ?? "opencode/1.18.30",
@@ -68,7 +72,14 @@ const DEFAULT_CONFIG = {
 function loadConfig() {
   try {
     const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"))
-    return { ...DEFAULT_CONFIG, ...raw }
+    const merged = { ...DEFAULT_CONFIG, ...raw }
+    // Env vars always win over the config file. This matters on Render etc:
+    // the first boot writes zen-proxy.json with the default host, and on later
+    // deploys the stale file would otherwise override the platform-injected
+    // HOST/PORT env vars and break port detection again.
+    if (ENV.HOST) merged.host = ENV.HOST
+    if (ENV.PORT) merged.port = Number(ENV.PORT)
+    return merged
   } catch {
     return { ...DEFAULT_CONFIG }
   }

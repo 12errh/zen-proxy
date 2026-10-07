@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: zen-proxy
+    runtime: node
+    plan: free
+    # Zero-dependency app: install is a no-op but keeps the lockfile warning away.
+    buildCommand: npm install
+    startCommand: node zen-proxy.mjs
+    healthCheckPath: /health
+    envVars:
+      # Render requires binding to 0.0.0.0 and injects PORT automatically.
+      # (The app also defaults to 0.0.0.0 now, this just makes it explicit.)
+      - key: HOST
+        value: 0.0.0.0
+      - key: NODE_VERSION
+        value: 22.12.0
