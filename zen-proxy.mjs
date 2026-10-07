@@ -521,6 +521,185 @@ function json(res, status, data) {
   res.end(JSON.stringify(data))
 }
 
+// ---- Anthropic Messages API translation -----------------------------------
+// Normalizes an Anthropic `/v1/messages` body to an OpenAI chat.completions
+// body so it can run through the same upstream candidate/fallback loop as
+// handleChat (shapes ported from the cand1 reference server).
+function anthropicSystemText(system) {
+  if (typeof system === "string") return system
+  if (Array.isArray(system)) {
+    return system
+      .map((b) => (typeof b === "string" ? b : (b?.text ?? "")))
+      .filter(Boolean)
+      .join("\n")
+  }
+  return ""
+}
+
+function anthropicToChat(body, requested) {
+  const messages = []
+  const sysText = anthropicSystemText(body.system)
+  if (sysText) messages.push({ role: "system", content: sysText })
+  for (const m of body.messages ?? []) {
+    const role = m?.role === "assistant" ? "assistant" : "user"
+    const c = m?.content
+    if (typeof c === "string") {
+      messages.push({ role, content: c })
+      continue
+    }
+    if (!Array.isArray(c)) {
+      messages.push({ role, content: String(c ?? "") })
+      continue
+    }
+    const texts = []
+    const images = []
+    const toolCalls = []
+    const toolResults = []
+    for (const b of c) {
+      if (!b || typeof b !== "object") continue
+      if (b.type === "text" && typeof b.text === "string") texts.push(b.text)
+      else if (b.type === "image") {
+        const src = b.source ?? {}
+        if (src.type === "base64" && src.data) {
+          images.push({ type: "image_url", image_url: { url: `data:${src.media_type ?? "image/png"};base64,${src.data}` } })
+        } else if ((src.type === "url" || src.type === "image_url") && (src.url ?? b.url)) {
+          images.push({ type: "image_url", image_url: { url: src.url ?? b.url } })
+        }
+      } else if (b.type === "image_url" && b.image_url?.url) {
+        images.push({ type: "image_url", image_url: { url: b.image_url.url } })
+      } else if (b.type === "tool_use") {
+        toolCalls.push({
+          id: b.id ?? `call_${toolCalls.length}`,
+          type: "function",
+          function: { name: b.name ?? "unknown", arguments: JSON.stringify(b.input ?? {}) },
+        })
+      } else if (b.type === "tool_result") {
+        const rc = b.content
+        const rt =
+          typeof rc === "string"
+            ? rc
+            : Array.isArray(rc)
+              ? rc.map((x) => (typeof x === "string" ? x : (x?.text ?? ""))).filter(Boolean).join("\n")
+              : String(rc ?? "")
+        toolResults.push(rt)
+      }
+    }
+    if (toolResults.length) {
+      // tool_result → plain user text (best effort; keeps tool loops readable).
+      messages.push({ role: "user", content: [texts.join("\n"), ...toolResults].filter(Boolean).join("\n") })
+    } else if (toolCalls.length) {
+      messages.push({ role: "assistant", content: texts.join("\n") || null, tool_calls: toolCalls })
+    } else if (images.length) {
+      messages.push({ role, content: [...texts.map((t) => ({ type: "text", text: t })), ...images] })
+    } else {
+      messages.push({ role, content: texts.join("\n") })
+    }
+  }
+  const out = { model: requested, messages }
+  const mt = Number(body.max_tokens)
+  out.max_tokens = Number.isFinite(mt) && mt > 0 ? mt : 1024
+  if (body.temperature != null) out.temperature = body.temperature
+  if (body.top_p != null) out.top_p = body.top_p
+  if (Array.isArray(body.stop_sequences) && body.stop_sequences.length) out.stop = body.stop_sequences
+  if (Array.isArray(body.tools) && body.tools.length) {
+    const tools = body.tools
+      .filter((t) => t?.name)
+      .map((t) => ({
+        type: "function",
+        function: {
+          name: t.name,
+          ...(t.description ? { description: t.description } : {}),
+          ...(t.input_schema ? { parameters: t.input_schema } : {}),
+        },
+      }))
+    if (tools.length) out.tools = tools
+    const tc = body.tool_choice
+    if (tc?.type === "any") out.tool_choice = "required"
+    else if (tc?.type === "tool" && tc.name) out.tool_choice = { type: "function", function: { name: tc.name } }
+    else if (tc?.type === "auto") out.tool_choice = "auto"
+  }
+  return out
+}
+
+// Normalized chat.completion -> Anthropic message envelope. Callers pass a
+// chat-shaped object (responsesToChat already normalizes responses-family
+// results), so both upstream families are covered.
+function chatToAnthropic(chat, requested, fallbackInputTokens = 0) {
+  const choice = chat?.choices?.[0] ?? {}
+  const msg = choice?.message ?? {}
+  const content = []
+  if (msg.reasoning_content) content.push({ type: "thinking", thinking: msg.reasoning_content })
+  if (typeof msg.content === "string" && msg.content) content.push({ type: "text", text: msg.content })
+  for (const tc of msg.tool_calls ?? []) {
+    let input = {}
+    try {
+      input = JSON.parse(tc?.function?.arguments ?? "{}")
+    } catch {}
+    content.push({
+      type: "tool_use",
+      id: tc?.id ?? `toolu_${randomBytes(8).toString("hex")}`,
+      name: tc?.function?.name ?? "unknown",
+      input,
+    })
+  }
+  if (!content.length) content.push({ type: "text", text: "" })
+  const fr = choice?.finish_reason
+  const stop_reason = fr === "tool_calls" ? "tool_use" : fr === "length" ? "max_tokens" : "end_turn"
+  const u = chat?.usage ?? {}
+  return {
+    id: `msg_${randomBytes(12).toString("hex")}`,
+    type: "message",
+    role: "assistant",
+    model: requested,
+    content,
+    stop_reason,
+    usage: {
+      input_tokens: u.prompt_tokens ?? fallbackInputTokens ?? 0,
+      output_tokens: u.completion_tokens ?? 0,
+    },
+  }
+}
+
+function anthropicSSE(res, ant, requested) {
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+  })
+  const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+  send("message_start", {
+    type: "message_start",
+    message: { id: ant.id, type: "message", role: "assistant", model: requested, content: [] },
+  })
+  send("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })
+  const text = ant.content
+    .filter((b) => b?.type === "text")
+    .map((b) => b.text)
+    .join("")
+  if (text) {
+    send("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } })
+  }
+  send("content_block_stop", { type: "content_block_stop", index: 0 })
+  let index = 0
+  for (const b of ant.content) {
+    if (b?.type !== "tool_use") continue
+    index++
+    send("content_block_start", {
+      type: "content_block_start",
+      index,
+      content_block: { type: "tool_use", id: b.id, name: b.name, input: {} },
+    })
+    send("content_block_delta", {
+      type: "content_block_delta",
+      index,
+      delta: { type: "input_json_delta", partial_json: JSON.stringify(b.input ?? {}) },
+    })
+    send("content_block_stop", { type: "content_block_stop", index })
+  }
+  send("message_stop", { type: "message_stop" })
+  res.end()
+}
+
 async function handleChat(req, res) {
   const start = Date.now()
   let body
@@ -545,6 +724,53 @@ async function handleChat(req, res) {
     return json(res, 401, { error: { type: "invalid_request_error", message: "invalid proxy key" } })
   }
 
+  return runChatLoop(req, res, {
+    body,
+    requested,
+    candidates,
+    auth,
+    start,
+    isStream,
+    onJson(content, model, format) {
+      if (format === "responses") {
+        recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
+        recordObserved(model, true)
+        return json(res, 200, responsesToChat(content, requested, model))
+      }
+      if (model !== requested) {
+        // Make the fallback visible to any client, not just JSON readers.
+        res.setHeader?.("x-zen-served-by", model)
+        res.setHeader?.("x-zen-fallback", "true")
+      }
+      if (content && typeof content === "object") {
+        content.model = requested
+        if (model !== requested) content.zen_served_by = model
+      }
+      recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
+      recordObserved(model, true)
+      return json(res, 200, content)
+    },
+    onStream(upstreamRes, model, format) {
+      if (format === "responses") {
+        relayResponsesStream(req, res, upstreamRes, requested)
+      } else {
+        relayStream(req, res, upstreamRes, requested)
+      }
+    },
+    onError(status, errBody) {
+      res.writeHead(status, { "content-type": "application/json" })
+      res.end(
+        JSON.stringify(errBody ?? { error: { type: "free_usage_limit_error", message: "all free models are rate-limited" } }),
+      )
+    },
+  })
+}
+
+// Shared upstream candidate/fallback loop for the chat and messages routes.
+// Callers supply success/error renderers; retry, fallback, stats and health
+// signaling stay identical for both. `onJson` handles a parsed non-stream
+// upstream body, `onStream` a live upstream SSE body, `onError` any failure.
+async function runChatLoop(req, res, { body, requested, candidates, auth, start, isStream, onJson, onStream, onError }) {
   let lastErr = null
   let lastStatus = 502
   let used = requested
@@ -569,36 +795,16 @@ async function handleChat(req, res) {
 
     if (upstreamRes.ok) {
       if (isStream) {
-        if (format === "responses") {
-          relayResponsesStream(req, res, upstreamRes, requested)
-        } else {
-          relayStream(req, res, upstreamRes, requested)
-        }
+        onStream(upstreamRes, model, format)
         res.on("finish", () => { recordReq(req, `${requested}→${model}`, Date.now() - start, 200); recordObserved(model, true) })
         return
       }
       try {
         const content = await upstreamRes.json()
-        if (format === "responses") {
-          recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
-          recordObserved(model, true)
-          return json(res, 200, responsesToChat(content, requested, model))
-        }
-        if (model !== requested) {
-          // Make the fallback visible to any client, not just JSON readers.
-          res.setHeader?.("x-zen-served-by", model)
-          res.setHeader?.("x-zen-fallback", "true")
-        }
-        if (content && typeof content === "object") {
-          content.model = requested
-          if (model !== requested) content.zen_served_by = model
-        }
-        recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
-        recordObserved(model, true)
-        return json(res, 200, content)
+        return onJson(content, model, format)
       } catch {
         recordReq(req, requested, Date.now() - start, 502)
-        return json(res, 502, { error: { type: "upstream_error", message: "bad upstream response" } })
+        return onError(502, { error: { type: "upstream_error", message: "bad upstream response" } })
       }
     }
 
@@ -623,10 +829,84 @@ async function handleChat(req, res) {
   }
 
   recordReq(req, `${requested}→${used}`, Date.now() - start, lastStatus)
-  res.writeHead(lastStatus, { "content-type": "application/json" })
-  res.end(
-    JSON.stringify(lastErr ?? { error: { type: "free_usage_limit_error", message: "all free models are rate-limited" } }),
-  )
+  return onError(lastStatus, lastErr)
+}
+
+async function handleMessages(req, res) {
+  const start = Date.now()
+  let body
+  try {
+    const raw = await readBody(req)
+    if (raw.length > MAX_BODY) {
+      return json(res, 413, { type: "error", error: { type: "invalid_request_error", message: "request body too large" } })
+    }
+    body = JSON.parse(raw)
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      return json(res, 400, { type: "error", error: { type: "invalid_request_error", message: "body must be a JSON object" } })
+    }
+  } catch {
+    return json(res, 400, { type: "error", error: { type: "invalid_request_error", message: "invalid JSON body" } })
+  }
+
+  const auth = authForUpstream(req)
+  if (!auth) {
+    recordReq(req, String(body?.model ?? ""), Date.now() - start, 401)
+    return json(res, 401, { type: "error", error: { type: "authentication_error", message: "invalid proxy key" } })
+  }
+  const rawModel = String(body.model ?? "").split("/").pop()
+  if (!rawModel) {
+    recordReq(req, "", Date.now() - start, 400)
+    return json(res, 400, { type: "error", error: { type: "invalid_request_error", message: "model is required" } })
+  }
+  if (!config.modelAliases[rawModel] && !ALLOWED().has(rawModel)) {
+    recordReq(req, rawModel, Date.now() - start, 400)
+    return json(res, 400, { type: "error", error: { type: "invalid_request_error", message: `unknown model: ${rawModel}` } })
+  }
+  if (!Array.isArray(body.messages)) {
+    recordReq(req, rawModel, Date.now() - start, 400)
+    return json(res, 400, { type: "error", error: { type: "invalid_request_error", message: "messages must be an array" } })
+  }
+
+  const { requested, candidates } = resolveModel(body.model)
+  const clientStream = !!body.stream
+  const chatBody = anthropicToChat(body, requested)
+  const inputFallback = JSON.stringify(chatBody.messages).length >> 2
+  // Streaming reuses the same non-stream upstream fetch and converts the full
+  // reply to Anthropic SSE (mirrors the reference implementation).
+  return runChatLoop(req, res, {
+    body: chatBody,
+    requested,
+    candidates,
+    auth,
+    start,
+    isStream: false,
+    onJson(content, model, format) {
+      const chat =
+        format === "responses"
+          ? responsesToChat(content, requested, model)
+          : { ...(content ?? {}), model: requested, ...(model !== requested ? { zen_served_by: model } : {}) }
+      const ant = chatToAnthropic(chat, requested, inputFallback)
+      recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
+      recordObserved(model, true)
+      if (clientStream) return anthropicSSE(res, ant, requested)
+      return json(res, 200, ant)
+    },
+    onStream(upstreamRes, model, format) {
+      relayStream(req, res, upstreamRes, requested)
+    },
+    onError(status, errBody) {
+      const message = errBody?.error?.message ?? errBody?.message ?? "upstream error"
+      const type =
+        status === 429
+          ? "rate_limit_error"
+          : status === 401 || status === 403
+            ? "authentication_error"
+            : status === 400
+              ? "invalid_request_error"
+              : "upstream_error"
+      json(res, status, { type: "error", error: { type, message } })
+    },
+  })
 }
 
 function relayStream(req, res, upstreamRes, requested) {
@@ -1340,6 +1620,20 @@ async function router(req, res) {
     }
     return handleChat(req, res)
   }
+  if (req.method === "POST" && (p === "/v1/messages" || p === "/messages")) {
+    // Anthropic Messages API — same throttling as the chat route.
+    const rl = rateLimitFor(req)
+    if (rl.limited) {
+      res.writeHead(429, { "content-type": "application/json", "retry-after": String(rl.retryAfter) })
+      return res.end(
+        JSON.stringify({
+          type: "error",
+          error: { type: "rate_limit_error", message: `rate limit exceeded, retry in ${rl.retryAfter}s` },
+        }),
+      )
+    }
+    return handleMessages(req, res)
+  }
   json(res, 404, { error: { type: "not_found", message: p } })
 }
 
@@ -1407,6 +1701,9 @@ export {
   requestStats,
   syncState,
   handleChat,
+  handleMessages,
+  anthropicToChat,
+  chatToAnthropic,
   relayStream,
   rewriteSSE,
   fetchModels,

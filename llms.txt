@@ -14,7 +14,7 @@ zen-proxy solves this by injecting the correct `User-Agent` and a stable per-cli
 
 ## Key facts
 
-- **Endpoints**: `POST /v1/chat/completions` (stream + non-stream), `POST /v1/responses`, `GET /v1/models`, `GET /health`, dashboard at `GET /`.
+- **Endpoints**: `POST /v1/chat/completions` (stream + non-stream), `POST /v1/responses`, `POST /v1/messages` (Anthropic Messages API, stream + non-stream), `GET /v1/models`, `GET /health`, dashboard at `GET /`.
 - **Auth**: anonymous via `Bearer public`; BYOK via `defaultZenKey` config or an `x-zen-key` / real bearer token.
 - **Session**: opencode's free tier requires `x-opencode-session`. The proxy mints one per client (stable per source IP, or one shared id for local clients) when the caller doesn't send one; set `injectSession: false` to disable.
 - **Quota**: the free tier is per-IP; the proxy forwards the real client IP (`x-real-ip`/`x-forwarded-for` when `trustForwarded` is on), but for local/loopback clients it omits `x-real-ip` so upstream counts your machine's real IP — matching opencode direct usage and avoiding a bogus shared `127.0.0.1` bucket. Do not abuse or rotate IPs.

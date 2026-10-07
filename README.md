@@ -39,7 +39,7 @@ opencode's free `-free` models (`mimo-v2.5-free`, `big-pickle`, `nemotron`, …)
 <div style="background-color:#1a1612;border-radius:14px;padding:20px;color:#efe8d9;margin:16px 0;">
   <p style="margin:0;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:#ccf73a;">▸ feature list</p>
   <ul style="margin:10px 0 0;padding-left:20px;line-height:1.9;font-size:14px;">
-    <li><b>OpenAI-compatible API</b> — <code>/v1/chat/completions</code> (stream + non-stream), <code>/v1/models</code>, <code>/v1/responses</code></li>
+    <li><b>OpenAI-compatible API</b> — <code>/v1/chat/completions</code> (stream + non-stream), <code>/v1/models</code>, <code>/v1/responses</code>, <code>/v1/messages</code> (Anthropic Messages API)</li>
     <li><b>UA unlock</b> — injects <code>User-Agent: opencode/1.18.30</code> plus a stable per-client <code>x-opencode-session</code> upstream, the two things that open the free tier</li>
     <li><b>BYOK</b> — ride anonymous <code>public</code> or bring your own Zen key (stable + no shared-pool throttling)</li>
     <li><b>Smart fallback</b> — tries models in order on <code>429</code>/<code>5xx</code>, honors <code>retry-after</code></li>
@@ -189,6 +189,7 @@ Anonymous `public` access rides opencode's shared free pool (per-IP quota, somet
 |---|---|---|
 | `POST` | `/v1/chat/completions` | Chat completions (stream + non-stream) |
 | `POST` | `/v1/responses` | Responses passthrough |
+| `POST` | `/v1/messages` | Anthropic Messages API (stream + non-stream) |
 | `GET` | `/v1/models` | Allowed models (cached) |
 | `GET` | `/health` | Health check |
 | `GET` | `/` | Dashboard |

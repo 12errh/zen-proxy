@@ -1517,6 +1517,238 @@ describe("dashboard XSS hardening (static)", () => {
   })
 })
 
+describe("anthropic messages", () => {
+  const anthBody = (over = {}) => ({
+    model: zp.config.fallbackModels[0],
+    max_tokens: 64,
+    messages: [{ role: "user", content: "hi" }],
+    ...over,
+  })
+  const chatOk = (message, finish = "stop", usage = { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 }) =>
+    jsonResponse({ model: "upstream-model", choices: [{ message, finish_reason: finish }], usage })
+
+  test("non-stream maps chat completion to Anthropic envelope", async () => {
+    const m = zp.config.fallbackModels[0]
+    globalThis.fetch = routeFetch([
+      ["/chat/completions", chatStub(m, chatOk({ role: "assistant", content: "hello" }))],
+    ])
+    const req = mockReq({ _body: JSON.stringify(anthBody({ model: m })) })
+    const res = mockRes()
+    await zp.handleMessages(req, res)
+    assert.equal(res.state.status, 200)
+    const data = JSON.parse(res.body)
+    assert.match(data.id, /^msg_/)
+    assert.equal(data.type, "message")
+    assert.equal(data.role, "assistant")
+    assert.equal(data.model, m)
+    assert.deepEqual(data.content, [{ type: "text", text: "hello" }])
+    assert.equal(data.stop_reason, "end_turn")
+    assert.equal(data.usage.input_tokens, 5)
+    assert.equal(data.usage.output_tokens, 3)
+  })
+
+  test("length finish maps to max_tokens", async () => {
+    const m = zp.config.fallbackModels[0]
+    globalThis.fetch = routeFetch([
+      ["/chat/completions", chatStub(m, chatOk({ role: "assistant", content: "partial" }, "length"))],
+    ])
+    const res = mockRes()
+    await zp.handleMessages(mockReq({ _body: JSON.stringify(anthBody({ model: m })) }), res)
+    assert.equal(JSON.parse(res.body).stop_reason, "max_tokens")
+  })
+
+  test("tool_calls map to tool_use blocks", async () => {
+    const m = zp.config.fallbackModels[0]
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        chatStub(
+          m,
+          chatOk(
+            {
+              role: "assistant",
+              content: null,
+              tool_calls: [{ id: "call_1", type: "function", function: { name: "read", arguments: '{"p":"a"}' } }],
+            },
+            "tool_calls",
+          ),
+        ),
+      ],
+    ])
+    const res = mockRes()
+    await zp.handleMessages(mockReq({ _body: JSON.stringify(anthBody({ model: m })) }), res)
+    const data = JSON.parse(res.body)
+    assert.equal(data.stop_reason, "tool_use")
+    assert.deepEqual(data.content, [{ type: "tool_use", id: "call_1", name: "read", input: { p: "a" } }])
+  })
+
+  test("unknown model → 400 invalid_request_error envelope", async () => {
+    const res = mockRes()
+    await zp.handleMessages(mockReq({ _body: JSON.stringify(anthBody({ model: "no-such-model-xyz" })) }), res)
+    assert.equal(res.state.status, 400)
+    const data = JSON.parse(res.body)
+    assert.equal(data.type, "error")
+    assert.equal(data.error.type, "invalid_request_error")
+    assert.match(data.error.message, /unknown model/)
+  })
+
+  test("wrong proxy key → 401 authentication_error envelope", async () => {
+    zp.saveConfig({ proxyKey: "admin-1" })
+    const res = mockRes()
+    await zp.handleMessages(
+      mockReq({ _body: JSON.stringify(anthBody()), headers: { authorization: "Bearer nope" } }),
+      res,
+    )
+    assert.equal(res.state.status, 401)
+    const data = JSON.parse(res.body)
+    assert.equal(data.type, "error")
+    assert.equal(data.error.type, "authentication_error")
+  })
+
+  test("upstream 429 → 429 rate_limit_error envelope", async () => {
+    const err429 = () => jsonResponse({ error: { message: "FreeUsageLimitError" } }, 429)
+    globalThis.fetch = routeFetch([
+      ["/chat/completions", err429],
+      ["/responses", err429],
+    ])
+    const res = mockRes()
+    await zp.handleMessages(mockReq({ _body: JSON.stringify(anthBody()) }), res)
+    assert.equal(res.state.status, 429)
+    const data = JSON.parse(res.body)
+    assert.equal(data.type, "error")
+    assert.equal(data.error.type, "rate_limit_error")
+  })
+
+  test("stream emits message_start through message_stop", async () => {
+    const m = zp.config.fallbackModels[0]
+    globalThis.fetch = routeFetch([
+      ["/chat/completions", chatStub(m, chatOk({ role: "assistant", content: "hello world" }))],
+    ])
+    const res = mockRes()
+    await zp.handleMessages(mockReq({ _body: JSON.stringify(anthBody({ model: m, stream: true })) }), res)
+    await res.done
+    assert.equal(res.state.status, 200)
+    assert.equal(res.state.headers["content-type"], "text/event-stream")
+    assert.match(res.body, /event: message_start/)
+    assert.match(res.body, /"type":"message_start"/)
+    assert.match(res.body, /event: content_block_start/)
+    assert.match(res.body, /"text_delta","text":"hello world"/)
+    assert.match(res.body, /event: content_block_stop/)
+    assert.match(res.body, /event: message_stop/)
+  })
+
+  test("system prompt becomes a system message upstream", async () => {
+    const m = zp.config.fallbackModels[0]
+    let sent = null
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          return chatOk({ role: "assistant", content: "ok" })
+        },
+      ],
+    ])
+    const res = mockRes()
+    await zp.handleMessages(
+      mockReq({ _body: JSON.stringify(anthBody({ model: m, system: "be brief" })) }),
+      res,
+    )
+    assert.equal(res.state.status, 200)
+    assert.deepEqual(sent.messages[0], { role: "system", content: "be brief" })
+    assert.deepEqual(sent.messages[1], { role: "user", content: "hi" })
+  })
+
+  test("image blocks become image_url parts upstream", async () => {
+    const m = zp.config.fallbackModels[0]
+    let sent = null
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          return chatOk({ role: "assistant", content: "seen" })
+        },
+      ],
+    ])
+    const res = mockRes()
+    await zp.handleMessages(
+      mockReq({
+        _body: JSON.stringify(
+          anthBody({
+            model: m,
+            messages: [
+              {
+                role: "user",
+                content: [
+                  { type: "text", text: "what is this" },
+                  { type: "image", source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" } },
+                ],
+              },
+            ],
+          }),
+        ),
+      }),
+      res,
+    )
+    assert.equal(res.state.status, 200)
+    assert.deepEqual(sent.messages[0].content, [
+      { type: "text", text: "what is this" },
+      { type: "image_url", image_url: { url: "data:image/png;base64,aGVsbG8=" } },
+    ])
+  })
+
+  test("responses-family upstream returns Anthropic envelope", async () => {
+    zp.saveConfig({ responsesModels: ["gpt-5*"], fallbackModels: ["gpt-5.5"], defaultModel: "gpt-5.5" })
+    globalThis.fetch = routeFetch([
+      [
+        "/responses",
+        () => jsonResponse({ id: "resp_1", output: [{ type: "message", content: [{ type: "output_text", text: "yo" }] }], usage: { input_tokens: 4, output_tokens: 1 } }),
+      ],
+    ])
+    const res = mockRes()
+    await zp.handleMessages(
+      mockReq({ _body: JSON.stringify(anthBody({ model: "gpt-5.5" })) }),
+      res,
+    )
+    assert.equal(res.state.status, 200)
+    const data = JSON.parse(res.body)
+    assert.equal(data.model, "gpt-5.5")
+    assert.deepEqual(data.content, [{ type: "text", text: "yo" }])
+    assert.equal(data.stop_reason, "end_turn")
+    assert.equal(data.usage.output_tokens, 1)
+  })
+
+  test("router dispatches /v1/messages and /messages alias", async () => {
+    const m = zp.config.fallbackModels[0]
+    globalThis.fetch = routeFetch([
+      ["/chat/completions", () => chatOk({ role: "assistant", content: "ok" })],
+    ])
+    for (const url of ["/v1/messages", "/messages"]) {
+      const res = mockRes()
+      await zp.router(mockReq({ method: "POST", url, _body: JSON.stringify(anthBody({ model: m })) }), res)
+      assert.equal(res.state.status, 200, url)
+      assert.equal(JSON.parse(res.body).type, "message", url)
+    }
+  })
+
+  test("router throttles /v1/messages with rate_limit_error envelope", async () => {
+    zp.saveConfig({ rateLimitMax: 1, rateLimitWindowMs: 60_000, fallbackModels: ["mimo-v2.5-free"], defaultModel: "mimo-v2.5-free" })
+    globalThis.fetch = routeFetch([
+      ["/chat/completions", () => chatOk({ role: "assistant", content: "ok" })],
+      ["/responses", () => jsonResponse({ output: [] })],
+    ])
+    const body = JSON.stringify(anthBody({ model: "mimo-v2.5-free" }))
+    const r1 = mockRes()
+    await zp.router(mockReq({ method: "POST", url: "/v1/messages", _body: body, remoteAddress: "9.9.9.9" }), r1)
+    assert.equal(r1.state.status, 200)
+    const r2 = mockRes()
+    await zp.router(mockReq({ method: "POST", url: "/v1/messages", _body: body, remoteAddress: "9.9.9.9" }), r2)
+    assert.equal(r2.state.status, 429)
+    assert.equal(JSON.parse(r2.body).error.type, "rate_limit_error")
+  })
+})
+
 describe("install.sh config preservation", () => {
   function runInstall(tmp, destPort) {
     const env = {

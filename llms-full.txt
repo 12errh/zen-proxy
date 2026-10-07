@@ -39,7 +39,7 @@ opencode's free `-free` models (`mimo-v2.5-free`, `big-pickle`, `nemotron`, …)
 
   ▸ feature list
   
-    - **OpenAI-compatible API** — `/v1/chat/completions` (stream + non-stream), `/v1/models`, `/v1/responses`
+    - **OpenAI-compatible API** — `/v1/chat/completions` (stream + non-stream), `/v1/models`, `/v1/responses`, `/v1/messages` (Anthropic Messages API)
     - **UA unlock** — injects `User-Agent: opencode/1.18.30` plus a stable per-client `x-opencode-session` upstream, the two things that open the free tier
     - **BYOK** — ride anonymous `public` or bring your own Zen key (stable + no shared-pool throttling)
     - **Smart fallback** — tries models in order on `429`/`5xx` and dead-model `4xx` (e.g. "Model is unavailable"), honors `retry-after`
@@ -171,6 +171,7 @@ Anonymous `public` access rides opencode's shared free pool (per-IP quota, somet
 |---|---|---|
 | `POST` | `/v1/chat/completions` | Chat completions (stream + non-stream) |
 | `POST` | `/v1/responses` | Responses passthrough |
+| `POST` | `/v1/messages` | Anthropic Messages API (stream + non-stream) |
 | `GET` | `/v1/models` | Allowed models (cached) |
 | `GET` | `/health` | Health check |
 | `GET` | `/` | Dashboard |
