@@ -1139,6 +1139,9 @@ async function handleApiConfig(req, res) {
       log("config updated via UI")
       return json(res, 200, { config: sanitize(config) })
     } catch (err) {
+      if (err && err.statusCode === 413) {
+        return json(res, 413, { error: { type: "invalid_request_error", message: "request body too large" } })
+      }
       return json(res, 400, { error: err.message })
     }
   }
@@ -1254,6 +1257,9 @@ async function handleTest(req, res) {
       detail: gated ? "free tier accepts real agent requests only — this probe can't verify it" : detail,
     })
   } catch (err) {
+    if (err && err.statusCode === 413) {
+      return json(res, 413, { error: { type: "invalid_request_error", message: "request body too large" } })
+    }
     json(res, 400, { ok: false, error: err.message })
   }
 }

@@ -56,6 +56,31 @@ function mockReq(over = {}) {
   }
 }
 
+// Multi-chunk request mock that records how many chunks were actually pulled
+// before the consumer (readBody) stops iterating. Used to prove early-abort
+// (mid-stream rejection) rather than full-buffer-then-check.
+function mockStreamingReq(chunks, over = {}) {
+  const pulled = { count: 0, finished: false }
+  return {
+    headers: over.headers ?? {},
+    socket: { remoteAddress: over.remoteAddress ?? "127.0.0.1" },
+    method: over.method ?? "POST",
+    url: over.url ?? "/v1/chat/completions",
+    signal: new AbortController().signal,
+    on: () => {},
+    destroy: () => {},
+    pulled,
+    [Symbol.asyncIterator]: async function* () {
+      for (const chunk of chunks) {
+        pulled.count++
+        yield chunk
+      }
+      pulled.finished = true
+    },
+    ...over,
+  }
+}
+
 function mockRes() {
   let finishCb = null
   let resolveDone
@@ -910,6 +935,19 @@ describe("test endpoint honest reporting", () => {
   })
 })
 
+describe("handleTest body size", () => {
+  test("mid-stream abort: oversized body rejected before stream fully drained", async () => {
+    const chunk = "x".repeat(100 * 1024)
+    const chunks = Array.from({ length: 20 }, () => chunk)
+    const req = mockStreamingReq(chunks, { method: "POST" })
+    const res = mockRes()
+    await zp.handleTest(req, res)
+    assert.equal(res.state.status, 413)
+    assert.ok(req.pulled.count < chunks.length, `expected early abort, pulled ${req.pulled.count}/${chunks.length} chunks`)
+    assert.equal(req.pulled.finished, false, "generator must not run to completion")
+  })
+})
+
 describe("recordReq stats", () => {
   test("dedups consecutive identical records", () => {
     const req = mockReq()
@@ -1031,6 +1069,54 @@ describe("handleChat", () => {
     const res = mockRes()
     await zp.handleChat(req, res)
     assert.equal(res.state.status, 413)
+  })
+
+  test("mid-stream abort: oversized body is rejected before the stream is fully drained", async () => {
+    globalThis.fetch = routeFetch([["/chat/completions", jsonResponse({ model: "ok" })]])
+    // 20 chunks of 100KB = ~2MB total, well over MAX_BODY (1MB). Each chunk is
+    // small relative to MAX_BODY so the overflow is detected partway through,
+    // not on the first or last chunk.
+    const chunk = "x".repeat(100 * 1024)
+    const chunks = Array.from({ length: 20 }, () => chunk)
+    const req = mockStreamingReq(chunks)
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 413)
+    assert.ok(req.pulled.count < chunks.length, `expected early abort, pulled ${req.pulled.count}/${chunks.length} chunks`)
+    assert.equal(req.pulled.finished, false, "generator must not run to completion")
+  })
+
+  test("body exactly at MAX_BODY → not rejected for size", async () => {
+    globalThis.fetch = routeFetch([["/chat/completions", jsonResponse({ model: "ok" })]])
+    const pad = "x".repeat(zp.MAX_BODY - JSON.stringify({ model: "m", messages: [{ role: "user", content: "" }] }).length)
+    const body = JSON.stringify({ model: "m", messages: [{ role: "user", content: pad }] })
+    assert.equal(body.length, zp.MAX_BODY, "sanity: body is exactly MAX_BODY")
+    const req = mockReq({ _body: body })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.notEqual(res.state.status, 413)
+  })
+
+  test("body one byte over MAX_BODY → 413", async () => {
+    globalThis.fetch = routeFetch([["/chat/completions", jsonResponse({ model: "ok" })]])
+    const pad = "x".repeat(zp.MAX_BODY - JSON.stringify({ model: "m", messages: [{ role: "user", content: "" }] }).length + 1)
+    const body = JSON.stringify({ model: "m", messages: [{ role: "user", content: pad }] })
+    assert.equal(body.length, zp.MAX_BODY + 1, "sanity: body is MAX_BODY + 1")
+    const req = mockReq({ _body: body })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 413)
+  })
+
+  test("body one byte under MAX_BODY → not 413", async () => {
+    globalThis.fetch = routeFetch([["/chat/completions", jsonResponse({ model: "ok" })]])
+    const pad = "x".repeat(zp.MAX_BODY - JSON.stringify({ model: "m", messages: [{ role: "user", content: "" }] }).length - 1)
+    const body = JSON.stringify({ model: "m", messages: [{ role: "user", content: pad }] })
+    assert.equal(body.length, zp.MAX_BODY - 1, "sanity: body is MAX_BODY - 1")
+    const req = mockReq({ _body: body })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.notEqual(res.state.status, 413)
   })
 
   test("wrong proxy key → 401", async () => {
@@ -1403,6 +1489,17 @@ describe("handleApiConfig", () => {
     const res = mockRes()
     await zp.handleApiConfig(req, res)
     assert.equal(res.state.status, 400)
+  })
+
+  test("PUT mid-stream abort: oversized body rejected before stream fully drained", async () => {
+    const chunk = "x".repeat(100 * 1024)
+    const chunks = Array.from({ length: 20 }, () => chunk) // ~2MB, no proxyKey set so adminAuth passes
+    const req = mockStreamingReq(chunks, { method: "PUT" })
+    const res = mockRes()
+    await zp.handleApiConfig(req, res)
+    assert.equal(res.state.status, 413)
+    assert.ok(req.pulled.count < chunks.length, `expected early abort, pulled ${req.pulled.count}/${chunks.length} chunks`)
+    assert.equal(req.pulled.finished, false, "generator must not run to completion")
   })
 })
 
