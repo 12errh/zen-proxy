@@ -500,9 +500,16 @@ function authForUpstream(req) {
   return "Bearer public"
 }
 
-async function readBody(req) {
+async function readBody(req, limit = MAX_BODY) {
   let raw = ""
-  for await (const chunk of req) raw += chunk
+  for await (const chunk of req) {
+    raw += chunk
+    if (raw.length > limit) {
+      const err = new Error("request body too large")
+      err.statusCode = 413
+      throw err
+    }
+  }
   return raw
 }
 
@@ -516,14 +523,14 @@ async function handleChat(req, res) {
   let body
   try {
     const raw = await readBody(req)
-    if (raw.length > MAX_BODY) {
-      return json(res, 413, { error: { type: "invalid_request_error", message: "request body too large" } })
-    }
     body = JSON.parse(raw)
     if (typeof body !== "object" || body === null || Array.isArray(body)) {
       return json(res, 400, { error: { type: "invalid_request_error", message: "body must be a JSON object" } })
     }
-  } catch {
+  } catch (err) {
+    if (err && err.statusCode === 413) {
+      return json(res, 413, { error: { type: "invalid_request_error", message: "request body too large" } })
+    }
     return json(res, 400, { error: { type: "invalid_request_error", message: "invalid JSON body" } })
   }
 
