@@ -581,6 +581,40 @@ describe("responses API translation", () => {
     assert.deepEqual(input[3], { type: "function_call_output", call_id: "call_1", output: "file.txt" })
   })
 
+  test("translation keeps an agentic field the free tier requires", () => {
+    // Upstream 403s Responses payloads carrying none of
+    // instructions/store/prompt_cache_key/include (issue #7).
+    const withSystem = zp.responsesRequest(
+      {
+        model: "muse-spark-1.3-contributor-free",
+        messages: [
+          { role: "system", content: "be brief" },
+          { role: "user", content: "hi" },
+        ],
+        tools: [{ type: "function", function: { name: "t", parameters: { type: "object" } } }],
+      },
+      "muse-spark-1.3-contributor-free",
+      true,
+    )
+    assert.equal(withSystem.instructions, "be brief")
+    assert.equal(withSystem.store, false)
+
+    const withoutSystem = zp.responsesRequest(
+      { model: "muse-spark-1.3-contributor-free", messages: [{ role: "user", content: "hi" }] },
+      "muse-spark-1.3-contributor-free",
+      false,
+    )
+    assert.equal(withoutSystem.store, false)
+    assert.ok(!("instructions" in withoutSystem))
+
+    const explicitStore = zp.responsesRequest(
+      { model: "muse-spark-1.3-contributor-free", messages: [{ role: "user", content: "hi" }], store: true },
+      "muse-spark-1.3-contributor-free",
+      false,
+    )
+    assert.equal(explicitStore.store, true)
+  })
+
   test("tool_calls survive the round trip", () => {
     const out = zp.responsesToChat(
       {

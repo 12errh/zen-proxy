@@ -669,6 +669,16 @@ function relayStream(req, res, upstreamRes, requested) {
 // Build a Responses API request from a chat.completions body.
 function responsesRequest(body, model, isStream) {
   const payload = { model, input: chatMessagesToInput(body.messages), stream: !!isStream }
+  // Free-tier gate: upstream 403s Responses payloads that carry none of
+  // instructions/store/prompt_cache_key/include (verified 2026-10-07, see
+  // issue #7). Preserve the caller's system prompt as instructions and
+  // default to store:false (privacy-positive, caller-overridable).
+  const sys = Array.isArray(body.messages)
+    ? body.messages.filter((m) => m?.role === "system").map((m) => textOf(m?.content)).filter(Boolean).join("\n\n")
+    : ""
+  if (sys) payload.instructions = sys
+  if (body.store == null) payload.store = false
+  else payload.store = !!body.store
   if (body.temperature != null) payload.temperature = body.temperature
   if (body.top_p != null) payload.top_p = body.top_p
   if (body.parallel_tool_calls != null) payload.parallel_tool_calls = body.parallel_tool_calls
