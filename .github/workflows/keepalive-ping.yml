@@ -21,6 +21,10 @@ jobs:
     env:
       PROXY_URL: ${{ vars.ZEN_PROXY_URL }}
       MODEL: ${{ vars.ZEN_KEEPALIVE_MODEL }}
+      # Optional: if your Render service sets PROXY_KEY, add the same value as
+      # a repo secret named ZEN_PROXY_KEY (Settings → Secrets and variables →
+      # Actions → Secrets). Health stays open without it; the model check needs it.
+      PROXY_KEY: ${{ secrets.ZEN_PROXY_KEY }}
     steps:
       - name: Health check
         run: |
@@ -34,9 +38,11 @@ jobs:
         run: |
           : "${PROXY_URL:=https://zen-proxy-49xk.onrender.com}"
           : "${MODEL:=mimo-v2.6-flash-free}"
+          auth=()
+          [ -n "${PROXY_KEY:-}" ] && auth=(-H "Authorization: Bearer $PROXY_KEY")
           echo "Asking $MODEL via $PROXY_URL ..."
           resp="$(curl -sS -m 120 -X POST "$PROXY_URL/v1/chat/completions" \
-            -H 'Content-Type: application/json' \
+            -H 'Content-Type: application/json' "${auth[@]}" \
             -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: keepalive-ok\"}],\"max_tokens\":20}")"
           echo "$resp" | head -c 1000; echo
           echo "$resp" | grep -q 'keepalive-ok' || { echo "::error::MODEL REPLY CHECK FAILED"; exit 1; }
