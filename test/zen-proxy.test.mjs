@@ -76,6 +76,9 @@ function mockRes() {
     write(chunk) {
       state.chunks.push(String(chunk))
     },
+    setHeader(name, value) {
+      state.headers[String(name).toLowerCase()] = String(value)
+    },
     end(chunk) {
       if (chunk !== undefined && chunk !== null) state.chunks.push(String(chunk))
       if (finishCb) finishCb()
@@ -100,6 +103,21 @@ function sseResponse(contents, model = "upstream-model") {
     contents.map((c) => `data: ${JSON.stringify({ model, choices: [{ delta: { content: c } }] })}\n\n`).join("") +
     "data: [DONE]\n\n"
   return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } })
+}
+
+// Upstream SSE delivered as separate stream chunks (one array entry per
+// enqueue), so tests can prove incremental translation.
+function sseStreamResponse(chunks) {
+  const enc = new TextEncoder()
+  return new Response(
+    new ReadableStream({
+      start(c) {
+        for (const ch of chunks) c.enqueue(enc.encode(ch))
+        c.close()
+      },
+    }),
+    { status: 200, headers: { "content-type": "text/event-stream" } },
+  )
 }
 
 function routeFetch(routes) {
@@ -1582,14 +1600,18 @@ describe("anthropic messages", () => {
     assert.deepEqual(data.content, [{ type: "tool_use", id: "call_1", name: "read", input: { p: "a" } }])
   })
 
-  test("unknown model → 400 invalid_request_error envelope", async () => {
+  test("unknown model resolves via fallback/default instead of 400", async () => {
+    const m = zp.config.fallbackModels[0]
+    globalThis.fetch = routeFetch([
+      ["/chat/completions", chatStub(m, chatOk({ role: "assistant", content: "fell back" }))],
+    ])
     const res = mockRes()
     await zp.handleMessages(mockReq({ _body: JSON.stringify(anthBody({ model: "no-such-model-xyz" })) }), res)
-    assert.equal(res.state.status, 400)
+    assert.equal(res.state.status, 200)
     const data = JSON.parse(res.body)
-    assert.equal(data.type, "error")
-    assert.equal(data.error.type, "invalid_request_error")
-    assert.match(data.error.message, /unknown model/)
+    assert.equal(data.type, "message")
+    assert.equal(data.model, "no-such-model-xyz", "requested model preserved in envelope")
+    assert.deepEqual(data.content, [{ type: "text", text: "fell back" }])
   })
 
   test("wrong proxy key → 401 authentication_error envelope", async () => {
@@ -1619,22 +1641,183 @@ describe("anthropic messages", () => {
     assert.equal(data.error.type, "rate_limit_error")
   })
 
-  test("stream emits message_start through message_stop", async () => {
+  test("stream translates upstream SSE incrementally with message_delta usage", async () => {
     const m = zp.config.fallbackModels[0]
+    let sent = null
     globalThis.fetch = routeFetch([
-      ["/chat/completions", chatStub(m, chatOk({ role: "assistant", content: "hello world" }))],
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          return sseStreamResponse([
+            `data: ${JSON.stringify({ model: m, choices: [{ delta: { role: "assistant", content: "Hello" } }] })}\n\n`,
+            `data: ${JSON.stringify({ model: m, choices: [{ delta: { content: " brave" } }] })}\n\n`,
+            `data: ${JSON.stringify({ model: m, choices: [{ delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 } })}\n\ndata: [DONE]\n\n`,
+          ])
+        },
+      ],
     ])
     const res = mockRes()
     await zp.handleMessages(mockReq({ _body: JSON.stringify(anthBody({ model: m, stream: true })) }), res)
     await res.done
+    assert.equal(sent.stream, true, "upstream fetched with stream:true")
     assert.equal(res.state.status, 200)
     assert.equal(res.state.headers["content-type"], "text/event-stream")
-    assert.match(res.body, /event: message_start/)
-    assert.match(res.body, /"type":"message_start"/)
-    assert.match(res.body, /event: content_block_start/)
-    assert.match(res.body, /"text_delta","text":"hello world"/)
-    assert.match(res.body, /event: content_block_stop/)
-    assert.match(res.body, /event: message_stop/)
+    const writes = res.state.chunks
+    const at = (re) => writes.findIndex((w) => re.test(w))
+    const iStart = at(/"type":"message_start"/)
+    const iHello = at(/"text_delta","text":"Hello"/)
+    const iBrave = at(/"text_delta","text":" brave"/)
+    const iDelta = at(/"type":"message_delta"/)
+    const iStop = at(/"type":"message_stop"/)
+    assert.ok(iStart >= 0 && iHello > iStart, "message_start arrives before first text delta (no accumulation)")
+    assert.ok(iBrave > iHello, "text deltas stream in order across upstream chunks")
+    assert.ok(iStop > iBrave, "message_stop arrives last")
+    assert.ok(iDelta >= 0 && iDelta < iStop, "message_delta precedes message_stop")
+    assert.match(res.body, /"message_start"[\s\S]*"usage":\{"input_tokens":\d+\}/, "message_start carries input_tokens")
+    assert.match(
+      res.body,
+      /"type":"message_delta","delta":\{"stop_reason":"end_turn"\},"usage":\{"output_tokens":3\}/,
+      "message_delta carries upstream stop_reason + output_tokens",
+    )
+    assert.doesNotMatch(res.body, /thinking/, "no thinking blocks emitted")
+  })
+
+  test("responses-family streams incrementally with usage from completed", async () => {
+    zp.saveConfig({ responsesModels: ["gpt-5*"], fallbackModels: ["gpt-5.5"], defaultModel: "gpt-5.5" })
+    let sent = null
+    globalThis.fetch = routeFetch([
+      [
+        "/responses",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          return sseStreamResponse([
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "Hel" })}\n\n`,
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "lo" })}\n\n`,
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { usage: { input_tokens: 5, output_tokens: 2, total_tokens: 7 } } })}\n\n`,
+          ])
+        },
+      ],
+    ])
+    const res = mockRes()
+    await zp.handleMessages(mockReq({ _body: JSON.stringify(anthBody({ model: "gpt-5.5", stream: true })) }), res)
+    await res.done
+    assert.equal(sent.stream, true, "responses upstream fetched with stream:true")
+    const writes = res.state.chunks
+    const at = (re) => writes.findIndex((w) => re.test(w))
+    assert.ok(at(/"text_delta","text":"Hel"/) > at(/"type":"message_start"/))
+    assert.ok(at(/"text_delta","text":"lo"/) > at(/"text_delta","text":"Hel"/), "deltas arrive in order")
+    assert.ok(at(/"type":"message_stop"/) > at(/"text_delta","text":"lo"/))
+    assert.match(res.body, /"message_delta","delta":\{"stop_reason":"end_turn"\},"usage":\{"output_tokens":2\}/)
+  })
+
+  test("reasoning never becomes a thinking block (non-stream)", async () => {
+    const m = zp.config.fallbackModels[0]
+    globalThis.fetch = routeFetch([
+      ["/chat/completions", chatStub(m, chatOk({ role: "assistant", content: "hi", reasoning_content: "secret chain" }))],
+    ])
+    const res = mockRes()
+    await zp.handleMessages(mockReq({ _body: JSON.stringify(anthBody({ model: m })) }), res)
+    assert.equal(res.state.status, 200)
+    const data = JSON.parse(res.body)
+    assert.deepEqual(data.content, [{ type: "text", text: "hi" }], "text only, no thinking block")
+  })
+
+  test("reasoning deltas stream as text, never thinking_delta", async () => {
+    const m = zp.config.fallbackModels[0]
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        sseStreamResponse([
+          `data: ${JSON.stringify({ model: m, choices: [{ delta: { reasoning_content: "hmm" } }] })}\n\n`,
+          `data: ${JSON.stringify({ model: m, choices: [{ delta: { content: "done" }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`,
+        ]),
+      ],
+    ])
+    const res = mockRes()
+    await zp.handleMessages(mockReq({ _body: JSON.stringify(anthBody({ model: m, stream: true })) }), res)
+    await res.done
+    assert.match(res.body, /"text_delta","text":"hmm"/, "reasoning streamed as text")
+    assert.doesNotMatch(res.body, /thinking/, "no thinking_delta emitted")
+  })
+
+  test("fallback model served on /v1/messages sets x-zen headers", async () => {
+    const [m1, m2] = zp.config.fallbackModels
+    const err429 = () => jsonResponse({ error: { message: "FreeUsageLimitError" } }, 429)
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          const sent = JSON.parse(opts.body)
+          if (sent.model === m1) return err429()
+          assert.equal(sent.model, m2)
+          return chatOk({ role: "assistant", content: "via fallback" })
+        },
+      ],
+    ])
+    const res = mockRes()
+    await zp.router(
+      mockReq({ method: "POST", url: "/v1/messages", _body: JSON.stringify(anthBody({ model: m1 })) }),
+      res,
+    )
+    assert.equal(res.state.status, 200)
+    assert.equal(res.state.headers["x-zen-served-by"], m2)
+    assert.equal(res.state.headers["x-zen-fallback"], "true")
+    assert.match(res.body, /via fallback/)
+  })
+
+  test("max_tokens defaults to 1024 and clamps to 1..32000 upstream", async () => {
+    const m = zp.config.fallbackModels[0]
+    const seen = []
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          seen.push(JSON.parse(opts.body).max_tokens)
+          return chatOk({ role: "assistant", content: "ok" })
+        },
+      ],
+    ])
+    for (const [input, want] of [[undefined, 1024], [999999, 32000], [0, 1024], [-5, 1024]]) {
+      void want
+      const over = { max_tokens: input } // undefined is dropped by JSON.stringify → tests the default
+      const res = mockRes()
+      await zp.handleMessages(mockReq({ _body: JSON.stringify(anthBody({ model: m, ...over })) }), res)
+      assert.equal(res.state.status, 200)
+    }
+    assert.deepEqual(seen, [1024, 32000, 1024, 1024])
+  })
+
+  test("mid-stream upstream failure sends error envelope then message_stop", async () => {
+    const m = zp.config.fallbackModels[0]
+    const enc = new TextEncoder()
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        () =>
+          new Response(
+            new ReadableStream({
+              start(c) {
+                c.enqueue(enc.encode(`data: ${JSON.stringify({ model: m, choices: [{ delta: { content: "par" } }] })}\n\n`))
+                // Erroring discards the queue, so fail only after the chunk is out.
+                setTimeout(() => c.error(new Error("upstream blew up")), 10)
+              },
+            }),
+            { status: 200, headers: { "content-type": "text/event-stream" } },
+          ),
+      ],
+    ])
+    const res = mockRes()
+    await zp.handleMessages(mockReq({ _body: JSON.stringify(anthBody({ model: m, stream: true })) }), res)
+    await res.done
+    const writes = res.state.chunks
+    const at = (re) => writes.findIndex((w) => re.test(w))
+    assert.ok(at(/"text_delta","text":"par"/) >= 0, "partial text flushed before failure")
+    const iErr = at(/event: error/)
+    const iStop = at(/"type":"message_stop"/)
+    assert.ok(iErr >= 0, "Anthropic error envelope emitted (never a bare end)")
+    assert.ok(iStop > iErr, "message_stop follows the error envelope")
+    assert.match(res.body, /upstream blew up/)
   })
 
   test("system prompt becomes a system message upstream", async () => {

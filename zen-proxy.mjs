@@ -596,8 +596,11 @@ function anthropicToChat(body, requested) {
     }
   }
   const out = { model: requested, messages }
+  // Anthropic requires max_tokens; keep the reference default (1024) and clamp
+  // to a sane range. Forwarded as max_tokens (chat) / max_output_tokens
+  // (responses, via responsesRequest).
   const mt = Number(body.max_tokens)
-  out.max_tokens = Number.isFinite(mt) && mt > 0 ? mt : 1024
+  out.max_tokens = Math.min(32000, Math.max(1, Math.floor(Number.isFinite(mt) && mt > 0 ? mt : 1024)))
   if (body.temperature != null) out.temperature = body.temperature
   if (body.top_p != null) out.top_p = body.top_p
   if (Array.isArray(body.stop_sequences) && body.stop_sequences.length) out.stop = body.stop_sequences
@@ -621,14 +624,24 @@ function anthropicToChat(body, requested) {
   return out
 }
 
+// OpenAI finish_reason -> Anthropic stop_reason.
+function anthropicStopReason(fr) {
+  if (fr === "tool_calls") return "tool_use"
+  if (fr === "length") return "max_tokens"
+  if (fr === "stop_sequence") return "stop_sequence"
+  if (fr === "content_filter" || fr === "refusal") return "refusal"
+  return "end_turn"
+}
+
 // Normalized chat.completion -> Anthropic message envelope. Callers pass a
 // chat-shaped object (responsesToChat already normalizes responses-family
-// results), so both upstream families are covered.
+// results), so both upstream families are covered. Reasoning is intentionally
+// NOT emitted as a thinking block (a thinking block without a signature is
+// rejected by strict SDKs) — text only, plus tool_use blocks.
 function chatToAnthropic(chat, requested, fallbackInputTokens = 0) {
   const choice = chat?.choices?.[0] ?? {}
   const msg = choice?.message ?? {}
   const content = []
-  if (msg.reasoning_content) content.push({ type: "thinking", thinking: msg.reasoning_content })
   if (typeof msg.content === "string" && msg.content) content.push({ type: "text", text: msg.content })
   for (const tc of msg.tool_calls ?? []) {
     let input = {}
@@ -643,61 +656,314 @@ function chatToAnthropic(chat, requested, fallbackInputTokens = 0) {
     })
   }
   if (!content.length) content.push({ type: "text", text: "" })
-  const fr = choice?.finish_reason
-  const stop_reason = fr === "tool_calls" ? "tool_use" : fr === "length" ? "max_tokens" : "end_turn"
   const u = chat?.usage ?? {}
+  const usage = {
+    input_tokens: u.prompt_tokens ?? fallbackInputTokens ?? 0,
+    output_tokens: u.completion_tokens ?? 0,
+  }
+  if (u.cache_creation_input_tokens != null) usage.cache_creation_input_tokens = u.cache_creation_input_tokens
+  if (u.cache_read_input_tokens != null) usage.cache_read_input_tokens = u.cache_read_input_tokens
   return {
     id: `msg_${randomBytes(12).toString("hex")}`,
     type: "message",
     role: "assistant",
     model: requested,
     content,
-    stop_reason,
-    usage: {
-      input_tokens: u.prompt_tokens ?? fallbackInputTokens ?? 0,
-      output_tokens: u.completion_tokens ?? 0,
-    },
+    stop_reason: anthropicStopReason(choice?.finish_reason),
+    usage,
   }
 }
 
-function anthropicSSE(res, ant, requested) {
+// Parse one SSE block into its event name and data payload.
+function parseSSEBlock(block) {
+  let event = ""
+  const datas = []
+  for (const line of block.split("\n")) {
+    if (line.startsWith("event:")) event = line.slice(6).trim()
+    else if (line.startsWith("data:")) datas.push(line.slice(5).trimStart())
+  }
+  return { event, raw: datas.join("\n") }
+}
+
+function anthropicStreamHead(res) {
   res.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
     connection: "keep-alive",
   })
+}
+
+// Write headers + message_start (with usage, so strict SDKs don't hang) and
+// open the first text block. Returns the `send` writer.
+function anthropicStreamStart(res, requested, inputTokens = 0) {
+  anthropicStreamHead(res)
   const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
   send("message_start", {
     type: "message_start",
-    message: { id: ant.id, type: "message", role: "assistant", model: requested, content: [] },
+    message: {
+      id: `msg_${randomBytes(12).toString("hex")}`,
+      type: "message",
+      role: "assistant",
+      model: requested,
+      content: [],
+      usage: { input_tokens: inputTokens ?? 0 },
+    },
   })
   send("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })
-  const text = ant.content
-    .filter((b) => b?.type === "text")
-    .map((b) => b.text)
-    .join("")
-  if (text) {
-    send("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } })
+  return { send }
+}
+
+// Wire client abort + proxy timeout to an upstream SSE reader (mirrors
+// relayStream). Returns a cleanup function.
+function streamAbort(req, reader) {
+  const ctrl = new AbortController()
+  const onAbort = () => ctrl.abort()
+  if (req.signal?.addEventListener) req.signal.addEventListener("abort", onAbort)
+  const timer = setTimeout(() => ctrl.abort(), config.timeoutMs)
+  ctrl.signal.addEventListener("abort", () => {
+    reader.cancel().catch(() => {})
+  })
+  return () => {
+    clearTimeout(timer)
+    if (req.signal?.removeEventListener) req.signal.removeEventListener("abort", onAbort)
   }
-  send("content_block_stop", { type: "content_block_stop", index: 0 })
-  let index = 0
-  for (const b of ant.content) {
-    if (b?.type !== "tool_use") continue
-    index++
-    send("content_block_start", {
-      type: "content_block_start",
-      index,
-      content_block: { type: "tool_use", id: b.id, name: b.name, input: {} },
-    })
-    send("content_block_delta", {
-      type: "content_block_delta",
-      index,
-      delta: { type: "input_json_delta", partial_json: JSON.stringify(b.input ?? {}) },
-    })
-    send("content_block_stop", { type: "content_block_stop", index })
+}
+
+// Translate a chat-family upstream SSE stream to Anthropic events
+// incrementally: every upstream chunk is converted and flushed immediately,
+// never accumulated.
+function relayMessagesChatStream(req, res, upstreamRes, requested, inputFallback = 0) {
+  const { send } = anthropicStreamStart(res, requested, inputFallback)
+  const reader = upstreamRes.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  const cleanup = streamAbort(req, reader)
+  const toolBlocks = new Map() // upstream tool_calls[].index -> anthropic block index
+  const openBlocks = new Set([0])
+  let nextIndex = 1
+  let stopReason = "end_turn"
+  const msgUsage = { output_tokens: 0 }
+  const pump = async () => {
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        let idx
+        while ((idx = buffer.indexOf("\n\n")) !== -1) {
+          const block = buffer.slice(0, idx)
+          buffer = buffer.slice(idx + 2)
+          if (!block.trim()) continue
+          const { raw } = parseSSEBlock(block)
+          if (!raw || raw === "[DONE]") continue
+          let data
+          try {
+            data = JSON.parse(raw)
+          } catch {
+            continue
+          }
+          const choice = data?.choices?.[0] ?? {}
+          const delta = choice?.delta ?? {}
+          if (typeof delta?.content === "string" && delta.content) {
+            send("content_block_delta", {
+              type: "content_block_delta",
+              index: 0,
+              delta: { type: "text_delta", text: delta.content },
+            })
+          }
+          // Reasoning has no Anthropic signature here — emit it as plain text,
+          // never as a thinking block.
+          if (typeof delta?.reasoning_content === "string" && delta.reasoning_content) {
+            send("content_block_delta", {
+              type: "content_block_delta",
+              index: 0,
+              delta: { type: "text_delta", text: delta.reasoning_content },
+            })
+          }
+          for (const tc of delta?.tool_calls ?? []) {
+            const upIdx = tc?.index ?? 0
+            let bIdx = toolBlocks.get(upIdx)
+            if (bIdx == null && (tc?.id || tc?.function?.name)) {
+              bIdx = nextIndex++
+              toolBlocks.set(upIdx, bIdx)
+              openBlocks.add(bIdx)
+              send("content_block_start", {
+                type: "content_block_start",
+                index: bIdx,
+                content_block: {
+                  type: "tool_use",
+                  id: tc.id ?? `toolu_${randomBytes(8).toString("hex")}`,
+                  name: tc?.function?.name ?? "unknown",
+                  input: {},
+                },
+              })
+            }
+            const args = tc?.function?.arguments
+            if (args && bIdx != null) {
+              send("content_block_delta", {
+                type: "content_block_delta",
+                index: bIdx,
+                delta: { type: "input_json_delta", partial_json: args },
+              })
+            }
+          }
+          if (choice?.finish_reason) stopReason = anthropicStopReason(choice.finish_reason)
+          const u = data?.usage
+          if (u && Number.isFinite(u?.completion_tokens)) msgUsage.output_tokens = u.completion_tokens
+          if (u?.cache_creation_input_tokens != null) msgUsage.cache_creation_input_tokens = u.cache_creation_input_tokens
+          if (u?.cache_read_input_tokens != null) msgUsage.cache_read_input_tokens = u.cache_read_input_tokens
+        }
+      }
+      if (toolBlocks.size > 0 && stopReason === "end_turn") stopReason = "tool_use"
+      for (const b of [...openBlocks].sort((a, b) => a - b)) {
+        send("content_block_stop", { type: "content_block_stop", index: b })
+      }
+      send("message_delta", { type: "message_delta", delta: { stop_reason: stopReason }, usage: msgUsage })
+      send("message_stop", { type: "message_stop" })
+      res.end()
+    } catch (err) {
+      try {
+        for (const b of [...openBlocks].sort((a, b) => a - b)) {
+          send("content_block_stop", { type: "content_block_stop", index: b })
+        }
+        send("error", { type: "error", error: { type: "api_error", message: err?.message ?? "upstream stream failed" } })
+        send("message_stop", { type: "message_stop" })
+      } catch {}
+      res.end()
+    } finally {
+      cleanup()
+    }
   }
-  send("message_stop", { type: "message_stop" })
-  res.end()
+  return pump()
+}
+
+// Translate a responses-family upstream SSE stream to Anthropic events
+// incrementally (output_text.delta, reasoning deltas, function_call
+// item/delta, completed, usage). Chat-shaped conversion reuses
+// responsesEventToDeltas; reasoning is emitted as text, never thinking.
+function relayMessagesResponsesStream(req, res, upstreamRes, requested, inputFallback = 0) {
+  const { send } = anthropicStreamStart(res, requested, inputFallback)
+  const reader = upstreamRes.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  const cleanup = streamAbort(req, reader)
+  const state = { tools: [], usage: null, finish: "stop" }
+  const toolBlocks = [] // chat tool ordinal -> anthropic block index
+  const openBlocks = new Set([0])
+  let nextIndex = 1
+  let failed = null
+  const pump = async () => {
+    const abort = (message) => {
+      failed = message
+      for (const b of [...openBlocks].sort((a, b) => a - b)) {
+        send("content_block_stop", { type: "content_block_stop", index: b })
+      }
+      send("error", { type: "error", error: { type: "api_error", message } })
+      send("message_stop", { type: "message_stop" })
+      res.end()
+    }
+    try {
+      for (;;) {
+        if (failed) return
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        let idx
+        while ((idx = buffer.indexOf("\n\n")) !== -1) {
+          const block = buffer.slice(0, idx)
+          buffer = buffer.slice(idx + 2)
+          if (!block.trim()) continue
+          const { event, raw } = parseSSEBlock(block)
+          if (!raw || raw === "[DONE]") continue
+          let data
+          try {
+            data = JSON.parse(raw)
+          } catch {
+            continue
+          }
+          const ru = data?.response?.usage ?? data?.usage
+          if (ru && typeof ru === "object") state.usage = ru
+          if (data?.type === "response.completed" || data?.type === "response.incomplete") {
+            state.finish = data.type === "response.incomplete" ? "length" : state.tools.length ? "tool_calls" : "stop"
+            continue
+          }
+          if (data?.type === "error" || data?.error) {
+            const message = data?.error?.message ?? data?.message ?? "upstream stream failed"
+            abort(String(message))
+            return
+          }
+          for (const d of responsesEventToDeltas(event, data, state)) {
+            if (typeof d?.content === "string" && d.content) {
+              send("content_block_delta", {
+                type: "content_block_delta",
+                index: 0,
+                delta: { type: "text_delta", text: d.content },
+              })
+            } else if (typeof d?.reasoning_content === "string" && d.reasoning_content) {
+              send("content_block_delta", {
+                type: "content_block_delta",
+                index: 0,
+                delta: { type: "text_delta", text: d.reasoning_content },
+              })
+            } else if (Array.isArray(d?.tool_calls)) {
+              for (const tc of d.tool_calls) {
+                const upIdx = tc?.index ?? 0
+                let bIdx = toolBlocks[upIdx]
+                if (bIdx == null && (tc?.id || tc?.function?.name)) {
+                  bIdx = nextIndex++
+                  toolBlocks[upIdx] = bIdx
+                  openBlocks.add(bIdx)
+                  send("content_block_start", {
+                    type: "content_block_start",
+                    index: bIdx,
+                    content_block: {
+                      type: "tool_use",
+                      id: tc.id ?? `toolu_${randomBytes(8).toString("hex")}`,
+                      name: tc?.function?.name ?? "unknown",
+                      input: {},
+                    },
+                  })
+                }
+                const args = tc?.function?.arguments
+                if (args && bIdx != null) {
+                  send("content_block_delta", {
+                    type: "content_block_delta",
+                    index: bIdx,
+                    delta: { type: "input_json_delta", partial_json: args },
+                  })
+                }
+              }
+            }
+          }
+        }
+      }
+      if (failed) return
+      let stopReason = anthropicStopReason(state.finish)
+      if (toolBlocks.length > 0 && stopReason === "end_turn") stopReason = "tool_use"
+      const msgUsage = { output_tokens: state.usage?.output_tokens ?? 0 }
+      if (state.usage?.cache_creation_input_tokens != null)
+        msgUsage.cache_creation_input_tokens = state.usage.cache_creation_input_tokens
+      if (state.usage?.cache_read_input_tokens != null)
+        msgUsage.cache_read_input_tokens = state.usage.cache_read_input_tokens
+      for (const b of [...openBlocks].sort((a, b) => a - b)) {
+        send("content_block_stop", { type: "content_block_stop", index: b })
+      }
+      send("message_delta", { type: "message_delta", delta: { stop_reason: stopReason }, usage: msgUsage })
+      send("message_stop", { type: "message_stop" })
+      res.end()
+    } catch (err) {
+      if (!failed) {
+        try {
+          abort(err?.message ?? "upstream stream failed")
+          return
+        } catch {}
+        res.end()
+      }
+    } finally {
+      cleanup()
+    }
+  }
+  return pump()
 }
 
 async function handleChat(req, res) {
@@ -757,8 +1023,9 @@ async function handleChat(req, res) {
         relayStream(req, res, upstreamRes, requested)
       }
     },
-    onError(status, errBody) {
-      res.writeHead(status, { "content-type": "application/json" })
+    onError(status, errBody, retryAfter) {
+      const headers = retryAfter > 0 ? { "retry-after": String(retryAfter) } : {}
+      res.writeHead(status, { "content-type": "application/json", ...headers })
       res.end(
         JSON.stringify(errBody ?? { error: { type: "free_usage_limit_error", message: "all free models are rate-limited" } }),
       )
@@ -773,6 +1040,7 @@ async function handleChat(req, res) {
 async function runChatLoop(req, res, { body, requested, candidates, auth, start, isStream, onJson, onStream, onError }) {
   let lastErr = null
   let lastStatus = 502
+  let lastRetryAfter = 0
   let used = requested
   for (const model of candidates) {
     used = model
@@ -785,7 +1053,10 @@ async function runChatLoop(req, res, { body, requested, candidates, auth, start,
         method: "POST",
         headers: zenHeaders(req, auth),
         body: JSON.stringify(payload),
-        signal: isStream ? req.signal : AbortSignal.timeout(config.timeoutMs),
+        // Newer Node aborts IncomingMessage.signal as soon as the request
+        // body is consumed, so it can never gate a long-lived upstream
+        // fetch — reuse it only while still armed, else use a timeout.
+        signal: isStream && req.signal && !req.signal.aborted ? req.signal : AbortSignal.timeout(config.timeoutMs),
       })
     } catch (err) {
       lastErr = { error: { type: "upstream_error", message: err.message } }
@@ -795,9 +1066,11 @@ async function runChatLoop(req, res, { body, requested, candidates, auth, start,
 
     if (upstreamRes.ok) {
       if (isStream) {
-        onStream(upstreamRes, model, format)
+        // Return the pump promise so callers await it (no unhandled
+        // rejections); finish/error accounting stays centralized here.
+        const streamed = onStream(upstreamRes, model, format)
         res.on("finish", () => { recordReq(req, `${requested}→${model}`, Date.now() - start, 200); recordObserved(model, true) })
-        return
+        return streamed
       }
       try {
         const content = await upstreamRes.json()
@@ -814,6 +1087,7 @@ async function runChatLoop(req, res, { body, requested, candidates, auth, start,
       lastErr = { error: { type: "upstream_error", message: `upstream returned ${upstreamRes.status}` } }
     }
     lastStatus = upstreamRes.status
+    lastRetryAfter = parseRetryAfter(upstreamRes.headers.get("retry-after"))
     // Try the next candidate not only on 429/5xx but also when the upstream
     // reports a model/environment-level failure (e.g. a provider that is
     // temporarily "unavailable", a geo-blocked free model, or a stale model id)
@@ -829,7 +1103,7 @@ async function runChatLoop(req, res, { body, requested, candidates, auth, start,
   }
 
   recordReq(req, `${requested}→${used}`, Date.now() - start, lastStatus)
-  return onError(lastStatus, lastErr)
+  return onError(lastStatus, lastErr, lastRetryAfter)
 }
 
 async function handleMessages(req, res) {
@@ -853,48 +1127,56 @@ async function handleMessages(req, res) {
     recordReq(req, String(body?.model ?? ""), Date.now() - start, 401)
     return json(res, 401, { type: "error", error: { type: "authentication_error", message: "invalid proxy key" } })
   }
-  const rawModel = String(body.model ?? "").split("/").pop()
-  if (!rawModel) {
-    recordReq(req, "", Date.now() - start, 400)
-    return json(res, 400, { type: "error", error: { type: "invalid_request_error", message: "model is required" } })
-  }
-  if (!config.modelAliases[rawModel] && !ALLOWED().has(rawModel)) {
-    recordReq(req, rawModel, Date.now() - start, 400)
-    return json(res, 400, { type: "error", error: { type: "invalid_request_error", message: `unknown model: ${rawModel}` } })
-  }
   if (!Array.isArray(body.messages)) {
-    recordReq(req, rawModel, Date.now() - start, 400)
+    recordReq(req, String(body?.model ?? ""), Date.now() - start, 400)
     return json(res, 400, { type: "error", error: { type: "invalid_request_error", message: "messages must be an array" } })
   }
 
+  // Unknown models resolve through the same default + fallback chain as
+  // handleChat — never a hard 400 here.
   const { requested, candidates } = resolveModel(body.model)
   const clientStream = !!body.stream
   const chatBody = anthropicToChat(body, requested)
+  if (clientStream) {
+    // True streaming: fetch upstream with stream:true (chat and responses
+    // families alike) and translate each SSE block incrementally.
+    chatBody.stream = true
+    chatBody.stream_options = { include_usage: true }
+  }
   const inputFallback = JSON.stringify(chatBody.messages).length >> 2
-  // Streaming reuses the same non-stream upstream fetch and converts the full
-  // reply to Anthropic SSE (mirrors the reference implementation).
   return runChatLoop(req, res, {
     body: chatBody,
     requested,
     candidates,
     auth,
     start,
-    isStream: false,
+    isStream: clientStream,
     onJson(content, model, format) {
       const chat =
         format === "responses"
           ? responsesToChat(content, requested, model)
           : { ...(content ?? {}), model: requested, ...(model !== requested ? { zen_served_by: model } : {}) }
       const ant = chatToAnthropic(chat, requested, inputFallback)
+      if (model !== requested) {
+        // Same fallback visibility as handleChat.
+        res.setHeader?.("x-zen-served-by", model)
+        res.setHeader?.("x-zen-fallback", "true")
+      }
       recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
       recordObserved(model, true)
-      if (clientStream) return anthropicSSE(res, ant, requested)
       return json(res, 200, ant)
     },
     onStream(upstreamRes, model, format) {
-      relayStream(req, res, upstreamRes, requested)
+      if (model !== requested) {
+        res.setHeader?.("x-zen-served-by", model)
+        res.setHeader?.("x-zen-fallback", "true")
+      }
+      if (format === "responses") {
+        return relayMessagesResponsesStream(req, res, upstreamRes, requested, inputFallback)
+      }
+      return relayMessagesChatStream(req, res, upstreamRes, requested, inputFallback)
     },
-    onError(status, errBody) {
+    onError(status, errBody, retryAfter) {
       const message = errBody?.error?.message ?? errBody?.message ?? "upstream error"
       const type =
         status === 429
@@ -904,7 +1186,9 @@ async function handleMessages(req, res) {
             : status === 400
               ? "invalid_request_error"
               : "upstream_error"
-      json(res, status, { type: "error", error: { type, message } })
+      const headers = retryAfter > 0 ? { "retry-after": String(retryAfter) } : {}
+      res.writeHead(status, { "content-type": "application/json", ...headers })
+      res.end(JSON.stringify({ type: "error", error: { type, message } }))
     },
   })
 }
@@ -1703,6 +1987,9 @@ export {
   handleChat,
   handleMessages,
   anthropicToChat,
+  anthropicStopReason,
+  relayMessagesChatStream,
+  relayMessagesResponsesStream,
   chatToAnthropic,
   relayStream,
   rewriteSSE,
