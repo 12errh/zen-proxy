@@ -408,7 +408,10 @@ function chatToolsToResponses(tools) {
   if (!Array.isArray(tools)) return undefined
   const out = []
   for (const t of tools) {
-    const fn = t?.type === "function" ? (t.function ?? t) : null
+    // Accept chat-shaped ({type:"function",function:{...}}), flat Responses
+    // ({type:"function",name,...}) and typeless ({name,...}) — anything with
+    // a name survives instead of being silently dropped.
+    const fn = t?.function ?? t
     if (!fn?.name) continue
     out.push({
       type: "function",
@@ -419,6 +422,34 @@ function chatToolsToResponses(tools) {
     })
   }
   return out.length ? out : undefined
+}
+
+// Normalize ANY caller tool shape to flat Responses form
+// {type:"function",name,description?,parameters?,strict?} so /v1/responses
+// never forwards mixed chat-shaped ({function:{...}}) + flat appends
+// upstream (chat-shaped entries are rejected/dropped there).
+function toResponsesTool(t) {
+  const fn = t?.function ?? t
+  if (!fn?.name) return null
+  return {
+    type: "function",
+    name: fn.name,
+    ...(fn.description ? { description: fn.description } : {}),
+    ...(fn.parameters ? { parameters: fn.parameters } : {}),
+    ...(fn.strict != null ? { strict: fn.strict } : {}),
+  }
+}
+
+// Normalize a chat-style tool_choice to flat Responses form; strings pass
+// through untouched ("auto"/"required"/"none" are valid in both families).
+function toResponsesToolChoice(tc) {
+  if (tc == null || typeof tc === "string") return tc
+  if (typeof tc === "object") {
+    const name = tc?.function?.name ?? tc?.name
+    if (tc.type === "function" && name) return { type: "function", name }
+    return tc
+  }
+  return tc
 }
 
 // Responses API result -> chat.completion, preserving tool calls + reasoning.
@@ -484,9 +515,16 @@ function responsesEventToDeltas(event, data, state) {
     state.tools.push({ id: item.call_id ?? item.id ?? `call_${index}` })
     out.push({ tool_calls: [{ index, id: item.call_id ?? item.id ?? `call_${index}`, type: "function", function: { name: item.name ?? "unknown", arguments: "" } }] })
   } else if (type === "response.function_call_arguments.delta" && data?.delta) {
-    let index = state.tools.findIndex((t) => t.id === (data.item_id ?? data.call_id ?? data.call_id))
-    if (index < 0) index = 0
-    if (!state.tools[index]) state.tools[index] = { id: data.call_id ?? `call_${index}` }
+    const key = data.item_id ?? data.id ?? data.call_id
+    let index = key != null ? state.tools.findIndex((t) => t.id === key) : -1
+    if (index < 0) {
+      // Delta for an item we haven't seen an `added` event for (parallel
+      // calls, reordered streams): open a slot instead of collapsing onto
+      // index 0 and corrupting another call's arguments.
+      index = state.tools.length
+      state.tools.push({ id: key ?? `call_${index}` })
+    }
+    if (!state.tools[index]) state.tools[index] = { id: key ?? `call_${index}` }
     out.push({ tool_calls: [{ index, function: { arguments: data.delta } }] })
   }
   return out
@@ -782,7 +820,7 @@ function anthropicToChat(body, requested) {
     const texts = []
     const images = []
     const toolCalls = []
-    const toolResults = []
+    const toolResults = [] // {id, text}: id links the result to its tool_use
     for (const b of c) {
       if (!b || typeof b !== "object") continue
       if (b.type === "text" && typeof b.text === "string") texts.push(b.text)
@@ -809,14 +847,24 @@ function anthropicToChat(body, requested) {
             : Array.isArray(rc)
               ? rc.map((x) => (typeof x === "string" ? x : (x?.text ?? ""))).filter(Boolean).join("\n")
               : String(rc ?? "")
-        toolResults.push(rt)
+        toolResults.push({ id: b.tool_use_id ?? b.id ?? `call_${toolResults.length}`, text: rt })
       }
     }
-    if (toolResults.length) {
-      // tool_result → plain user text (best effort; keeps tool loops readable).
-      messages.push({ role: "user", content: [texts.join("\n"), ...toolResults].filter(Boolean).join("\n") })
-    } else if (toolCalls.length) {
+    if (toolCalls.length) {
+      // Assistant turn that produced tool_use blocks → first-class tool_calls
+      // so the upstream model sees the call linkage (never flattened).
       messages.push({ role: "assistant", content: texts.join("\n") || null, tool_calls: toolCalls })
+    }
+    if (toolResults.length) {
+      // tool_result → one `tool`-role message per result with the originating
+      // tool_use id. Flattening to plain user text loses the linkage and
+      // breaks follow-up rounds that reference the call.
+      if (texts.length && !toolCalls.length) messages.push({ role: "user", content: texts.join("\n") })
+      for (const tr of toolResults) {
+        messages.push({ role: "tool", tool_call_id: tr.id, content: tr.text || " " })
+      }
+    } else if (toolCalls.length) {
+      // already emitted above; nothing more to do
     } else if (images.length) {
       messages.push({ role, content: [...texts.map((t) => ({ type: "text", text: t })), ...images] })
     } else {
@@ -1306,26 +1354,24 @@ function ensureChatFreeTier(body) {
 function ensureResponsesFreeTier(body, session) {
   const clientStream = body.stream !== false
   const payload = { ...body }
-  // responses tools are flat: {type:"function", name, ...}
-  const existing = Array.isArray(payload.tools) ? payload.tools : []
-  const names = new Set(
-    existing
-      .map((t) => t?.name ?? t?.function?.name)
-      .filter(Boolean),
-  )
+  // responses tools are flat: {type:"function", name, ...}. Normalize FIRST
+  // so chat-shaped caller tools ({function:{name}}) are converted instead of
+  // producing a mixed-shape array upstream (mixed shapes get dropped).
+  const existing = Array.isArray(payload.tools) ? payload.tools.map(toResponsesTool).filter(Boolean) : []
+  const names = new Set(existing.map((t) => t?.name).filter(Boolean))
   let hits = 0
   for (const n of OFFICIAL_TOOLS) if (names.has(n)) hits++
   if (hits < 6) {
     // Top up (never replace): keep caller tools, append missing official ones
     // in the same flat shape so user function-calling keeps working.
-    const flat = existing.length > 0 && existing[0]?.function == null
-    const missing = MIN_OFFICIAL_TOOLS.filter((n) => !names.has(n)).map((n) =>
-      flat
-        ? { type: "function", name: n, description: `opencode tool ${n}`, parameters: { type: "object", properties: {} } }
-        : { type: "function", function: { name: n, description: `opencode tool ${n}`, parameters: { type: "object", properties: {} } } },
-    )
+    const missing = MIN_OFFICIAL_TOOLS.filter((n) => !names.has(n)).map((n) => (
+      { type: "function", name: n, description: `opencode tool ${n}`, parameters: { type: "object", properties: {} } }
+    ))
     payload.tools = [...existing, ...missing]
+  } else {
+    payload.tools = existing
   }
+  if (payload.tool_choice != null) payload.tool_choice = toResponsesToolChoice(payload.tool_choice)
   if (payload.store == null) payload.store = false
   if (payload.prompt_cache_key == null) payload.prompt_cache_key = session
   if (payload.include == null) payload.include = ["reasoning.encrypted_content"]
@@ -1377,9 +1423,21 @@ async function collectChatSSE(upstreamRes) {
       if (delta && typeof delta.content === "string") content += delta.content
       if (delta && typeof delta.reasoning_content === "string") reasoning_content += delta.reasoning_content
       // Accumulate streamed tool_calls deltas by index (arguments arrive split
-      // across chunks); id/type/name come on the first chunk only.
+      // across chunks); id/type/name come on the first chunk only. Parallel
+      // calls use distinct indexes; chunks without an index are matched to a
+      // known id or opened as a new slot (never collapsed onto index 0).
       for (const tc of delta?.tool_calls ?? []) {
-        const index = Number.isFinite(tc?.index) ? tc.index : 0
+        let index = Number.isFinite(tc?.index) ? tc.index : undefined
+        if (index === undefined) {
+          if (tc?.id) {
+            const found = [...toolCalls.entries()].find(([, v]) => v.id === tc.id)
+            if (found) index = found[0]
+          }
+          if (index === undefined) {
+            index = toolCalls.size
+            while (toolCalls.has(index)) index++
+          }
+        }
         let cur = toolCalls.get(index)
         if (!cur) {
           cur = { id: tc?.id, type: tc?.type ?? "function", function: { name: tc?.function?.name ?? "unknown", arguments: "" } }
@@ -1452,14 +1510,22 @@ async function collectResponsesSSE(upstreamRes) {
           if (Array.isArray(j?.response?.output)) respOutput = j.response.output
           continue
         }
-        if (typeof j.delta === "string") deltas.push(j.delta)
-        else if (j.delta && typeof j.delta.text === "string") deltas.push(j.delta.text)
+        // Text deltas accumulate into the message; function_call argument
+        // deltas (carrying an item/call id) accumulate into toolArgs ONLY —
+        // mixing them into the text corrupts both the prose and the tool loop.
+        if (typeof j.delta === "string") {
+          if (j?.item_id != null || j?.call_id != null) {
+            toolArgs.set(j.item_id ?? j.call_id, (toolArgs.get(j.item_id ?? j.call_id) ?? "") + j.delta)
+          } else {
+            deltas.push(j.delta)
+          }
+        } else if (j.delta && typeof j.delta.text === "string") {
+          deltas.push(j.delta.text)
+        }
         // Preserve streamed function_call items + argument deltas so tool
         // loops survive destreaming (previously dropped).
         if (j?.item?.type === "function_call") {
           outputItems.push({ ...j.item })
-        } else if (typeof j?.delta === "string" && (j?.item_id || j?.call_id)) {
-          toolArgs.set(j.item_id ?? j.call_id, (toolArgs.get(j.item_id ?? j.call_id) ?? "") + j.delta)
         }
         const out = j.response?.output
         if (Array.isArray(out)) {
@@ -1739,6 +1805,15 @@ async function handleResponses(req, res) {
       // Responses free also needs tools + stream; reuse session for cache key.
       const fixed = ensureResponsesFreeTier(payload, upSession)
       payload = fixed.payload
+    } else {
+      // Paid models: still normalize shapes so chat-shaped caller tools /
+      // tool_choice are not forwarded in a form upstream drops.
+      if (Array.isArray(payload.tools)) {
+        const norm = payload.tools.map(toResponsesTool).filter(Boolean)
+        if (norm.length) payload.tools = norm
+        else delete payload.tools
+      }
+      if (payload.tool_choice != null) payload.tool_choice = toResponsesToolChoice(payload.tool_choice)
     }
     let upstreamRes
     try {
@@ -1771,6 +1846,7 @@ async function handleResponses(req, res) {
         const out = {
           id: `resp_${Date.now().toString(36)}`,
           object: "response",
+          status: "completed",
           model: requested,
           ...(typeof collected !== "string" && collected.usage ? { usage: collected.usage } : {}),
           output: outItems.length
@@ -2924,6 +3000,8 @@ export {
   mkOfficialTools,
   hasEnoughOfficialTools,
   mergeUserTools,
+  toResponsesTool,
+  toResponsesToolChoice,
   isFreeModel,
   ensureChatFreeTier,
   ensureResponsesFreeTier,

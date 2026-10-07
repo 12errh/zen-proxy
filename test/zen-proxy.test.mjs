@@ -2402,6 +2402,253 @@ describe("install.sh config preservation", () => {
   })
 })
 
+describe("tool-calling hardening regressions", () => {
+  test("ensureResponsesFreeTier normalizes chat-shaped tools to flat (no mixed shapes)", () => {
+    const chatShaped = { type: "function", function: { name: "calculator", description: "mul", parameters: { type: "object", properties: {} } } }
+    const { payload } = zp.ensureResponsesFreeTier({ model: "m", input: "hi", tools: [chatShaped] }, "ses_test")
+    assert.ok(payload.tools.length >= 7, "user tool + official top-up")
+    for (const t of payload.tools) {
+      assert.equal(t.type, "function")
+      assert.equal(typeof t.name, "string", "flat name present")
+      assert.equal(t.function, undefined, "no chat-shaped nesting survives")
+    }
+    assert.ok(payload.tools.some((t) => t.name === "calculator"), "user tool kept by name")
+  })
+
+  test("ensureResponsesFreeTier normalizes chat-shaped tool_choice", () => {
+    const { payload } = zp.ensureResponsesFreeTier(
+      { model: "m", input: "hi", tool_choice: { type: "function", function: { name: "calculator" } } },
+      "ses_test",
+    )
+    assert.deepEqual(payload.tool_choice, { type: "function", name: "calculator" })
+  })
+
+  test("toResponsesTool accepts flat, chat-shaped and typeless tools", () => {
+    assert.equal(zp.toResponsesTool({ type: "function", name: "a" }).name, "a")
+    assert.equal(zp.toResponsesTool({ type: "function", function: { name: "b" } }).name, "b")
+    assert.equal(zp.toResponsesTool({ name: "c" }).name, "c")
+    assert.equal(zp.toResponsesTool({ type: "function" }), null)
+  })
+
+  test("chatToolsToResponses keeps typeless user tools instead of dropping them", () => {
+    const out = zp.chatToolsToResponses([{ name: "calculator", description: "mul", parameters: { type: "object" } }])
+    assert.deepEqual(out, [{ type: "function", name: "calculator", description: "mul", parameters: { type: "object" } }])
+  })
+
+  test("anthropic tool_result becomes linked tool messages, not flattened text", () => {
+    const chat = zp.anthropicToChat({
+      model: "m",
+      max_tokens: 64,
+      messages: [
+        { role: "assistant", content: [{ type: "text", text: "looking" }, { type: "tool_use", id: "toolu_1", name: "read", input: { p: "a" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "file contents" }] },
+      ],
+    }, "m")
+    assert.deepEqual(chat.messages[0], {
+      role: "assistant",
+      content: "looking",
+      tool_calls: [{ id: "toolu_1", type: "function", function: { name: "read", arguments: '{"p":"a"}' } }],
+    })
+    assert.deepEqual(chat.messages[1], { role: "tool", tool_call_id: "toolu_1", content: "file contents" })
+  })
+
+  test("multiple anthropic tool_results become one tool message each", () => {
+    const chat = zp.anthropicToChat({
+      model: "m",
+      max_tokens: 64,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "toolu_1", content: "r1" },
+            { type: "tool_result", tool_use_id: "toolu_2", content: [{ type: "text", text: "r2" }] },
+          ],
+        },
+      ],
+    }, "m")
+    assert.deepEqual(chat.messages, [
+      { role: "tool", tool_call_id: "toolu_1", content: "r1" },
+      { role: "tool", tool_call_id: "toolu_2", content: "r2" },
+    ])
+  })
+
+  test("assistant tool_calls echo survives chatMessagesToInput translation", () => {
+    const input = zp.chatMessagesToInput([
+      { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "read", arguments: '{"p":"a"}' } }] },
+      { role: "tool", tool_call_id: "call_1", content: "file.txt" },
+    ])
+    assert.deepEqual(input, [
+      { type: "function_call", call_id: "call_1", name: "read", arguments: '{"p":"a"}' },
+      { type: "function_call_output", call_id: "call_1", output: "file.txt" },
+    ])
+  })
+
+  test("handleChat forwards replayed assistant tool_calls + tool results untouched", async () => {
+    const m = zp.config.fallbackModels[0]
+    let sent
+    globalThis.fetch = routeFetch([
+      ["/chat/completions", (u, opts) => {
+        sent = JSON.parse(opts.body)
+        return jsonResponse({ model: m, choices: [{ message: { role: "assistant", content: "done" }, finish_reason: "stop" }] })
+      }],
+    ])
+    const messages = [
+      { role: "user", content: "read a" },
+      { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "read", arguments: '{"p":"a"}' } }] },
+      { role: "tool", tool_call_id: "call_1", content: "file.txt" },
+    ]
+    const req = mockReq({ _body: JSON.stringify({ model: m, messages }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 200)
+    assert.deepEqual(sent.messages, messages, "replayed tool loop forwarded verbatim")
+  })
+
+  test("tool_choice object name matches a merged upstream tool", async () => {
+    const m = zp.config.fallbackModels[0]
+    let sent
+    globalThis.fetch = routeFetch([
+      ["/chat/completions", (u, opts) => {
+        sent = JSON.parse(opts.body)
+        return jsonResponse({ model: m, choices: [{ message: { role: "assistant", content: "ok" }, finish_reason: "stop" }] })
+      }],
+    ])
+    const calc = { type: "function", function: { name: "calculator", description: "mul", parameters: { type: "object", properties: {} } } }
+    const req = mockReq({
+      _body: JSON.stringify({ model: m, messages: [{ role: "user", content: "hi" }], tools: [calc], tool_choice: { type: "function", function: { name: "calculator" } } }),
+    })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 200)
+    const names = sent.tools.map((t) => t?.function?.name ?? t?.name)
+    assert.ok(names.includes("calculator"))
+    assert.deepEqual(sent.tool_choice, { type: "function", function: { name: "calculator" } })
+  })
+
+  test("collectChatSSE accumulates parallel tool_calls by index", async () => {
+    const sse = [
+      `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_a", type: "function", function: { name: "read", arguments: "" } }] } }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 1, id: "call_b", type: "function", function: { name: "glob", arguments: "" } }] } }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '{"p":"a"}' } }] } }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 1, function: { arguments: '{"g":"*"}' } }] } }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "tool_calls" }] })}\n\n`,
+      "data: [DONE]\n\n",
+    ].join("")
+    const out = await zp.collectChatSSE(new Response(sse))
+    assert.equal(out.finish, "tool_calls")
+    assert.equal(out.tool_calls.length, 2)
+    assert.equal(out.tool_calls[0].id, "call_a")
+    assert.equal(out.tool_calls[0].function.arguments, '{"p":"a"}')
+    assert.equal(out.tool_calls[1].id, "call_b")
+    assert.equal(out.tool_calls[1].function.arguments, '{"g":"*"}')
+  })
+
+  test("collectChatSSE index-less chunks match by id instead of collapsing", async () => {
+    const sse = [
+      `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ id: "call_a", type: "function", function: { name: "read", arguments: '{"p":' } }] } }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ id: "call_a", function: { arguments: '"a"}' } }] } }] })}\n\n`,
+      "data: [DONE]\n\n",
+    ].join("")
+    const out = await zp.collectChatSSE(new Response(sse))
+    assert.equal(out.tool_calls.length, 1)
+    assert.equal(out.tool_calls[0].function.arguments, '{"p":"a"}')
+  })
+
+  test("responsesEventToDeltas opens a new slot for unknown delta ids (no index-0 pile-up)", () => {
+    const state = { tools: [{ id: "c1" }] }
+    const d = zp.responsesEventToDeltas("", { type: "response.function_call_arguments.delta", item_id: "c2", delta: '{"x":1}' }, state)
+    assert.equal(d[0].tool_calls[0].index, 1)
+    assert.equal(state.tools[1].id, "c2")
+    assert.equal(state.tools[0].id, "c1")
+  })
+
+  test("collectResponsesSSE keeps function args out of the text", async () => {
+    const sse = [
+      `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "hi" })}\n\n`,
+      `event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", item: { type: "function_call", call_id: "call_9", name: "shell", arguments: "" } })}\n\n`,
+      `event: response.function_call_arguments.delta\ndata: ${JSON.stringify({ type: "response.function_call_arguments.delta", item_id: "call_9", delta: '{"cmd":"ls"}' })}\n\n`,
+      `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8 } } })}\n\n`,
+    ].join("")
+    const out = await zp.collectResponsesSSE(new Response(sse))
+    assert.equal(out.text, "hi", "JSON argument fragments must not leak into prose")
+    const fc = out.output.find((i) => i?.type === "function_call")
+    assert.equal(fc?.call_id, "call_9")
+    assert.equal(fc?.arguments, '{"cmd":"ls"}')
+  })
+
+  test("/v1/messages tool_calls turn ends with stop_reason tool_use + usage", async () => {
+    const m = zp.config.fallbackModels[0]
+    globalThis.fetch = routeFetch([
+      ["/chat/completions", (u, opts) => jsonResponse({
+        model: "up",
+        choices: [{
+          message: { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "read", arguments: '{"p":"a"}' } }] },
+          finish_reason: "tool_calls",
+        }],
+        usage: { prompt_tokens: 9, completion_tokens: 4, total_tokens: 13 },
+      })],
+    ])
+    const res = mockRes()
+    await zp.handleMessages(mockReq({
+      _body: JSON.stringify({ model: m, max_tokens: 64, messages: [{ role: "user", content: "hi" }] }),
+    }), res)
+    assert.equal(res.state.status, 200)
+    const data = JSON.parse(res.body)
+    assert.equal(data.stop_reason, "tool_use")
+    assert.deepEqual(data.content, [{ type: "tool_use", id: "call_1", name: "read", input: { p: "a" } }])
+    assert.equal(data.usage.input_tokens, 9)
+    assert.equal(data.usage.output_tokens, 4)
+  })
+
+  test("/v1/messages follow-up tool_result round-trips with call linkage", async () => {
+    const m = zp.config.fallbackModels[0]
+    let sent
+    globalThis.fetch = routeFetch([
+      ["/chat/completions", (u, opts) => {
+        sent = JSON.parse(opts.body)
+        return jsonResponse({ model: "up", choices: [{ message: { role: "assistant", content: "got it" }, finish_reason: "stop" }] })
+      }],
+    ])
+    const res = mockRes()
+    await zp.handleMessages(mockReq({
+      _body: JSON.stringify({
+        model: m,
+        max_tokens: 64,
+        messages: [
+          { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "read", input: { p: "a" } }] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "file.txt" }] },
+        ],
+      }),
+    }), res)
+    assert.equal(res.state.status, 200)
+    assert.deepEqual(sent.messages, [
+      { role: "assistant", content: null, tool_calls: [{ id: "toolu_1", type: "function", function: { name: "read", arguments: '{"p":"a"}' } }] },
+      { role: "tool", tool_call_id: "toolu_1", content: "file.txt" },
+    ])
+    assert.equal(JSON.parse(res.body).stop_reason, "end_turn")
+  })
+
+  test("POST /v1/responses keeps flat user tools (no silent drop)", async () => {
+    zp.saveConfig({ fallbackModels: ["space-bunny-free"], defaultModel: "space-bunny-free" })
+    let sent
+    globalThis.fetch = routeFetch([
+      ["/responses", (u, opts) => {
+        sent = JSON.parse(opts.body)
+        return jsonResponse({ id: "resp_1", object: "response", model: "x", output: [{ type: "message", content: [{ type: "output_text", text: "yo" }] }] })
+      }],
+    ])
+    const calc = { type: "function", name: "calculator", description: "mul", parameters: { type: "object", properties: {} } }
+    const res = mockRes()
+    await zp.router(
+      mockReq({ method: "POST", url: "/v1/responses", _body: JSON.stringify({ model: "space-bunny-free", input: "hi", stream: false, tools: [calc] }) }),
+      res,
+    )
+    assert.equal(res.state.status, 200)
+    assert.ok(sent.tools.some((t) => t.name === "calculator" && t.function === undefined), "flat user tool kept flat")
+    assert.ok(sent.tools.length >= 6, "official tools topped up")
+  })
+})
+
 describe("install.ps1 config preservation", () => {
   let hasPwsh = false
   try {
