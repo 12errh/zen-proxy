@@ -1296,6 +1296,12 @@ async function router(req, res) {
     const cache = await fetchModels()
     return json(res, 200, { ok: cache.ok, upstream: config.upstream })
   }
+  if (req.method === "GET" && p === "/robots.txt") {
+    // Keep search-engine crawlers off the proxy (saves free-tier hours/quota).
+    // Uptime monitors don't obey robots.txt, so keep-alive pings still work.
+    res.writeHead(200, { "content-type": "text/plain; charset=utf-8" })
+    return res.end("User-agent: *\nDisallow: /\n")
+  }
 
   if (p.startsWith("/api/")) {
     if (p === "/api/config") return handleApiConfig(req, res)
