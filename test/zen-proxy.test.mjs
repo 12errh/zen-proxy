@@ -345,6 +345,22 @@ describe("opencode 2.x free-tier emulation", () => {
     assert.equal(kept.payload.tools, tools, "caller tools preserved when already official")
   })
 
+  test("ensureChatFreeTier merges user tools instead of replacing them", () => {
+    const calc = { type: "function", function: { name: "calculator", description: "mul", parameters: { type: "object", properties: {} } } }
+    const { payload } = zp.ensureChatFreeTier({ model: "m", messages: [], tools: [calc] })
+    const names = payload.tools.map((t) => t?.function?.name)
+    assert.ok(names.includes("calculator"), "user tool survives free-tier hardening")
+    assert.ok(names.filter((n) => ["edit", "glob", "grep", "question", "read", "shell"].includes(n)).length >= 6, "official tools topped up")
+    assert.equal(payload.tools[0], calc, "user tool stays first, same reference")
+  })
+
+  test("anthropic user tools survive conversion + free-tier hardening", () => {
+    const chat = zp.anthropicToChat({ model: "m", max_tokens: 64, messages: [{ role: "user", content: "hi" }], tools: [{ name: "calculator", description: "mul", input_schema: { type: "object" } }] }, "m")
+    assert.ok(chat.tools.some((t) => t?.function?.name === "calculator"), "calculator converted")
+    const { payload } = zp.ensureChatFreeTier({ ...chat, model: "m" })
+    assert.ok(payload.tools.some((t) => t?.function?.name === "calculator"), "calculator kept after hardening")
+  })
+
   test("free non-stream chat is served via upstream stream + destream", async () => {
     zp.saveConfig({ fallbackModels: ["space-bunny-free"], defaultModel: "space-bunny-free" })
     let sent

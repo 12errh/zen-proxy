@@ -176,6 +176,22 @@ function hasEnoughOfficialTools(tools) {
   return hits >= 6
 }
 
+// Keep every caller tool and top up with the missing official ones so the
+// free tier sees >=6 official tools WITHOUT dropping user tools (replacing
+// them broke tool calling: the model only ever saw opencode's shell/edit…).
+// Returns the original array untouched when it already qualifies.
+function mergeUserTools(tools) {
+  if (hasEnoughOfficialTools(tools)) return tools
+  const have = new Set(
+    (Array.isArray(tools) ? tools : []).map((t) => t?.function?.name ?? t?.name).filter(Boolean),
+  )
+  const missing = MIN_OFFICIAL_TOOLS.filter((n) => !have.has(n)).map((n) => ({
+    type: "function",
+    function: { name: n, description: `opencode tool ${n}`, parameters: { type: "object", properties: {} } },
+  }))
+  return [...(Array.isArray(tools) ? tools : []), ...missing]
+}
+
 // Replicates opencode/src/id/id.ts `create(prefix, descending)`.
 // Session IDs are `ses_<12hex timestamp><14 base62>` where the hex part is the
 // low 48 bits of `~(Date.now()*0x1000 + counter)`. Pure random `ses_` fails.
@@ -1281,9 +1297,7 @@ function ensureChatFreeTier(body) {
   // served by upstream-streaming + destreaming (see collectChatSSE).
   const clientStream = !!body.stream
   const payload = { ...body }
-  if (!hasEnoughOfficialTools(payload.tools)) {
-    payload.tools = mkOfficialTools()
-  }
+  payload.tools = mergeUserTools(payload.tools)
   payload.stream = true
   if (payload.stream_options == null) payload.stream_options = { include_usage: true }
   return { payload, clientStream }
@@ -1293,20 +1307,24 @@ function ensureResponsesFreeTier(body, session) {
   const clientStream = body.stream !== false
   const payload = { ...body }
   // responses tools are flat: {type:"function", name, ...}
+  const existing = Array.isArray(payload.tools) ? payload.tools : []
   const names = new Set(
-    (Array.isArray(payload.tools) ? payload.tools : [])
+    existing
       .map((t) => t?.name ?? t?.function?.name)
       .filter(Boolean),
   )
   let hits = 0
   for (const n of OFFICIAL_TOOLS) if (names.has(n)) hits++
   if (hits < 6) {
-    payload.tools = MIN_OFFICIAL_TOOLS.map((n) => ({
-      type: "function",
-      name: n,
-      description: `opencode tool ${n}`,
-      parameters: { type: "object", properties: {} },
-    }))
+    // Top up (never replace): keep caller tools, append missing official ones
+    // in the same flat shape so user function-calling keeps working.
+    const flat = existing.length > 0 && existing[0]?.function == null
+    const missing = MIN_OFFICIAL_TOOLS.filter((n) => !names.has(n)).map((n) =>
+      flat
+        ? { type: "function", name: n, description: `opencode tool ${n}`, parameters: { type: "object", properties: {} } }
+        : { type: "function", function: { name: n, description: `opencode tool ${n}`, parameters: { type: "object", properties: {} } } },
+    )
+    payload.tools = [...existing, ...missing]
   }
   if (payload.store == null) payload.store = false
   if (payload.prompt_cache_key == null) payload.prompt_cache_key = session
@@ -2905,6 +2923,7 @@ export {
   genProjectId,
   mkOfficialTools,
   hasEnoughOfficialTools,
+  mergeUserTools,
   isFreeModel,
   ensureChatFreeTier,
   ensureResponsesFreeTier,
