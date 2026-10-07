@@ -24,7 +24,7 @@ jobs:
     steps:
       - name: Health check
         run: |
-          : "${PROXY_URL:=https://zen-proxy-4vjk.onrender.com}"
+          : "${PROXY_URL:=https://zen-proxy-49xk.onrender.com}"
           echo "GET $PROXY_URL/health"
           body="$(curl -sS -m 60 "$PROXY_URL/health")"
           echo "$body"
@@ -32,7 +32,7 @@ jobs:
 
       - name: Ask a free model a question
         run: |
-          : "${PROXY_URL:=https://zen-proxy-4vjk.onrender.com}"
+          : "${PROXY_URL:=https://zen-proxy-49xk.onrender.com}"
           : "${MODEL:=mimo-v2.6-flash-free}"
           echo "Asking $MODEL via $PROXY_URL ..."
           resp="$(curl -sS -m 120 -X POST "$PROXY_URL/v1/chat/completions" \
