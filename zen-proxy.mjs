@@ -44,6 +44,7 @@ const DEFAULT_CONFIG = {
         "longcat-2.5-preview-free",
         "fledge-alpha-free",
         "ling-3.1-flash-free",
+        "exo-free",
       ]),
   ),
   modelAliases: JSON.parse(ENV.MODEL_ALIASES ?? "{}"),
