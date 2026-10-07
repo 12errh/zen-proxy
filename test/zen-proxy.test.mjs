@@ -2124,6 +2124,219 @@ describe("anthropic messages", () => {
   })
 })
 
+describe("stream hardening regressions", () => {
+  test("mid-stream upstream failure on OpenAI chat stream emits error chunk + [DONE]", async () => {
+    const m = zp.config.fallbackModels[0] // chat family by default config
+    const enc = new TextEncoder()
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        () =>
+          new Response(
+            new ReadableStream({
+              start(c) {
+                c.enqueue(enc.encode(`data: ${JSON.stringify({ model: m, choices: [{ delta: { content: "par" } }] })}\n\n`))
+                setTimeout(() => c.error(new Error("upstream blew up")), 10)
+              },
+            }),
+            { status: 200, headers: { "content-type": "text/event-stream" } },
+          ),
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: m, messages: [], stream: true }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    await res.done
+    assert.match(res.body, /"content":"par"/, "partial text flushed before failure")
+    const iErr = res.body.indexOf('"error"')
+    const iDone = res.body.indexOf("data: [DONE]")
+    assert.ok(iErr >= 0, "error chunk emitted (never a bare end)")
+    assert.match(res.body.slice(iErr), /upstream blew up/)
+    assert.ok(iDone > iErr, "[DONE] follows the error chunk")
+  })
+
+  test("mid-stream failure on responses→chat stream emits error chunk + [DONE]", async () => {
+    zp.saveConfig({ responsesModels: ["gpt-5*"], fallbackModels: ["gpt-5.5"], defaultModel: "gpt-5.5" })
+    const enc = new TextEncoder()
+    globalThis.fetch = routeFetch([
+      [
+        "/responses",
+        () =>
+          new Response(
+            new ReadableStream({
+              start(c) {
+                c.enqueue(
+                  enc.encode(`event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "hi" })}\n\n`),
+                )
+                setTimeout(() => c.error(new Error("responses blew up")), 10)
+              },
+            }),
+            { status: 200, headers: { "content-type": "text/event-stream" } },
+          ),
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: "gpt-5.5", messages: [], stream: true }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    await res.done
+    const iErr = res.body.indexOf('"error"')
+    const iDone = res.body.indexOf("data: [DONE]")
+    assert.ok(iErr >= 0, "error chunk emitted (never a bare end)")
+    assert.match(res.body.slice(iErr), /responses blew up/)
+    assert.ok(iDone > iErr, "[DONE] follows the error chunk")
+  })
+
+  test("collectChatSSE accumulates tool_calls deltas, reasoning and usage", async () => {
+    const sse = [
+      `data: ${JSON.stringify({ id: "chatcmpl-x", model: "m", choices: [{ delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "read", arguments: "" } }] } }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '{"path":' } }] } }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '"a"}' } }], reasoning_content: "let me read" } }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "tool_calls" }], usage: { prompt_tokens: 7, completion_tokens: 9, total_tokens: 16 } })}\n\n`,
+      "data: [DONE]\n\n",
+    ].join("")
+    const out = await zp.collectChatSSE(new Response(sse))
+    assert.equal(out.finish, "tool_calls")
+    assert.equal(out.tool_calls.length, 1)
+    assert.equal(out.tool_calls[0].id, "call_1")
+    assert.equal(out.tool_calls[0].function.name, "read")
+    assert.equal(out.tool_calls[0].function.arguments, '{"path":"a"}')
+    assert.equal(out.reasoning_content, "let me read")
+    assert.deepEqual(out.usage, { prompt_tokens: 7, completion_tokens: 9, total_tokens: 16 })
+  })
+
+  test("collectResponsesSSE keeps output items, usage and finish", async () => {
+    const sse = [
+      `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "hel" })}\n\n`,
+      `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "lo" })}\n\n`,
+      `event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", item: { type: "function_call", call_id: "call_9", name: "shell", arguments: "" } })}\n\n`,
+      `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8 } } })}\n\n`,
+    ].join("")
+    const out = await zp.collectResponsesSSE(new Response(sse))
+    assert.equal(out.text, "hello")
+    assert.ok(Array.isArray(out.output), "full output items returned")
+    assert.ok(out.output.some((i) => i?.type === "function_call" && i?.call_id === "call_9"), "streamed tool item survives")
+    assert.deepEqual(out.usage, { input_tokens: 5, output_tokens: 3, total_tokens: 8 })
+    assert.equal(out.finish, "stop")
+  })
+
+  test("chat stream sets x-zen fallback headers like the messages path", async () => {
+    const [m1, m2] = zp.config.fallbackModels
+    const err429 = () => jsonResponse({ error: { message: "FreeUsageLimitError" } }, 429)
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          const sent = JSON.parse(opts.body)
+          if (sent.model === m1) return err429()
+          assert.equal(sent.model, m2)
+          return sseResponse(["fallback chunk"], "upstream-model")
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: m1, messages: [], stream: true }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    await res.done
+    assert.equal(res.state.headers["x-zen-served-by"], m2)
+    assert.equal(res.state.headers["x-zen-fallback"], "true")
+    // SSE model is rewritten to the *requested* model; the fallback is
+    // visible via headers.
+    assert.match(res.body, new RegExp(`"model":"${m1.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`))
+    assert.ok(res.body.includes("data: [DONE]"))
+  })
+
+  test("responses request mints session headers once per attempt", async () => {
+    zp.saveConfig({ responsesModels: ["muse-spark-*"] })
+    const m = zp.config.fallbackModels.find((x) => x.startsWith("muse-spark-")) ?? "muse-spark-test-free"
+    zp.saveConfig({ fallbackModels: [m], defaultModel: m })
+    let sessionReads = 0
+    const headers = {}
+    Object.defineProperty(headers, "x-opencode-session", {
+      get() {
+        sessionReads++
+        return undefined
+      },
+      configurable: true,
+    })
+    let seenHeaders = null
+    let seenBody = null
+    globalThis.fetch = routeFetch([
+      [
+        "/responses",
+        (u, opts) => {
+          seenHeaders = opts.headers
+          seenBody = JSON.parse(opts.body)
+          return jsonResponse({ id: "resp_1", output: [{ type: "message", content: [{ type: "output_text", text: "yo" }] }], usage: { input_tokens: 1, output_tokens: 1 } })
+        },
+      ],
+    ])
+    const res = mockRes()
+    await zp.handleResponses(mockReq({ headers, _body: JSON.stringify({ model: m, input: "hi", stream: false }) }), res)
+    assert.equal(res.state.status, 200)
+    assert.equal(sessionReads, 1, "exactly one zenHeaders() call per attempt")
+    assert.equal(seenBody.prompt_cache_key, seenHeaders["x-opencode-session"], "cache key matches the sent session header")
+  })
+
+  test("MAX_BODY enforced on /api/test", async () => {
+    const res = mockRes()
+    await zp.router(mockReq({ method: "POST", url: "/api/test", _body: "x".repeat(zp.MAX_BODY + 1) }), res)
+    assert.equal(res.state.status, 413)
+  })
+
+  test("MAX_BODY enforced on /api/config PUT", async () => {
+    const res = mockRes()
+    await zp.router(mockReq({ method: "PUT", url: "/api/config", _body: "x".repeat(zp.MAX_BODY + 1) }), res)
+    assert.equal(res.state.status, 413)
+  })
+
+  test('rewriteSSE handles "data:" without a space', () => {
+    const out = zp.rewriteSSE('data:{"model":"a","choices":[]}', "target-model")
+    assert.ok(out.includes('"model":"target-model"'), out)
+    assert.ok(zp.rewriteSSE("data:[DONE]", "m").includes("data: [DONE]"))
+    assert.ok(zp.rewriteSSE("data: not json", "m").includes("data: not json"))
+  })
+
+  test("parseSSEBlock falls back to per-line parse for multi-data blocks", async () => {
+    // A block whose joined multi-data payload is not valid JSON must still
+    // yield its parseable line instead of being dropped.
+    const block = `event: response.output_text.delta\ndata: {"type":"x","delta":"a"}\ndata: {"type":"y"}`
+    const { raw } = zp.parseSSEBlock(block)
+    assert.doesNotThrow(() => JSON.parse(raw))
+  })
+
+  test("stream relays register client-close abort listeners", async () => {
+    const m = zp.config.fallbackModels[0]
+    const cases = [
+      ["relayStream", (q, s, u) => zp.relayStream(q, s, u, m)],
+      ["relayResponsesPassthrough", (q, s, u) => zp.relayResponsesPassthrough(q, s, u, m)],
+    ]
+    for (const [name, run] of cases) {
+      const reqListened = []
+      const req = mockReq({ on: (ev) => void reqListened.push(ev) })
+      const res = mockRes()
+      const resListened = []
+      const origOn = res.on.bind(res)
+      res.on = (ev, cb) => {
+        resListened.push(ev)
+        return origOn(ev, cb)
+      }
+      const upstream = sseResponse(["hi"], "upstream-model")
+      await run(req, res, upstream)
+      await res.done
+      assert.ok(reqListened.includes("close"), `${name}: req close listener registered`)
+      assert.ok(resListened.includes("close"), `${name}: res close listener registered`)
+    }
+  })
+
+  test("null upstream body ends the stream with an error chunk, not a throw", async () => {
+    const nullBody = { headers: new Headers({ "content-type": "text/event-stream" }), body: null }
+    const res = mockRes()
+    await zp.relayStream(mockReq(), res, nullBody, "m")
+    assert.match(res.body, /"error"/)
+    assert.ok(res.body.includes("data: [DONE]"))
+  })
+})
+
 describe("install.sh config preservation", () => {
   function runInstall(tmp, destPort) {
     const env = {

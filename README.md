@@ -144,7 +144,7 @@ curl -s http://127.0.0.1:8787/v1/chat/completions \
 - **Settings** — edit host, port, upstream URL, User-Agent, proxy key, BYOK key, timeout, fallback list, aliases; saved to `zen-proxy.json` and applied instantly
 - **Logs** — live terminal-style log tail
 
-Set `proxyKey` and the dashboard, `/api/*`, chat completions, and `/v1/models` all require it (`/health` stays open for uptime monitors).
+Set `proxyKey` and the dashboard, `/api/*`, chat completions, and `/v1/models` all require it (`/health` stays open for uptime monitors). With no `proxyKey` and a non-loopback `host`, the dashboard/API are unauthenticated (startup logs a warning) — set `PROXY_KEY` or bind `HOST=127.0.0.1`.
 
 ---
 

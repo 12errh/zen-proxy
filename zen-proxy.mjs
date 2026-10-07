@@ -207,7 +207,24 @@ function genProjectId() {
 // opencode's free tier requires every request to carry an `x-opencode-session`
 // header (upstream returns 400 `MissingSessionID` otherwise). Generic agents
 // never send one, so we mint stable per-client session IDs and inject them.
-const sessionPool = new Map()
+const sessionPool = new Map() // ip -> id (LRU: re-inserted on hit)
+const sessionPoolAt = new Map() // ip -> last-seen timestamp (for expiry)
+const MAX_SESSIONS = 1000
+const SESSION_TTL_MS = 24 * 3600_000
+function pruneSessionPool(now = Date.now()) {
+  // Drop expired entries first, then evict oldest until under the cap.
+  for (const [k, at] of sessionPoolAt) {
+    if (now - at > SESSION_TTL_MS) {
+      sessionPoolAt.delete(k)
+      sessionPool.delete(k)
+    }
+  }
+  while (sessionPool.size > MAX_SESSIONS) {
+    const oldest = sessionPool.keys().next().value
+    sessionPool.delete(oldest)
+    sessionPoolAt.delete(oldest)
+  }
+}
 function genSessionId() {
   return genOfficialId("ses")
 }
@@ -224,10 +241,23 @@ function sessionFor(req) {
     return { value: incoming.trim(), injected: false }
   }
   const key = req ? (ipOmit(clientIp(req)) ? "local" : clientIp(req)) : "server"
+  const now = Date.now()
   let id = sessionPool.get(key)
+  if (id && now - (sessionPoolAt.get(key) ?? 0) > SESSION_TTL_MS) {
+    sessionPool.delete(key)
+    sessionPoolAt.delete(key)
+    id = undefined
+  }
   if (!id || !isValidOfficialSession(id)) {
     id = genSessionId()
     sessionPool.set(key, id)
+    sessionPoolAt.set(key, now)
+    pruneSessionPool(now)
+  } else {
+    // LRU refresh: move to the newest position.
+    sessionPool.delete(key)
+    sessionPool.set(key, id)
+    sessionPoolAt.set(key, now)
   }
   return { value: id, injected: true }
 }
@@ -674,6 +704,30 @@ async function readBody(req) {
   return raw
 }
 
+// Same MAX_BODY enforcement the chat/messages/responses routes use, for admin
+// endpoints that read a JSON body (config POST/PUT, /api/test).
+async function readBodyLimited(req) {
+  let raw = ""
+  for await (const chunk of req) {
+    raw += chunk
+    if (raw.length > MAX_BODY) {
+      // Drain nothing further; caller turns TOO_LARGE into a 413.
+      const err = new Error("request body too large")
+      err.code = "BODY_TOO_LARGE"
+      throw err
+    }
+  }
+  return raw
+}
+
+function bodyTooLarge(res, err) {
+  if (err?.code === "BODY_TOO_LARGE") {
+    json(res, 413, { error: { type: "invalid_request_error", message: "request body too large" } })
+    return true
+  }
+  return false
+}
+
 function json(res, status, data) {
   res.writeHead(status, { "content-type": "application/json" })
   res.end(JSON.stringify(data))
@@ -833,12 +887,30 @@ function chatToAnthropic(chat, requested, fallbackInputTokens = 0) {
 }
 
 // Parse one SSE block into its event name and data payload.
+// Multi-line `data:` blocks are tried as a joined JSON payload first; when the
+// joined text does not parse (e.g. NDJSON-style stacked objects), fall back to
+// the first individually-parseable line so the block is not silently dropped.
 function parseSSEBlock(block) {
   let event = ""
   const datas = []
   for (const line of block.split("\n")) {
     if (line.startsWith("event:")) event = line.slice(6).trim()
-    else if (line.startsWith("data:")) datas.push(line.slice(5).trimStart())
+    else if (/^data:/.test(line)) datas.push(line.slice(5).trimStart())
+  }
+  if (datas.length > 1) {
+    const joined = datas.join("\n")
+    try {
+      JSON.parse(joined)
+      return { event, raw: joined }
+    } catch {
+      for (const d of datas) {
+        try {
+          JSON.parse(d)
+          return { event, raw: d }
+        } catch {}
+      }
+      return { event, raw: joined }
+    }
   }
   return { event, raw: datas.join("\n") }
 }
@@ -871,20 +943,83 @@ function anthropicStreamStart(res, requested, inputTokens = 0) {
   return { send }
 }
 
-// Wire client abort + proxy timeout to an upstream SSE reader (mirrors
-// relayStream). Returns a cleanup function.
-function streamAbort(req, reader) {
+// Wire client abort + proxy timeout to an upstream SSE reader.
+// node:http IncomingMessages expose no `signal`, so client disconnects only
+// surface as "close" on req/res — listen for those explicitly and cancel the
+// upstream reader + abort the controller on every stream relay pump.
+// Returns a cleanup function.
+function streamAbort(req, res, reader) {
   const ctrl = new AbortController()
-  const onAbort = () => ctrl.abort()
+  const cancelUpstream = () => {
+    try {
+      ctrl.abort()
+    } catch {}
+    try {
+      const p = reader?.cancel?.()
+      if (p?.catch) p.catch(() => {})
+    } catch {}
+  }
+  const onAbort = () => cancelUpstream()
   if (req.signal?.addEventListener) req.signal.addEventListener("abort", onAbort)
+  // Client disconnect (node:http has no req.signal): stop pulling upstream.
+  const onClose = () => {
+    if (!res?.writableEnded) cancelUpstream()
+  }
+  if (typeof req.on === "function") {
+    try {
+      req.on("close", onClose)
+    } catch {}
+  }
+  if (typeof res?.on === "function") {
+    try {
+      res.on("close", onClose)
+    } catch {}
+  }
   const timer = setTimeout(() => ctrl.abort(), config.timeoutMs)
   ctrl.signal.addEventListener("abort", () => {
-    reader.cancel().catch(() => {})
+    try {
+      const p = reader?.cancel?.()
+      if (p?.catch) p.catch(() => {})
+    } catch {}
   })
   return () => {
     clearTimeout(timer)
     if (req.signal?.removeEventListener) req.signal.removeEventListener("abort", onAbort)
+    if (typeof req.off === "function") {
+      try {
+        req.off("close", onClose)
+      } catch {}
+    }
+    if (typeof res?.off === "function") {
+      try {
+        res.off("close", onClose)
+      } catch {}
+    }
   }
+}
+
+// Guarded upstream reader acquisition: upstreamRes.body may be null (e.g. a
+// 204/empty body) and getReader() then throws synchronously. Returns null so
+// callers can emit a mid-stream error chunk instead of crashing.
+function safeGetReader(upstreamRes) {
+  try {
+    const reader = upstreamRes?.body?.getReader?.()
+    return reader ?? null
+  } catch {
+    return null
+  }
+}
+
+// Mid-stream failure for OpenAI chat-completions SSE relays: emit an error
+// chunk plus data:[DONE] (never a bare res.end()) so clients see the failure.
+function writeChatStreamError(res, message) {
+  try {
+    res.write(`data: ${JSON.stringify({ error: { type: "upstream_error", message: String(message ?? "upstream stream failed") } })}\n\n`)
+    res.write("data: [DONE]\n\n")
+  } catch {}
+  try {
+    res.end()
+  } catch {}
 }
 
 // Translate a chat-family upstream SSE stream to Anthropic events
@@ -892,10 +1027,18 @@ function streamAbort(req, reader) {
 // never accumulated.
 function relayMessagesChatStream(req, res, upstreamRes, requested, inputFallback = 0) {
   const { send } = anthropicStreamStart(res, requested, inputFallback)
-  const reader = upstreamRes.body.getReader()
+  const reader = safeGetReader(upstreamRes)
+  if (!reader) {
+    try {
+      send("error", { type: "error", error: { type: "api_error", message: "empty upstream body" } })
+      send("message_stop", { type: "message_stop" })
+    } catch {}
+    res.end()
+    return Promise.resolve()
+  }
   const decoder = new TextDecoder()
   let buffer = ""
-  const cleanup = streamAbort(req, reader)
+  const cleanup = streamAbort(req, res, reader)
   const toolBlocks = new Map() // upstream tool_calls[].index -> anthropic block index
   const openBlocks = new Set([0])
   let nextIndex = 1
@@ -1001,10 +1144,18 @@ function relayMessagesChatStream(req, res, upstreamRes, requested, inputFallback
 // responsesEventToDeltas; reasoning is emitted as text, never thinking.
 function relayMessagesResponsesStream(req, res, upstreamRes, requested, inputFallback = 0) {
   const { send } = anthropicStreamStart(res, requested, inputFallback)
-  const reader = upstreamRes.body.getReader()
+  const reader = safeGetReader(upstreamRes)
+  if (!reader) {
+    try {
+      send("error", { type: "error", error: { type: "api_error", message: "empty upstream body" } })
+      send("message_stop", { type: "message_stop" })
+    } catch {}
+    res.end()
+    return Promise.resolve()
+  }
   const decoder = new TextDecoder()
   let buffer = ""
-  const cleanup = streamAbort(req, reader)
+  const cleanup = streamAbort(req, res, reader)
   const state = { tools: [], usage: null, finish: "stop" }
   const toolBlocks = [] // chat tool ordinal -> anthropic block index
   const openBlocks = new Set([0])
@@ -1186,9 +1337,12 @@ async function collectChatSSE(upstreamRes) {
     }
   } catch {}
   let content = ""
+  let reasoning_content = ""
   let finish = "stop"
   let model = ""
   let id = `chatcmpl-${Date.now().toString(36)}`
+  const toolCalls = new Map() // index -> {id,type,function:{name,arguments}}
+  let usage
   for (const line of text.split("\n")) {
     const t = line.trim()
     if (!t.startsWith("data:")) continue
@@ -1200,14 +1354,38 @@ async function collectChatSSE(upstreamRes) {
       if (typeof j.model === "string") model = j.model
       const fr = j.choices?.[0]?.finish_reason
       if (typeof fr === "string" && fr) finish = fr
+      if (j.usage && typeof j.usage === "object") usage = j.usage
       const delta = j.choices?.[0]?.delta
       if (delta && typeof delta.content === "string") content += delta.content
+      if (delta && typeof delta.reasoning_content === "string") reasoning_content += delta.reasoning_content
+      // Accumulate streamed tool_calls deltas by index (arguments arrive split
+      // across chunks); id/type/name come on the first chunk only.
+      for (const tc of delta?.tool_calls ?? []) {
+        const index = Number.isFinite(tc?.index) ? tc.index : 0
+        let cur = toolCalls.get(index)
+        if (!cur) {
+          cur = { id: tc?.id, type: tc?.type ?? "function", function: { name: tc?.function?.name ?? "unknown", arguments: "" } }
+          toolCalls.set(index, cur)
+        }
+        if (tc?.id && !cur.id) cur.id = tc.id
+        if (tc?.function?.name && (!cur.function.name || cur.function.name === "unknown")) cur.function.name = tc.function.name
+        if (typeof tc?.function?.arguments === "string") cur.function.arguments += tc.function.arguments
+      }
       // some providers put final content in message instead of delta
       const msg = j.choices?.[0]?.message
       if (msg && typeof msg.content === "string" && !content) content = msg.content
+      if (msg && typeof msg.reasoning_content === "string" && !reasoning_content) reasoning_content = msg.reasoning_content
+      if (Array.isArray(msg?.tool_calls) && !toolCalls.size) {
+        msg.tool_calls.forEach((tc, n) => toolCalls.set(n, tc))
+      }
     } catch {}
   }
-  return { content, model, id, finish, tool_calls: undefined, usage: undefined }
+  const ordered = [...toolCalls.entries()].sort((a, b) => a[0] - b[0]).map(([, tc], n) => ({
+    id: tc?.id ?? `call_${n}`,
+    type: "function",
+    function: { name: tc?.function?.name ?? tc?.name ?? "unknown", arguments: tc?.function?.arguments ?? tc?.arguments ?? "" },
+  }))
+  return { content, model, id, finish, tool_calls: ordered.length ? ordered : undefined, usage, reasoning_content: reasoning_content || undefined }
 }
 
 async function collectResponsesSSE(upstreamRes) {
@@ -1216,7 +1394,9 @@ async function collectResponsesSSE(upstreamRes) {
   try {
     const j = JSON.parse(text)
     if (j && typeof j === "object") {
-      if (typeof j.output_text === "string" && j.output_text) return j.output_text
+      if (typeof j.output_text === "string" && j.output_text) {
+        return { text: j.output_text, output: j.output ?? [], usage: j.usage, finish: j.status === "incomplete" ? "length" : "stop" }
+      }
       const out = Array.isArray(j.output) ? j.output : []
       const parts = []
       for (const item of out) {
@@ -1224,11 +1404,19 @@ async function collectResponsesSSE(upstreamRes) {
           if (p?.type === "output_text" && typeof p.text === "string") parts.push(p.text)
         }
       }
-      if (parts.length) return parts.sort((a, b) => b.length - a.length)[0]
+      if (parts.length) {
+        return { text: parts.sort((a, b) => b.length - a.length)[0], output: out, usage: j.usage, finish: j.status === "incomplete" ? "length" : "stop" }
+      }
+      if (out.length || j.usage) return { text: "", output: out, usage: j.usage, finish: j.status === "incomplete" ? "length" : "stop" }
     }
   } catch {}
   const deltas = []
   const completed = []
+  const outputItems = []
+  const toolArgs = new Map() // item/call id -> accumulated arguments
+  let usage
+  let finish = "stop"
+  let respOutput = null
   for (const chunk of text.split("\n\n")) {
     const c = chunk.trim()
     if (!c || !c.includes("data:")) continue
@@ -1237,8 +1425,24 @@ async function collectResponsesSSE(upstreamRes) {
       if (!t.startsWith("data:")) continue
       try {
         const j = JSON.parse(t.slice(5).trim())
+        if (j?.response?.usage && typeof j.response.usage === "object") usage = j.response.usage
+        else if (j?.usage && typeof j.usage === "object" && j?.type !== "response.output_text.delta") usage = j.usage
+        if (j?.type === "response.completed" || j?.type === "response.incomplete") {
+          finish = j.type === "response.incomplete" ? "length" : finish
+          const ru = j?.response?.usage
+          if (ru && typeof ru === "object") usage = ru
+          if (Array.isArray(j?.response?.output)) respOutput = j.response.output
+          continue
+        }
         if (typeof j.delta === "string") deltas.push(j.delta)
         else if (j.delta && typeof j.delta.text === "string") deltas.push(j.delta.text)
+        // Preserve streamed function_call items + argument deltas so tool
+        // loops survive destreaming (previously dropped).
+        if (j?.item?.type === "function_call") {
+          outputItems.push({ ...j.item })
+        } else if (typeof j?.delta === "string" && (j?.item_id || j?.call_id)) {
+          toolArgs.set(j.item_id ?? j.call_id, (toolArgs.get(j.item_id ?? j.call_id) ?? "") + j.delta)
+        }
         const out = j.response?.output
         if (Array.isArray(out)) {
           for (const item of out) {
@@ -1250,8 +1454,21 @@ async function collectResponsesSSE(upstreamRes) {
       } catch {}
     }
   }
+  for (const item of outputItems) {
+    const key = item.call_id ?? item.id
+    if (key && toolArgs.has(key) && typeof item.arguments === "string") {
+      item.arguments += toolArgs.get(key)
+      toolArgs.delete(key)
+    }
+  }
+  for (const [key, args] of toolArgs) {
+    outputItems.push({ type: "function_call", call_id: key, name: "unknown", arguments: args })
+  }
   const full = completed.length ? completed.sort((a, b) => b.length - a.length)[0] : deltas.join("")
-  return full
+  if (respOutput) {
+    return { text: full, output: respOutput, usage, finish }
+  }
+  return { text: full, output: outputItems, usage, finish }
 }
 
 async function handleChat(req, res) {
@@ -1305,11 +1522,16 @@ async function handleChat(req, res) {
       return json(res, 200, content)
     },
     onStream(upstreamRes, model, format) {
-      if (format === "responses") {
-        relayResponsesStream(req, res, upstreamRes, requested)
-      } else {
-        relayStream(req, res, upstreamRes, requested)
+      if (model !== requested) {
+        // Make the fallback visible to streaming clients too (messages path
+        // already does this; chat omitted it). Must precede relay writeHead.
+        res.setHeader?.("x-zen-served-by", model)
+        res.setHeader?.("x-zen-fallback", "true")
       }
+      if (format === "responses") {
+        return relayResponsesStream(req, res, upstreamRes, requested)
+      }
+      return relayStream(req, res, upstreamRes, requested)
     },
     onError(status, errBody, retryAfter) {
       const headers = retryAfter > 0 ? { "retry-after": String(retryAfter) } : {}
@@ -1383,18 +1605,24 @@ async function runChatLoop(req, res, { body, requested, candidates, auth, start,
         // collect SSE and synthesize a non-stream body for onJson.
         try {
           if (format === "responses") {
-            const full = await collectResponsesSSE(upstreamRes)
+            const collected = await collectResponsesSSE(upstreamRes)
+            const text = typeof collected === "string" ? collected : collected.text
+            const outItems = typeof collected === "string" ? [] : (collected.output ?? [])
             const out = {
               id: `resp_${Date.now().toString(36)}`,
-              output: [{
-                type: "message",
-                role: "assistant",
-                content: [{ type: "output_text", text: full }],
-              }],
+              ...(typeof collected !== "string" && collected.usage ? { usage: collected.usage } : {}),
+              ...(typeof collected !== "string" && collected.finish ? { status: collected.finish === "length" ? "incomplete" : "completed" } : {}),
+              output: outItems.length
+                ? outItems
+                : [{
+                  type: "message",
+                  role: "assistant",
+                  content: [{ type: "output_text", text }],
+                }],
             }
             return onJson(out, model, format)
           }
-          const { content, tool_calls: tcalls, finish, model: upModel, id, usage } = await collectChatSSE(upstreamRes)
+          const { content, tool_calls: tcalls, finish, model: upModel, id, usage, reasoning_content: rcontent } = await collectChatSSE(upstreamRes)
           const out = {
             id: id || `chatcmpl-${Date.now().toString(36)}`,
             object: "chat.completion",
@@ -1402,7 +1630,7 @@ async function runChatLoop(req, res, { body, requested, candidates, auth, start,
             model: upModel || model,
             choices: [{
               index: 0,
-              message: { role: "assistant", content, ...(tcalls?.length ? { tool_calls: tcalls } : {}) },
+              message: { role: "assistant", content, ...(rcontent ? { reasoning_content: rcontent } : {}), ...(tcalls?.length ? { tool_calls: tcalls } : {}) },
               finish_reason: finish ?? "stop",
             }],
             ...(usage ? { usage } : {}),
@@ -1485,21 +1713,24 @@ async function handleResponses(req, res) {
   let used = requested
   for (const model of candidates) {
     used = model
+    // Single zenHeaders() call per attempt: the session doubles as the
+    // prompt_cache_key, so minting twice would mismatch header vs payload.
+    const { headers: upHeaders, session: upSession } = zenHeaders(req, auth)
     let payload = { ...body, model }
     if (isFreeModel(model)) {
       // Responses free also needs tools + stream; reuse session for cache key.
-      const { session: sess } = zenHeaders(req, auth)
-      const fixed = ensureResponsesFreeTier(payload, sess)
+      const fixed = ensureResponsesFreeTier(payload, upSession)
       payload = fixed.payload
     }
-    const { headers: upHeaders } = zenHeaders(req, auth)
     let upstreamRes
     try {
       upstreamRes = await fetch(`${config.upstream}/responses`, {
         method: "POST",
         headers: upHeaders,
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(config.timeoutMs),
+        // Abort-aware like the chat loop: honor a still-armed client signal
+        // (node:http has none, so this is usually the timeout), else timeout.
+        signal: clientStream && req.signal && !req.signal.aborted ? req.signal : AbortSignal.timeout(config.timeoutMs),
       })
     } catch (err) {
       lastErr = { error: { type: "upstream_error", message: err.message } }
@@ -1509,21 +1740,28 @@ async function handleResponses(req, res) {
 
     if (upstreamRes.ok) {
       if (clientStream) {
-        relayResponsesPassthrough(req, res, upstreamRes, requested)
-        res.on("finish", () => recordReq(req, `${requested}→${model}`, Date.now() - start, 200))
-        return
+        // Return the pump promise (never fire-and-forget) so the caller
+        // awaits it and rejections are handled, like the chat/messages relays.
+        const streamed = relayResponsesPassthrough(req, res, upstreamRes, requested)
+        res.on("finish", () => { recordReq(req, `${requested}→${model}`, Date.now() - start, 200); recordObserved(model, true) })
+        return streamed
       }
       try {
-        const full = await collectResponsesSSE(upstreamRes)
+        const collected = await collectResponsesSSE(upstreamRes)
+        const text = typeof collected === "string" ? collected : collected.text
+        const outItems = typeof collected === "string" ? [] : (collected.output ?? [])
         const out = {
           id: `resp_${Date.now().toString(36)}`,
           object: "response",
           model: requested,
-          output: [{
-            type: "message",
-            role: "assistant",
-            content: [{ type: "output_text", text: full }],
-          }],
+          ...(typeof collected !== "string" && collected.usage ? { usage: collected.usage } : {}),
+          output: outItems.length
+            ? outItems
+            : [{
+              type: "message",
+              role: "assistant",
+              content: [{ type: "output_text", text }],
+            }],
         }
         recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
         return json(res, 200, out)
@@ -1559,6 +1797,28 @@ async function handleResponses(req, res) {
   )
 }
 
+function rewriteResponsesBlock(block, requested) {
+  // Rewrite embedded model fields inside Responses SSE data payloads.
+  const lines = block.split("\n")
+  const out = []
+  for (const line of lines) {
+    if (/^data:/.test(line)) {
+      const payload = line.slice(5).trimStart()
+      try {
+        const j = JSON.parse(payload)
+        if (j?.response?.model) j.response.model = requested
+        if (j?.model) j.model = requested
+        out.push(`data: ${JSON.stringify(j)}`)
+      } catch {
+        out.push(line)
+      }
+    } else {
+      out.push(line)
+    }
+  }
+  return out.join("\n") + "\n\n"
+}
+
 function relayResponsesPassthrough(req, res, upstreamRes, requested) {
   // Responses SSE is `event: ...\ndata: {...}\n\n`; rewrite embedded model fields.
   res.writeHead(200, {
@@ -1566,26 +1826,26 @@ function relayResponsesPassthrough(req, res, upstreamRes, requested) {
     "cache-control": "no-cache",
     connection: "keep-alive",
   })
-  const reader = upstreamRes.body.getReader()
+  const reader = safeGetReader(upstreamRes)
+  if (!reader) {
+    try {
+      res.write(`event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: "empty upstream body" } })}\n\n`)
+    } catch {}
+    res.end()
+    return Promise.resolve()
+  }
   const decoder = new TextDecoder()
   let buffer = ""
-  const ctrl = new AbortController()
-  const onAbort = () => ctrl.abort()
-  if (req.signal?.addEventListener) req.signal.addEventListener("abort", onAbort)
-  const timer = setTimeout(() => ctrl.abort(), config.timeoutMs)
-  ctrl.signal.addEventListener("abort", () => {
-    reader.cancel().catch(() => {})
-  })
-  const cleanup = () => {
-    clearTimeout(timer)
-    if (req.signal?.removeEventListener) req.signal.removeEventListener("abort", onAbort)
-  }
+  const cleanup = streamAbort(req, res, reader)
   const pump = async () => {
     try {
       for (;;) {
         const { done, value } = await reader.read()
         if (done) {
-          if (buffer.trim()) res.write(buffer)
+          buffer += decoder.decode()
+          // Run the trailing partial block through the same rewrite path so
+          // model fields stay consistent (never flush raw upstream text).
+          if (buffer.trim()) res.write(rewriteResponsesBlock(buffer, requested))
           res.end()
           return
         }
@@ -1595,28 +1855,13 @@ function relayResponsesPassthrough(req, res, upstreamRes, requested) {
           const block = buffer.slice(0, idx)
           buffer = buffer.slice(idx + 2)
           if (!block.trim()) continue
-          // rewrite model inside data payloads
-          const lines = block.split("\n")
-          const out = []
-          for (const line of lines) {
-            if (line.startsWith("data: ")) {
-              const payload = line.slice(6)
-              try {
-                const j = JSON.parse(payload)
-                if (j?.response?.model) j.response.model = requested
-                if (j?.model) j.model = requested
-                out.push(`data: ${JSON.stringify(j)}`)
-              } catch {
-                out.push(line)
-              }
-            } else {
-              out.push(line)
-            }
-          }
-          res.write(out.join("\n") + "\n\n")
+          res.write(rewriteResponsesBlock(block, requested))
         }
       }
-    } catch {
+    } catch (err) {
+      try {
+        res.write(`event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: err?.message ?? "upstream stream failed" } })}\n\n`)
+      } catch {}
       res.end()
     } finally {
       cleanup()
@@ -1718,26 +1963,26 @@ function relayStream(req, res, upstreamRes, requested) {
     "cache-control": "no-cache",
     connection: "keep-alive",
   })
-  const reader = upstreamRes.body.getReader()
+  const reader = safeGetReader(upstreamRes)
+  if (!reader) {
+    writeChatStreamError(res, "empty upstream body")
+    return Promise.resolve()
+  }
   const decoder = new TextDecoder()
   let buffer = ""
-  const ctrl = new AbortController()
-  const onAbort = () => ctrl.abort()
-  if (req.signal?.addEventListener) req.signal.addEventListener("abort", onAbort)
-  const timer = setTimeout(() => ctrl.abort(), config.timeoutMs)
-  ctrl.signal.addEventListener("abort", () => {
-    reader.cancel().catch(() => {})
-  })
-  const cleanup = () => {
-    clearTimeout(timer)
-    if (req.signal?.removeEventListener) req.signal.removeEventListener("abort", onAbort)
-  }
+  const cleanup = streamAbort(req, res, reader)
   const pump = async () => {
     try {
       for (;;) {
         const { done, value } = await reader.read()
         if (done) {
-          if (buffer.trim()) res.write(buffer)
+          buffer += decoder.decode()
+          // Run the trailing partial block through the same rewrite/framing
+          // path (never flush raw upstream text).
+          if (buffer.trim()) {
+            const out = rewriteSSE(buffer, requested)
+            if (out) res.write(out)
+          }
           res.end()
           return
         }
@@ -1750,8 +1995,8 @@ function relayStream(req, res, upstreamRes, requested) {
           if (out) res.write(out)
         }
       }
-    } catch {
-      res.end()
+    } catch (err) {
+      writeChatStreamError(res, err?.message ?? "upstream stream failed")
     } finally {
       cleanup()
     }
@@ -1852,24 +2097,19 @@ function relayResponsesStream(req, res, upstreamRes, requested) {
   const created = Math.floor(Date.now() / 1000)
   const base = { id, object: "chat.completion.chunk", created, model: requested }
   const state = { tools: [], usage: null, finish: "stop" }
-  const reader = upstreamRes.body.getReader()
+  const reader = safeGetReader(upstreamRes)
+  if (!reader) {
+    writeChatStreamError(res, "empty upstream body")
+    return Promise.resolve()
+  }
   const decoder = new TextDecoder()
   let buffer = ""
-  const ctrl = new AbortController()
-  const onAbort = () => ctrl.abort()
-  if (req.signal?.addEventListener) req.signal.addEventListener("abort", onAbort)
-  const timer = setTimeout(() => ctrl.abort(), config.timeoutMs)
-  ctrl.signal.addEventListener("abort", () => {
-    reader.cancel().catch(() => {})
-  })
-  const cleanup = () => {
-    clearTimeout(timer)
-    if (req.signal?.removeEventListener) req.signal.removeEventListener("abort", onAbort)
-  }
+  const cleanup = streamAbort(req, res, reader)
   const send = (choices, extra) =>
     res.write(`data: ${JSON.stringify({ ...base, choices, ...(extra ?? {}) })}\n\n`)
 
   const pump = async () => {
+    let failed = null
     try {
       for (;;) {
         const { done, value } = await reader.read()
@@ -1884,7 +2124,7 @@ function relayResponsesStream(req, res, upstreamRes, requested) {
           let raw = ""
           for (const line of block.split("\n")) {
             if (line.startsWith("event:")) event = line.slice(6).trim()
-            else if (line.startsWith("data:")) raw = line.slice(5).trim()
+            else if (/^data:/.test(line)) raw = line.slice(5).trim()
           }
           if (!raw || raw === "[DONE]") continue
           let data
@@ -1898,15 +2138,26 @@ function relayResponsesStream(req, res, upstreamRes, requested) {
             state.finish = data.type === "response.incomplete" ? "length" : state.tools.length ? "tool_calls" : "stop"
             continue
           }
-          if (data?.type === "error" || data?.error) continue
+          if (data?.type === "error" || data?.error) {
+            const message = data?.error?.message ?? data?.message ?? "upstream stream failed"
+            failed = String(message)
+            try {
+              send([{ index: 0, delta: {}, finish_reason: "error" }])
+              res.write(`data: ${JSON.stringify({ error: { type: "upstream_error", message: failed } })}\n\n`)
+              res.write("data: [DONE]\n\n")
+            } catch {}
+            res.end()
+            return
+          }
           for (const delta of responsesEventToDeltas(event, data, state)) send([{ index: 0, delta, finish_reason: null }])
         }
       }
+      if (failed) return
       send([{ index: 0, delta: {}, finish_reason: state.finish }], state.usage ? { usage: usageToChat(state.usage) } : {})
       res.write("data: [DONE]\n\n")
       res.end()
-    } catch {
-      res.end()
+    } catch (err) {
+      if (!failed) writeChatStreamError(res, err?.message ?? "upstream stream failed")
     } finally {
       cleanup()
     }
@@ -1919,10 +2170,12 @@ function rewriteSSE(block, requested) {
   const lines = block.split("\n")
   const out = []
   for (const line of lines) {
-    if (line.startsWith("data: ")) {
-      const payload = line.slice(6)
+    // Match "data:" with or without the trailing space (some upstreams emit
+    // bare "data:{...}"); normalize to "data: {...}" on rewrite.
+    if (/^data:/.test(line)) {
+      const payload = line.slice(5).trimStart()
       if (payload === "[DONE]") {
-        out.push(line)
+        out.push("data: [DONE]")
         continue
       }
       try {
@@ -2212,6 +2465,22 @@ function adminAuth(req, res) {
   return true
 }
 
+// Loopback check for the empty-proxyKey startup warning (conservative: only
+// used to warn, never to change auth behavior).
+function isLoopbackHost(h) {
+  const v = String(h ?? "").trim().toLowerCase().replace(/^\[|\]$/g, "")
+  return v === "localhost" || v === "::1" || v === "127.0.0.1" || /^\[?::ffff:127\./.test(v) || /^127\./.test(v)
+}
+
+let _openAdminWarned = false
+function warnIfOpenAdmin() {
+  if (_openAdminWarned) return
+  _openAdminWarned = true
+  if (!config.proxyKey && !isLoopbackHost(config.host)) {
+    log("warning: proxyKey is empty and host is not loopback — dashboard and admin API are unauthenticated; set PROXY_KEY or bind HOST=127.0.0.1")
+  }
+}
+
 async function handleApiConfig(req, res) {
   if (!adminAuth(req, res)) return
   if (req.method === "GET") return json(res, 200, { config: sanitize(config) })
@@ -2219,7 +2488,7 @@ async function handleApiConfig(req, res) {
     // Reset the model list back to the shipped defaults (useful if the list was
     // trimmed by an older build or edited by hand). User keys are untouched.
     try {
-      const body = await readBody(req)
+      const body = await readBodyLimited(req)
       const parsed = body ? JSON.parse(body) : {}
       if (parsed.fallbackModels !== true) return json(res, 400, { error: "unsupported action" })
       const shipped = JSON.parse(JSON.stringify(DEFAULT_CONFIG.fallbackModels))
@@ -2230,12 +2499,13 @@ async function handleApiConfig(req, res) {
       log(`model list restored to defaults (${merged.length} models)`)
       return json(res, 200, { ok: true, config: sanitize(config) })
     } catch (err) {
+      if (bodyTooLarge(res, err)) return
       return json(res, 400, { error: err.message })
     }
   }
   if (req.method === "PUT") {
     try {
-      const body = JSON.parse(await readBody(req))
+      const body = JSON.parse(await readBodyLimited(req))
       if (typeof body !== "object" || body === null || Array.isArray(body)) throw new Error("body must be a JSON object")
       const cleaned = {}
       for (const key of Object.keys(DEFAULT_CONFIG)) {
@@ -2273,6 +2543,7 @@ async function handleApiConfig(req, res) {
       log("config updated via UI")
       return json(res, 200, { config: sanitize(config) })
     } catch (err) {
+      if (bodyTooLarge(res, err)) return
       return json(res, 400, { error: err.message })
     }
   }
@@ -2336,7 +2607,7 @@ function parseKey(key) {
 async function handleTest(req, res) {
   if (!adminAuth(req, res)) return
   try {
-    const body = JSON.parse(await readBody(req))
+    const body = JSON.parse(await readBodyLimited(req))
     const model = String(body.model ?? effectiveDefault())
     const start = Date.now()
     // Explicit key override lets the dashboard "test my key" flow verify a typed
@@ -2422,6 +2693,9 @@ async function handleTest(req, res) {
       detail: gated ? "free tier accepts real agent requests only — this probe can't verify it" : detail,
     })
   } catch (err) {
+    if (err?.code === "BODY_TOO_LARGE") {
+      return json(res, 413, { ok: false, error: err.message })
+    }
     json(res, 400, { ok: false, error: err.message })
   }
 }
@@ -2553,6 +2827,7 @@ if (isMain) {
     log(`zen-proxy listening on http://${config.host}:${config.port}`)
     log(`upstream ${config.upstream}  UA ${config.ua}  default ${config.defaultModel || "(auto)"}`)
     log(`config file: ${CONFIG_PATH}  UI: /`)
+    warnIfOpenAdmin()
     if (!fs.existsSync(CONFIG_PATH)) {
       try {
         fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2))
@@ -2635,6 +2910,18 @@ export {
   ensureResponsesFreeTier,
   collectChatSSE,
   collectResponsesSSE,
+  parseSSEBlock,
+  streamAbort,
+  safeGetReader,
+  writeChatStreamError,
+  rewriteResponsesBlock,
+  readBodyLimited,
+  isLoopbackHost,
+  warnIfOpenAdmin,
+  sessionPool,
+  pruneSessionPool,
+  MAX_SESSIONS,
+  SESSION_TTL_MS,
   loadLocalZenKey,
   resolveZenKey,
   MAX_BODY,
