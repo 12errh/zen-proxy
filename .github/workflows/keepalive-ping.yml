@@ -1,0 +1,43 @@
+name: keepalive-ping
+
+# Keeps the Render free instance awake and proves the free tier actually
+# answers — a warm HTTP 200 with dead models would otherwise look "healthy".
+# NOTE: GitHub runs scheduled workflows at most every 5 minutes, so */5 is
+# the fastest possible cadence here (plenty: Render sleeps after ~15 min idle).
+# Override the target without editing: repo Settings → Secrets and variables →
+# Actions → Variables → ZEN_PROXY_URL / ZEN_KEEPALIVE_MODEL. Manual runs welcome
+# from the Actions tab (workflow_dispatch).
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      PROXY_URL: ${{ vars.ZEN_PROXY_URL }}
+      MODEL: ${{ vars.ZEN_KEEPALIVE_MODEL }}
+    steps:
+      - name: Health check
+        run: |
+          : "${PROXY_URL:=https://zen-proxy-4vjk.onrender.com}"
+          echo "GET $PROXY_URL/health"
+          body="$(curl -sS -m 60 "$PROXY_URL/health")"
+          echo "$body"
+          echo "$body" | grep -q '"ok":true' || { echo "::error::HEALTH CHECK FAILED"; exit 1; }
+
+      - name: Ask a free model a question
+        run: |
+          : "${PROXY_URL:=https://zen-proxy-4vjk.onrender.com}"
+          : "${MODEL:=mimo-v2.6-flash-free}"
+          echo "Asking $MODEL via $PROXY_URL ..."
+          resp="$(curl -sS -m 120 -X POST "$PROXY_URL/v1/chat/completions" \
+            -H 'Content-Type: application/json' \
+            -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: keepalive-ok\"}],\"max_tokens\":20}")"
+          echo "$resp" | head -c 1000; echo
+          echo "$resp" | grep -q 'keepalive-ok' || { echo "::error::MODEL REPLY CHECK FAILED"; exit 1; }
+          echo "Model answered correctly ✅"
