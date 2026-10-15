@@ -1,7 +1,8 @@
 {
-  "updatedAt": "2026-10-15T17:06:48.841Z",
+  "updatedAt": "2000-01-01T00:00:00.000Z",
   "upstream": "https://opencode.ai/inference/v1",
   "models": [
+    "ghost-model-that-does-not-exist-free",
     "space-bunny-free",
     "mimo-v2.6-flash-free",
     "big-pickle",
@@ -11,7 +12,6 @@
     "longcat-2.5-preview-free",
     "step-5-preview-free",
     "cat-jam-free",
-    "deepseek-v4.1-flash-free",
-    "nemotron-3.5-super-vl-free"
+    "deepseek-v4.1-flash-free"
   ]
 }
