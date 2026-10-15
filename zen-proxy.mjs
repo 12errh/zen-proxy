@@ -53,6 +53,7 @@ const DEFAULT_CONFIG = {
         "step-5-preview-free",
         "cat-jam-free",
         "deepseek-v4.1-flash-free",
+        "nemotron-3.5-super-vl-free",
       ]),
   ),
   modelAliases: JSON.parse(ENV.MODEL_ALIASES ?? "{}"),
