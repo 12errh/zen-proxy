@@ -3,7 +3,7 @@
 </p>
 
 <p align="center"><b>zen-proxy</b></p>
-<p align="center">Use OpenCode Zen's free models from any AI coding agent — no account, no API key.</p>
+<p align="center">Use OpenCode Zen's free models from any AI coding agent — <b>OpenAI&nbsp;and&nbsp;Anthropic&nbsp;compatible</b> — no account, no API key.</p>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-ccf73a?style=flat-square&labelColor=1a1612" alt="MIT License"></a>
@@ -23,6 +23,11 @@ OpenCode publishes free AI models (`space-bunny-free`, `mimo-v2.6-flash-free`, `
 ```
 
 **zen-proxy** is a single-file local server that sits in front of that gateway and speaks for your agent. Point Cline, Roo, Continue, Aider, Claude Code, or anything else that accepts a `baseURL` at it, and you get those free models — still anonymously, still with no account and no API key.
+
+It speaks **two wire formats**, so you're not locked into one SDK:
+
+- **OpenAI** — `/v1/chat/completions`, `/v1/responses`, `/v1/models`. Cline, Roo Code, Continue, Aider, mimo, opencode forks, anything with a `baseURL`.
+- **Anthropic** — `/v1/messages` and `/v1/messages/count_tokens`, including the full streaming envelope, tools, images and thinking blocks. **Claude Code works as-is**, including file and shell tools.
 
 Everything runs on your machine. Nothing is sent anywhere but OpenCode's own API.
 
@@ -92,7 +97,7 @@ The proxy listens on `http://127.0.0.1:8787` and prints its URLs on startup.
 
 ## Setup
 
-### Any OpenAI-compatible agent
+### Any OpenAI-compatible agent (Cline, Roo, Continue, Aider, mimo, opencode)
 
 Set the base URL to `http://127.0.0.1:8787/v1` and the API key to `public`. That's the whole configuration.
 

@@ -6,11 +6,11 @@ Source: https://github.com/12errh/zen-proxy
 
 ---
 
-a local OpenAI-compatible proxy that unlocks opencode's anonymous free tier — for any agent.
+a local proxy that unlocks opencode's anonymous free models for any agent — over both the OpenAI and Anthropic APIs.
 
-anonymous free tier  ◦  no accounts  ◦  no keys  ◦  any openai-compatible agent  ◦  100% local
+anonymous free tier  ◦  no accounts  ◦  no keys  ◦  openai + anthropic compatible  ◦  claude code  ◦  100% local
 
-> **Zen Proxy** is a zero-dependency, locally-run OpenAI-compatible proxy that unlocks opencode's Zen free tier **for any coding agent — not just opencode**.
+> **Zen Proxy** is a zero-dependency, locally-run proxy that unlocks opencode's Zen free tier **for any coding agent — not just opencode**. It speaks two wire formats: the OpenAI API, and the Anthropic Messages API so **Claude Code** can use the free models directly, tools included.
 >
 > opencode gives you free models like `mimo-v2.5-free`, `big-pickle`, and `nemotron` — but only to requests that look like they come from opencode itself: the right `User-Agent` **and** a complete session identity (`x-opencode-session` *and* `x-opencode-session-id`). Most agents force their own identity and get shut out with `400 MissingSessionID` or `403 FreeTierError` ("OpenCode's free tier can only be used from within OpenCode"). Zen Proxy quietly speaks for them: it injects the correct `User-Agent`, mints stable per-client session IDs, forwards your real IP, and re-exposes everything as a standard `/v1/chat/completions` + `/v1/models` API.
 >
@@ -18,7 +18,7 @@ anonymous free tier  ◦  no accounts  ◦  no keys  ◦  any openai-compatible 
 
 **What it enables:**
 
-- **Free OpenAI-compatible models outside opencode** — bring your own agent, keep the free tier
+- **Free models outside opencode, over either API** — OpenAI-compatible agents *and* Claude Code, keep the free tier
 - **Anonymous access with no accounts or keys** (`Bearer public`), or bring your own Zen key (BYOK) for your own quota
 - **Smart model fallback** — when one free model is saturated, it rolls to the next
 - **Model aliases** — call them `gpt-4o` or `claude-3-5`, get routed to free models

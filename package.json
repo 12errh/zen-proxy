@@ -1,7 +1,7 @@
 {
   "name": "zen-proxy",
   "version": "1.0.0",
-  "description": "Zero-dependency OpenAI-compatible reverse proxy that unlocks opencode's Zen anonymous free tier for any coding agent",
+  "description": "Zero-dependency local proxy that unlocks opencode's Zen anonymous free models for any coding agent, over both the OpenAI and Anthropic APIs (Claude Code included)",
   "type": "module",
   "main": "zen-proxy.mjs",
   "bin": {
@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "node zen-proxy.mjs",
-    "test": "node --test \"test/**/*.test.mjs\""
+    "test": "node --test"
   },
   "engines": {
     "node": ">=18"

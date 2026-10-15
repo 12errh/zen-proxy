@@ -1,6 +1,6 @@
 # zen-proxy
 
-> A local, zero-dependency OpenAI-compatible proxy that lets **any** coding agent (Cline, Roo Code, Continue, Aider, mimo CLI, opencode forks) use opencode's anonymous **free** Zen models — no accounts, no API keys.
+> A local, zero-dependency proxy that lets **any** coding agent use opencode's anonymous **free** Zen models — no accounts, no API keys. It speaks **two wire formats**: the OpenAI API (`/v1/chat/completions`, `/v1/responses`, `/v1/models`) for Cline, Roo Code, Continue, Aider, mimo CLI and opencode forks, and the **Anthropic Messages API** (`/v1/messages`) so **Claude Code works as-is**, tools included.
 
 ## The problem this solves
 
@@ -11,7 +11,7 @@ opencode's Zen gateway serves its free `-free` models (`mimo-v2.5-free`, `big-pi
 - The legacy `https://opencode.ai/zen/v1` base still answers `/models` but rejects genuine agent traffic with **403 FreeTierError**. The served base is `https://opencode.ai/inference/v1`.
 - Most agents force their own UA and never send a session header, so they cannot use the free tier directly.
 
-zen-proxy solves this by injecting the correct `User-Agent` and a stable per-client `x-opencode-session` upstream, then re-exposing everything as a standard OpenAI-compatible API on `http://127.0.0.1:8787/v1`.
+zen-proxy solves this by injecting the correct `User-Agent` and a stable per-client `x-opencode-session` pair upstream, then re-exposing everything on `http://127.0.0.1:8787/v1` — as either a standard OpenAI API or a standard Anthropic Messages API.
 
 ## Key facts
 
