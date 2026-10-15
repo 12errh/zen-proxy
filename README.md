@@ -1,70 +1,70 @@
 <p align="center">
-  <img src="assets/logo.png" width="128" alt="zen-proxy logo" style="border:3px solid #1a1612;border-radius:22px;box-shadow:8px 8px 0 #ff5c39;">
+  <img src="assets/logo.png" width="110" alt="zen-proxy" />
 </p>
 
-<p align="center" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:800;font-size:26px;letter-spacing:.12em;color:#1a1612;margin-top:14px;">ZEN·PROXY</p>
-<p align="center" style="font-family:'Iowan Old Style',Georgia,serif;font-style:italic;font-size:15px;color:#7d7461;">a local OpenAI-compatible proxy that unlocks opencode's anonymous free tier — for any agent.</p>
+<p align="center"><b>zen-proxy</b></p>
+<p align="center">Use OpenCode Zen's free models from any AI coding agent — no account, no API key.</p>
 
-<div align="center" style="background-color:#ccf73a;border:2px solid #1a1612;border-radius:999px;padding:9px 22px;font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:700;font-size:12px;letter-spacing:.15em;color:#1a1612;margin:18px 0;text-transform:uppercase;">
-anonymous free tier &nbsp;◦&nbsp; no accounts &nbsp;◦&nbsp; no keys &nbsp;◦&nbsp; any openai-compatible agent &nbsp;◦&nbsp; 100% local
-</div>
-
-> **Zen Proxy** is a zero-dependency, locally-run OpenAI-compatible proxy that unlocks opencode's Zen free tier **for any coding agent — not just opencode**.
->
-> opencode gives you free models like `mimo-v2.5-free`, `big-pickle`, and `nemotron` — but only to requests that look like they come from opencode itself: the right `User-Agent` **and** a complete session identity (`x-opencode-session` *and* `x-opencode-session-id`). Most agents force their own identity and get shut out with `400 MissingSessionID` or `403 FreeTierError` ("OpenCode's free tier can only be used from within OpenCode"). Zen Proxy quietly speaks for them: it injects the correct `User-Agent`, mints stable per-client session IDs, forwards your real IP, and re-exposes everything as a standard `/v1/chat/completions` + `/v1/models` API.
->
-> The result: whatever tool you love — Cline, Roo Code, Continue, Aider, mimo, or a plain `curl` — can now ride opencode's free models with **zero accounts, zero API keys**, and zero config beyond a `baseURL`.
-
-**What it enables:**
-
-- **Free OpenAI-compatible models outside opencode** — bring your own agent, keep the free tier
-- **Anonymous access with no accounts or keys** (`Bearer public`), or bring your own Zen key (BYOK) for your own quota
-- **Smart model fallback** — when one free model is saturated, it rolls to the next
-- **Model aliases** — call them `gpt-4o` or `claude-3-5`, get routed to free models
-- **Self-updating** — tracks new opencode releases (auto User-Agent) and a GitHub Action keeps the shipped free-model list current as models come and go
-- **Per-IP fairness** — real client IPs are forwarded (local clients fall back to your machine's real IP, same quota bucket as opencode direct)
-- **A retro-zine management dashboard** — stats, one-click model tests, live config, and logs at `http://127.0.0.1:8787/`
-- **One-file install** on Linux, macOS, and Windows with a single `curl`
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-ccf73a?style=flat-square&labelColor=1a1612" alt="MIT License"></a>
+  <img src="https://img.shields.io/badge/node-%3E%3D18-8b8b8b?style=flat-square&labelColor=1a1612" alt="Node 18+">
+  <img src="https://img.shields.io/badge/dependencies-0-8b8b8b?style=flat-square&labelColor=1a1612" alt="Zero dependencies">
+  <img src="https://img.shields.io/badge/endpoint-OpenAI%20%2B%20Anthropic-8b8b8b?style=flat-square&labelColor=1a1612" alt="OpenAI and Anthropic compatible">
+</p>
 
 ---
 
-## why it exists
+## What it is
 
-opencode's free `-free` models (`mimo-v2.5-free`, `big-pickle`, `nemotron`, …) are only served to requests that mimic the real client. Since opencode started requiring a full session identity, anything missing it gets `400 MissingSessionID`, and anything carrying only half of it gets `403 FreeTierError: "OpenCode's free tier can only be used from within OpenCode"` — even with a valid API key. The gateway is served from `https://opencode.ai/inference/v1`; the older `/zen/v1` base still lists models but now rejects all agent traffic. Most coding agents — like the *mimo* CLI fork — force their own identity and get slammed with that error (or `429 FreeUsageLimitError`).
+OpenCode publishes free AI models (`space-bunny-free`, `mimo-v2.6-flash-free`, `big-pickle`, …) — but their gateway only answers requests that come from the OpenCode CLI itself. Any other agent gets:
 
-**zen-proxy** injects the correct `User-Agent` and a stable synthetic `x-opencode-session` / `x-opencode-session-id` pair per client, then re-exposes everything as a plain OpenAI API. No accounts, no API keys, no source patches.
+```
+403 FreeTierError: OpenCode's free tier can only be used from within OpenCode
+```
 
-> works with: **mimo cli**, **Cline**, **Roo Code**, **Continue**, **Aider**, opencode forks — anything that lets you set a `baseURL` + `apiKey`.
+**zen-proxy** is a single-file local server that sits in front of that gateway and speaks for your agent. Point Cline, Roo, Continue, Aider, Claude Code, or anything else that accepts a `baseURL` at it, and you get those free models — still anonymously, still with no account and no API key.
 
-<div style="background-color:#1a1612;border-radius:14px;padding:20px;color:#efe8d9;margin:16px 0;">
-  <p style="margin:0;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:#ccf73a;">▸ feature list</p>
-  <ul style="margin:10px 0 0;padding-left:20px;line-height:1.9;font-size:14px;">
-    <li><b>OpenAI-compatible API</b> — <code>/v1/chat/completions</code> (stream + non-stream), <code>/v1/models</code>, <code>/v1/responses</code></li>
-    <li><b>UA unlock</b> — injects <code>User-Agent: opencode/1.18.30</code> plus a stable per-client <code>x-opencode-session</code> / <code>x-opencode-session-id</code> pair upstream, the things that open the free tier</li>
-    <li><b>BYOK</b> — ride anonymous <code>public</code> or bring your own Zen key (stable + no shared-pool throttling)</li>
-    <li><b>Smart fallback</b> — tries models in order on <code>429</code>/<code>5xx</code>, honors <code>retry-after</code></li>
-    <li><b>Model aliases</b> — e.g. <code>gpt-4o → mimo-v2.5-free</code>, replies rewritten back</li>
-    <li><b>Per-IP fairness</b> — real client IPs forwarded; local clients fall back to your real IP (same quota bucket as opencode direct)</li>
-    <li><b>Management dashboard</b> — glass… no, sticker-style UI at <code>/</code> for stats, model tests, config &amp; logs</li>
-    <li><b>Zero dependencies</b> — one <code>zen-proxy.mjs</code>, runs on any Node ≥ 18</li>
-  </ul>
-</div>
-
-## dashboard
-
-The management UI runs on **`http://localhost:8787`** (or `http://127.0.0.1:8787`) once the proxy is running — live stats, one-click model tests, auto-sync status, config editing, and server logs.
-
-![zen-proxy dashboard](assets/dashboard.png)
+Everything runs on your machine. Nothing is sent anywhere but OpenCode's own API.
 
 ---
 
-## install
+## How it works
 
-Requires **Node.js ≥ 18**.
+The gateway accepts a request only when it carries the identity and shape of a real OpenCode session. Three things matter, all measured by replaying genuine requests upstream:
 
-<table>
-<tr>
-<td width="50%" valign="top">
+| Requirement | What zen-proxy does |
+|---|---|
+| A valid session identity — `x-opencode-session` **and** `x-opencode-session-id`, sharing one value | Mints a stable per-client ID and sends both headers |
+| The ID must look real — its first 12 hex characters encode a creation time | Generates IDs in OpenCode's own format, not random hex |
+| Served from `https://opencode.ai/inference/v1` | Uses that base, and migrates older configs that still point at the retired `/zen/v1` path |
+
+One more rule applies specifically to `/v1/messages` (the Anthropic endpoint): the gateway requires OpenCode's own tool manifest to be present. Claude Code's system prompt is passed through **completely untouched** — but zen-proxy attaches a few of OpenCode's built-in tools alongside Claude Code's, and renames any resulting tool calls back to Claude Code's names and argument spelling. Details in [Claude Code](#claude-code).
+
+> **Note on plain chat clients:** the gateway only answers genuine *agent* traffic — a request must stream, carry a system message, and include tool definitions. All the coding agents above do this, so they work as-is. A bare `curl` or a chat-only client that sends none of those gets `403 FreeTierError`; that is the gateway's rule, not a proxy fault.
+
+---
+
+## What it supports
+
+| Capability | Status |
+|---|---|
+| `POST /v1/chat/completions` — streaming and non-streaming | ✅ |
+| `POST /v1/responses` (Responses API) | ✅ translated both ways |
+| `POST /v1/messages` — Anthropic Messages API, for Claude Code | ✅ full streaming envelope, tools, images, thinking |
+| `POST /v1/messages/count_tokens` | ✅ |
+| `GET /v1/models` | ✅ |
+| Automatic fallback across free models on `429`/`5xx`/unavailable | ✅ honors `retry-after` |
+| Model aliases — call it `gpt-4o`, get a free model back | ✅ |
+| Anonymous `Bearer public` **or** your own Zen key (BYOK) | ✅ |
+| Free-model catalog kept current by a GitHub Action | ✅ [`models.json`](models.json), every 6 h |
+| Management dashboard | ✅ `http://127.0.0.1:8787/` |
+| Per-IP rate limiting, `proxyKey` lock | ✅ opt-in |
+
+---
+
+## Install
+
+Requires **Node.js 18 or newer**. No `npm install` — there are no dependencies.
 
 **Linux / macOS**
 
@@ -72,46 +72,46 @@ Requires **Node.js ≥ 18**.
 curl -fsSL https://raw.githubusercontent.com/12errh/zen-proxy/main/install.sh | bash
 ```
 
-</td>
-<td valign="top">
-
 **Windows (PowerShell)**
 
 ```powershell
 irm https://raw.githubusercontent.com/12errh/zen-proxy/main/install.ps1 | iex
 ```
 
-</td>
-</tr>
-</table>
-
-Or just clone and run — it's a single file, no `npm install`:
+**Or from source**
 
 ```bash
-git clone https://github.com/12errh/zen-proxy.git && cd zen-proxy
+git clone https://github.com/12errh/zen-proxy.git
+cd zen-proxy
 node zen-proxy.mjs
 ```
 
+The proxy listens on `http://127.0.0.1:8787` and prints its URLs on startup.
+
 ---
 
-## usage
+## Setup
 
-```bash
-node zen-proxy.mjs            # or the installer's `zen-proxy` launcher
-# dashboard → http://127.0.0.1:8787/
+### Any OpenAI-compatible agent
+
+Set the base URL to `http://127.0.0.1:8787/v1` and the API key to `public`. That's the whole configuration.
+
+**opencode** — in `opencode.json`:
+
+```jsonc
+{
+  "provider": {
+    "zen": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://127.0.0.1:8787/v1" },
+      "models": { "space-bunny-free": { "name": "Space Bunny Free" } }
+    }
+  },
+  "model": "zen/space-bunny-free"
+}
 ```
 
-| Thing | Value |
-|---|---|
-| Dashboard / admin UI | `http://127.0.0.1:8787/` |
-| OpenAI base URL | `http://127.0.0.1:8787/v1` |
-| API key | `public` (or your `proxyKey` once set) |
-| Example model | `mimo-v2.5-free` (auto default picks a healthy free model) |
-| Health check | `http://127.0.0.1:8787/health` |
-
-### point your agent at it
-
-Cline / Roo / Continue / Aider / mimo — anywhere you configure an OpenAI-compatible provider:
+**Cline / Roo Code / Continue / Aider / mimo** — any provider form that takes a `baseURL` + `apiKey`:
 
 ```jsonc
 {
@@ -119,91 +119,153 @@ Cline / Roo / Continue / Aider / mimo — anywhere you configure an OpenAI-compa
     "zen": {
       "baseURL": "http://127.0.0.1:8787/v1",
       "apiKey": "public",
-      "models": { "mimo-v2.5-free": {} }
+      "models": { "space-bunny-free": {} }
     }
   }
 }
 ```
 
-Quick test:
+Which models are available right now:
 
 ```bash
-curl -s http://127.0.0.1:8787/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"mimo-v2.5-free","messages":[{"role":"user","content":"say hi"}]}'
+curl -s http://127.0.0.1:8787/v1/models -H "Authorization: Bearer public"
 ```
 
+### Claude Code
+
+Claude Code speaks the Anthropic Messages API, which zen-proxy implements directly:
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
+export ANTHROPIC_AUTH_TOKEN=public     # any value; it falls back to the anonymous tier
+claude
+```
+
+Then, inside Claude Code:
+
+```
+/model space-bunny-free
+```
+
+Two things worth knowing:
+
+- **Claude Code warns the model is outside its catalog** and assumes a 200k context window. Set `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the free model's real limit to avoid premature auto-compact.
+- **Why OpenCode's tools get attached.** With only Claude Code's own tools the gateway returns `403` — measured, not assumed. zen-proxy therefore adds a handful of OpenCode's built-in tools alongside Claude Code's, **only those Claude Code has a counterpart for**, and translates calls back:
+
+  | Attached as | You get back | Arguments |
+  |---|---|---|
+  | `read` | `Read` | `filePath` → `file_path` |
+  | `edit` | `Edit` | `filePath`, `oldString`, `newString` → `file_path`, `old_string`, `new_string` |
+  | `write` | `Write` | `filePath` → `file_path` |
+  | `bash` | `Bash` | `workdir` dropped (no counterpart) |
+  | `grep`, `glob`, `list` | `Grep`, `Glob`, `LS` | passed through |
+
+  A tool Claude Code doesn't offer is never attached, so the model can't request something that can't run. Set `agentTools: false` to turn this off.
+
+### Verify it works
+
+Check the server is up:
+
+```bash
+curl -s http://127.0.0.1:8787/health
+# {"ok":true,"upstream":"https://opencode.ai/inference/v1"}
+```
+
+Then send a request shaped the way the gateway expects — **streaming**, with a system message and at least one tool:
+
+```bash
+curl -sN http://127.0.0.1:8787/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer public" \
+  -d '{
+    "model": "space-bunny-free",
+    "stream": true,
+    "max_tokens": 32,
+    "system": "You are a coding assistant. Answer concisely.",
+    "messages": [{"role": "user", "content": "say hi"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "read",
+        "description": "Read a file from disk.",
+        "parameters": {"type": "object", "properties": {"filePath": {"type": "string"}}}
+      }
+    }]
+  }'
+```
+
+You should see `data:` lines streaming back. See [Things to know](#things-to-know) for why the shape matters.
+
 ---
 
-## the dashboard
+## Configuration
 
-<div style="background-color:#ccf73a;border:2px solid #1a1612;border-radius:999px;padding:6px 16px;display:inline-block;font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:700;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:#1a1612;transform:rotate(-2deg);">manage everything, no config files</div>
-
-- **Overview** — upstream health, uptime, request counters, live recent-request feed with status + latency
-- **Models** — add/remove allowed models, pick the default, one-click **Test** per model
-- **Settings** — edit host, port, upstream URL, User-Agent, proxy key, BYOK key, timeout, fallback list, aliases; saved to `zen-proxy.json` and applied instantly
-- **Logs** — live terminal-style log tail
-
-Set `proxyKey` and the dashboard, `/api/*`, chat completions, and `/v1/models` all require it (`/health` stays open for uptime monitors).
-
----
-
-## configuration
-
-Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded when edited — the dashboard writes it too). Env vars can override at startup.
+Config lives in **`zen-proxy.json`**, created on first run, hot-reloaded when edited, and writable from the dashboard. Environment variables can override anything at startup.
 
 | Key | Default | Description |
 |---|---|---|
-| `host` | `127.0.0.1` | Bind address (restart needed) |
-| `port` | `8787` | Listen port (restart needed) |
-| `upstream` | `https://opencode.ai/inference/v1` | Zen API base |
-| `ua` | `opencode/1.18.30` | The `User-Agent` that unlocks the free tier (auto-updates to new opencode releases) |
-| `autoUA` | `true` | Track opencode releases and update `ua` automatically (`opencode/<latest>`) |
-| `uaRefreshMs` | `21600000` | How often to check for a new opencode version (ms) |
-| `injectSession` | `true` | Mint the `x-opencode-session` + `x-opencode-session-id` pair per client (upstream rejects requests that lack either) |
-| `gated` (sync state) | — | Models answering `403 FreeTierError`: the free tier only accepts genuine agent requests, so our probe can't verify them. Shown as **agent-only**, kept in the list, never removed |
-| `probeAuth` | `auto` | Credentials for auto-sync health probes: `auto` (your Zen key if set, else anonymous), `anonymous` (always the public free tier), or `key` (always your key, so probes reflect your own quota) |
-| `defaultModel` | `""` | Empty = auto: pick the first *healthy* free model (no more hardcoded/vanished defaults) |
-| `fallbackModels` | *(from `models.json`)* | Tried in order on `429`/`5xx` and unavailable-model `4xx`. Omit it from `zen-proxy.json` to follow the shipped catalog, which the model-sync Action keeps current every 6 hours. Save it once from the dashboard to pin your own list; **Restore defaults** returns to following the catalog |
-| `responsesModels` | `["gpt-5*","gpt-6*","grok-*","muse-spark-*"]` | Models served on `/v1/responses` (patterns may end in `*`); the proxy translates to/from chat completions for you |
-| `rateLimitMax` | `0` (off) | Max chat requests per client per window — `0` disables the limiter |
-| `rateLimitWindowMs` | `60000` | Rate-limit window |
-| `modelAliases` | `{}` | e.g. `{"gpt-4o":"mimo-v2.5-free"}` — reply model rewritten back |
-| `proxyKey` | `""` | If set, clients must send it as `Bearer`; locks the dashboard too |
-| `defaultZenKey` | `""` | Your own Zen key (BYOK) instead of anonymous `public` |
-| `trustForwarded` | `false` | Trust `x-forwarded-for`/`x-real-ip` from a reverse proxy |
-| `timeoutMs` | `120000` | Upstream timeout (streaming and non-streaming) |
-| `cacheMs` | `30000` | `/v1/models` cache TTL |
+| `host` / `port` | `127.0.0.1` / `8787` | Bind address (restart required) |
+| `upstream` | `https://opencode.ai/inference/v1` | Zen gateway base |
+| `ua` / `autoUA` | `opencode/1.18.30` / `true` | User-Agent sent upstream; auto-tracks new OpenCode releases |
+| `injectSession` | `true` | Mint and send the session header pair |
+| `agentTools` | `true` | Attach OpenCode's tools to `/v1/messages` (see [Claude Code](#claude-code)) |
+| `defaultModel` | `""` | Empty = auto-pick the first working free model |
+| `fallbackModels` | *(from [`models.json`](models.json))* | Tried in order on `429`/`5xx`/unavailable. Omit it to follow the catalog; save it once to pin your own list |
+| `modelAliases` | `{}` | e.g. `{"gpt-4o": "space-bunny-free"}`; the reply's model name is rewritten back |
+| `responsesModels` | `["gpt-5*","gpt-6*","grok-*","muse-spark-*"]` | Models served on `/v1/responses`; patterns may end in `*` |
+| `defaultZenKey` | `""` | Your own Zen key instead of anonymous `public` |
+| `proxyKey` | `""` | If set, clients must send it; also locks the dashboard and `/api/*` |
+| `rateLimitMax` / `rateLimitWindowMs` | `0` (off) / `60000` | Per-client rate limiting for inference routes |
+| `timeoutMs` / `cacheMs` | `120000` / `30000` | Upstream timeout, `/v1/models` cache TTL |
+| `autoSync` / `autoSyncIntervalMs` | `true` / `3600000` | Runtime discovery of newly-offered free models |
+| `trustForwarded` | `false` | Honour `x-forwarded-for` when behind a reverse proxy |
 
-Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION` (`0` to disable), `AUTO_UA` (`0` to disable), `UA_REFRESH_MS`, `PROBE_AUTH`, `RESPONSES_MODELS` (JSON), `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW_MS`, `DEFAULT_MODEL`, `FALLBACK_MODELS` (JSON), `MODEL_ALIASES` (JSON), `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED=1`, `TIMEOUT_MS`, `CACHE_MS`, `AUTO_SYNC` (`0` to disable), `AUTO_SYNC_MS`, `ZEN_PROXY_CONFIG` (custom config path).
+**Environment variables:** `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION=0`, `AUTO_UA=0`, `UA_REFRESH_MS`, `AGENT_TOOLS=0`, `PROBE_AUTH`, `DEFAULT_MODEL`, `FALLBACK_MODELS` (JSON), `MODEL_ALIASES` (JSON), `RESPONSES_MODELS` (JSON), `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED=1`, `TIMEOUT_MS`, `CACHE_MS`, `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW_MS`, `AUTO_SYNC=0`, `AUTO_SYNC_MS`, `ZEN_PROXY_CONFIG`.
 
-### bring your own key
+### Bring your own key
 
-Anonymous `public` access rides opencode's shared free pool (per-IP quota, sometimes saturated). For stable, reliable use set `defaultZenKey` to your own free Zen key — or send it per request as `x-zen-key` / a non-`public` bearer token.
+Anonymous `public` access shares a per-IP quota that is sometimes saturated. For steadier service set `defaultZenKey` to your own Zen key, or send it per request as `x-zen-key`.
 
 ---
 
-## api surface
+## Dashboard
+
+`http://127.0.0.1:8787/`
+
+- **Overview** — upstream health, uptime, request counters, live request feed with status and latency
+- **Models** — add or remove models, pick the default, test any model with one click
+- **Settings** — edit and save config instantly; **Restore defaults** returns the model list to following [`models.json`](models.json)
+- **Logs** — live log tail
+
+![zen-proxy dashboard](assets/dashboard.png)
+
+---
+
+## API
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/v1/chat/completions` | Chat completions (stream + non-stream) |
-| `POST` | `/v1/responses` | Responses passthrough |
-| `GET` | `/v1/models` | Allowed models (cached) |
-| `GET` | `/health` | Health check |
+| `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
+| `POST` | `/v1/responses` | OpenAI Responses API |
+| `POST` | `/v1/messages` | Anthropic Messages API |
+| `POST` | `/v1/messages/count_tokens` | Anthropic token estimate |
+| `GET` | `/v1/models` | Available models |
+| `GET` | `/health` | Health check (always open) |
 | `GET` | `/` | Dashboard |
-| `GET` | `/api/status` | Stats + upstream health |
-| `GET/PUT` | `/api/config` | Read / update config |
-| `POST` | `/api/test` | Test a model (`{"model":"…"}`) |
+| `GET`/`PUT` | `/api/config` | Read / update configuration |
+| `GET` | `/api/status` | Stats and upstream health |
+| `POST` | `/api/test` | Test one model — `{"model":"..."}` |
 | `GET` | `/api/logs` | Log tail |
-| `POST` | `/api/reset` | Reset request stats |
-| `GET` | `/assets/*` | Static assets (logo, favicon) |
+| `POST` | `/api/sync` | Re-run model discovery |
+| `POST` | `/api/reset` | Reset request statistics |
+
+Setting `proxyKey` protects the dashboard and every `/api/*` route.
 
 ---
 
-## systemd (linux)
+## Running as a service (Linux)
 
-Install as a service via `install.sh` (it prompts you), or manually:
+`install.sh` offers to install a systemd unit; or manually:
 
 ```bash
 sudo systemctl enable --now zen-proxy
@@ -211,67 +273,15 @@ sudo systemctl enable --now zen-proxy
 
 ---
 
-## the free-tier gate (read this if a model says "agent-only")
+## Things to know
 
-opencode serves its free models **only to genuine opencode traffic**. Established by capturing a real opencode request and replaying it upstream one change at a time: a request is accepted only when it carries all three of
-
-- a valid session pair — `x-opencode-session` **and** `x-opencode-session-id`, sharing one id, and
-- `stream: true`, **and**
-- a system message carrying opencode's **own** wording (roughly the first 1 kB of its system prompt)
-
-Everything else is incidental. `user-agent` does not matter. `x-opencode-client`, `x-opencode-project` and `x-opencode-request` do not matter. Neither does body size — a realistic 1.5 kB agent prompt of our own wording is refused, and `'x' * 2000` is refused too. Only opencode's actual prompt text passes. So there is no synthetic probe that can verify a free model: it would have to impersonate opencode, and even that breaks the day opencode edits its prompt.
-
-Anything else gets:
-
-```
-403 FreeTierError: OpenCode's free tier can only be used from within OpenCode
-```
-
-**This is not the model being broken.** The proxy sends all three, so real agent traffic passes straight through. A model in this state is shown as **agent-only**, is kept in your list, and is never pruned — because a retired model is refused with exactly the same error, a probe cannot tell the two apart.
-
-The proxy learns real health from your actual client traffic instead: a model that serves your agent shows **`ok (live traffic)`**, which is the only trustworthy signal available.
-
-| badge | meaning |
-|---|---|
-| `ok (live traffic)` | a real request through the proxy succeeded — the strongest signal |
-| `agent-only` | the synthetic probe was gated; unproven either way, kept in your list |
-| `flaky` | temporary trouble (timeout, 5xx, rate-limit) |
-| `dead` | upstream no longer lists the model in `/models` — the only state that removes it |
-
-### Which free models exist?
-
-That comes from opencode's public `/models` catalog, not from probing. The **model-sync** GitHub Action reads it every 6 hours and updates [`models.json`](models.json) — new free models appended, ones upstream drops removed, existing order preserved so your default model doesn't jump around. The proxy reads that file at startup.
-
-Your `zen-proxy.json` is not required to carry a list. If it doesn't, the proxy follows `models.json` and picks up refreshes on its next start. Saving the list from the dashboard pins it; **Restore defaults** hands control back to the catalog. Configs written by older builds (which stored the shipped list locally) are released back to the catalog automatically on first start.
-
-### Does my agent need anything?
-
-If your agent **streams** (Claude Code, Cline, Roo Code, Continue, Aider, mimo, opencode itself — all of them do), it works. A one-shot non-streaming client gets gated on those calls, and the proxy transparently falls back to another free model.
-
-You don't need to change anything. When a fallback happens the response tells you:
-
-```jsonc
-{ "model": "mimo-v2.6-flash-free", "zen_served_by": "space-bunny-free", /* … */ }
-```
-
-plus response headers `x-zen-served-by` and `x-zen-fallback: true`.
-
-> The proxy deliberately does **not** fake opencode's tool schemas to get past this check. That gate is an access control, and the honest behaviour is to tell you which models are gated and let your real agent traffic use them.
+- **This rides an anonymous free tier.** Expect per-IP quotas and a shared pool that gets saturated. Don't run heavy workloads on it — bring a key if you need reliability.
+- **The gateway expects agent-shaped traffic.** Streaming, a system message, and tool definitions are all required; without them you get `403 FreeTierError`. Every coding agent listed above sends them. If you build your own client, send them too.
+- **A model showing "agent-only" is not broken.** The gateway refuses the built-in health probe because it isn't genuine agent traffic, so the proxy can't confirm those models up front. It learns real health from your actual requests instead — a model that serves you shows `ok (live traffic)`. Models are never removed on a temporary block.
+- **Which models exist comes from OpenCode's public catalog**, not from probing: a retired model and a healthy one are refused identically, so probing can't tell them apart. A GitHub Action refreshes [`models.json`](models.json) every 6 hours.
+- **When the proxy falls back**, the response carries `zen_served_by` plus `x-zen-served-by` and `x-zen-fallback` headers so you can see which model actually answered.
+- **`agent-tools.json` is a capture of OpenCode's tools.** If OpenCode changes its tool schemas, the `/v1/messages` bridge may stop satisfying the gateway and Claude Code will start returning `403`. Regenerate it by capturing any OpenCode request.
 
 ---
 
-## caveats
-
-- This rides opencode's **anonymous free tier**: per-IP request/daily quotas and a shared pool that's sometimes saturated. Don't rotate/abuse IPs or run heavy workloads anonymously.
-- When the proxy falls back to a different model, the response includes `zen_served_by` plus `x-zen-served-by` / `x-zen-fallback` headers so you can see which model actually answered.
-- The free tier only accepts **real agent traffic**: a valid session pair, `stream: true`, and a system message carrying opencode's own wording. A bare `curl` or the built-in health probe gets `403 FreeTierError` — that is *not* the model being broken. Models in this state are shown as **agent-only** and the proxy learns their real health from your actual traffic (`ok (live traffic)`).
-- opencode keeps **tightening the anonymous free tier** — most `-free` models now answer `403 FreeTierError: "OpenCode's free tier can only be used from within OpenCode"`, and that hits the real opencode client too. The proxy detects it and rolls to the next working model, so requests keep succeeding, but the pool is much smaller than it used to be. A Zen API key (BYOK) is the reliable path.
-- The `-free` models are "as-is" free tiers — expect rate limits and occasional provider errors.
-- For anything serious, **BYOK**.
-
----
-
-<p align="center" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;letter-spacing:.12em;color:#7d7461;text-transform:uppercase;">zen-proxy · anonymous free tier · no accounts · no keys · 100% local</p>
-<p align="center" style="font-family:'Iowan Old Style',Georgia,serif;font-style:italic;color:#7d7461;font-size:13px;">go make some noise.</p>
-
-<p align="center"><b>MIT License</b></p>
+<p align="center">MIT licensed. Runs entirely on your machine.</p>

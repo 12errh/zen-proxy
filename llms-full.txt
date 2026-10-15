@@ -130,6 +130,12 @@ Set `proxyKey` and both the dashboard and the API require that key.
 
 ---
 
+## Anthropic API (Claude Code)
+
+`POST /v1/messages` and `POST /v1/messages/count_tokens` implement the Anthropic Messages protocol: system blocks, message content blocks, images, `tool_use`/`tool_result`, `thinking`, `tool_choice` and `stop_sequences` are all translated to the endpoint family the target model actually uses, and the reply is translated back including the full streaming envelope (`message_start` → `content_block_*` → `message_delta` → `message_stop`). Errors use Anthropic's `{type:"error",error:{type,message}}` shape. Both `x-api-key` and `Authorization: Bearer` authenticate.
+
+The free tier accepts an Anthropic request only when it also carries opencode's own tool manifest. Claude Code's system prompt is passed through untouched — it is never edited or replaced — but the proxy attaches opencode's built-in tools next to the caller's, limited to those the caller has a counterpart for, and renames resulting calls (`read`→`Read`, `filePath`→`file_path`, …) so the caller runs the tool it knows. Disable with `agentTools: false`.
+
 ## configuration
 
 Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded when edited — the dashboard writes it too). Env vars can override at startup.

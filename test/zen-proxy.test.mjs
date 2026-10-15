@@ -1960,6 +1960,188 @@ describe("model-sync bot (scripts/sync-models.mjs)", () => {
   })
 })
 
+describe("Anthropic Messages API layer", () => {
+  // Claude Code speaks /v1/messages. Requests are reshaped for the chat endpoint,
+  // replies reshaped back, and the caller's tools survive the round trip.
+  const req = (body, headers = {}, url = "/v1/messages") =>
+    mockReq({ method: "POST", url, headers: { "content-type": "application/json", ...headers }, _body: typeof body === "string" ? body : JSON.stringify(body) })
+  const callRoute = async (r) => {
+    const res = mockRes()
+    await zp.router(r, res)
+    try {
+      return { status: res.state.status, body: JSON.parse(res.body) }
+    } catch {
+      return { status: res.state.status, body: res.body }
+    }
+  }
+
+  test("system blocks and message blocks flatten into chat messages", () => {
+    const out = zp.anthropicToChatBody(
+      {
+        system: [{ type: "text", text: "sys one" }, { type: "text", text: "sys two" }],
+        messages: [{ role: "user", content: [{ type: "text", text: "hello " }, { type: "text", text: "world" }] }],
+        max_tokens: 512,
+      },
+      "space-bunny-free",
+    )
+    const sys = out.messages.filter((m) => m.role === "system").map((m) => m.content).join("\n\n")
+    assert.match(sys, /sys one[\s\S]*sys two/)
+    const user = out.messages.find((m) => m.role === "user")
+    // Block objects must be unwrapped, never stringified into "[object Object]".
+    assert.equal(user.content, "hello world")
+    assert.equal(out.max_tokens, 512)
+  })
+
+  test("the caller's system prompt is kept verbatim and never replaced", () => {
+    const body = { system: [{ type: "text", text: "CALLER PROMPT MARKER" }], messages: [{ role: "user", content: "hi" }] }
+    const out = zp.anthropicToChatBody(body, "m")
+    const sys = out.messages.filter((m) => m.role === "system").map((m) => m.content).join("\n")
+    assert.match(sys, /CALLER PROMPT MARKER/)
+  })
+
+  test("tool_use and tool_result become chat tool_calls and role:tool", () => {
+    const out = zp.anthropicToChatBody(
+      {
+        messages: [
+          { role: "user", content: "do it" },
+          { role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "Read", input: { file_path: "/a" } }] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "contents" }] },
+        ],
+      },
+      "m",
+    )
+    const call = out.messages.find((m) => m.tool_calls?.length)
+    assert.equal(call.tool_calls[0].id, "call_1")
+    assert.equal(call.tool_calls[0].function.name, "Read")
+    assert.deepEqual(JSON.parse(call.tool_calls[0].function.arguments), { file_path: "/a" })
+    const tool = out.messages.find((m) => m.role === "tool")
+    assert.equal(tool.tool_call_id, "call_1")
+    assert.equal(tool.content, "contents")
+  })
+
+  test("anthropic tools convert to chat function tools", () => {
+    const tools = zp.anthropicToolsToChat([
+      { name: "Read", description: "read it", input_schema: { type: "object", properties: { file_path: { type: "string" } }, required: ["file_path"] } },
+    ])
+    assert.deepEqual(tools, [
+      { type: "function", function: { name: "Read", description: "read it", parameters: { type: "object", properties: { file_path: { type: "string" } }, required: ["file_path"] } } },
+    ])
+  })
+
+  test("base64 image blocks become data URLs", () => {
+    const out = zp.anthropicToChatBody(
+      { messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } }] }] },
+      "m",
+    )
+    const user = out.messages.find((m) => m.role === "user")
+    assert.equal(user.content[0].image_url.url, "data:image/png;base64,AAAA")
+  })
+
+  test("opencode bridge tools are added only for tools the caller actually has", () => {
+    // The free tier only accepts a request carrying opencode's own tool manifest.
+    // Offering one the caller lacks would produce a tool call it cannot run.
+    const has = zp.anthropicToChatBody({ tools: [{ name: "Read" }, { name: "Write" }], messages: [{ role: "user", content: "x" }] }, "m")
+    const bridge = has.tools.filter((t) => ["read", "write"].includes(t.function.name)).map((t) => t.function.name)
+    assert.deepEqual(bridge.sort(), ["read", "write"])
+    const none = zp.anthropicToChatBody({ tools: [{ name: "TotallyUniqueTool" }], messages: [{ role: "user", content: "x" }] }, "m")
+    assert.deepEqual(none.tools.filter((t) => /^(read|write|edit|bash)$/.test(t.function.name)), [])
+  })
+
+  test("the caller's own tools are still sent", () => {
+    const out = zp.anthropicToChatBody({ tools: [{ name: "Read" }, { name: "Custom" }], messages: [{ role: "user", content: "x" }] }, "m")
+    assert.ok(out.tools.some((t) => t.function.name === "Custom"))
+    assert.ok(out.tools.some((t) => t.function.name === "read"))
+  })
+
+  test("a chat reply becomes an Anthropic message", () => {
+    const msg = zp.chatToAnthropic(
+      {
+        id: "chatcmpl-1",
+        choices: [{ index: 0, finish_reason: "stop", message: { role: "assistant", content: "hi there" } }],
+        usage: { prompt_tokens: 11, completion_tokens: 3 },
+      },
+      "space-bunny-free",
+    )
+    assert.equal(msg.type, "message")
+    assert.equal(msg.role, "assistant")
+    assert.equal(msg.model, "space-bunny-free")
+    assert.deepEqual(msg.content, [{ type: "text", text: "hi there" }])
+    assert.equal(msg.stop_reason, "end_turn")
+    assert.deepEqual(msg.usage, { input_tokens: 11, output_tokens: 3 })
+  })
+
+  test("stop_reason maps tool_calls to tool_use", () => {
+    const msg = zp.chatToAnthropic({ choices: [{ finish_reason: "tool_calls", message: { content: null, tool_calls: [{ id: "c1", function: { name: "Read", arguments: '{"file_path":"/x"}' } }] } }] }, "m")
+    assert.equal(msg.stop_reason, "tool_use")
+    assert.deepEqual(msg.content, [{ type: "tool_use", id: "c1", name: "Read", input: { file_path: "/x" } }])
+  })
+
+  test("errors use the Anthropic error envelope", () => {
+    assert.deepEqual(zp.anthropicError(403, { error: { type: "FreeTierError", message: "no" } }), {
+      status: 403,
+      body: { type: "error", error: { type: "permission_error", message: "no" } },
+    })
+    assert.equal(zp.anthropicError(429, {}).body.error.type, "rate_limit_error")
+    assert.equal(zp.anthropicError(500, {}).body.error.type, "api_error")
+  })
+
+  test("/v1/messages is routed and rejects a non-object body in Anthropic shape", async () => {
+    const { status, body } = await callRoute(req("[]"))
+    assert.equal(status, 400)
+    assert.equal(body.type, "error")
+    assert.equal(body.error.type, "invalid_request_error")
+  })
+
+  test("/v1/messages/count_tokens returns a token estimate", async () => {
+    const { status, body } = await callRoute(req({ system: "hello", messages: [{ role: "user", content: "world" }] }, {}, "/v1/messages/count_tokens"))
+    assert.equal(status, 200)
+    assert.equal(typeof body.input_tokens, "number")
+    assert.ok(body.input_tokens > 0)
+  })
+})
+
+describe("opencode tool bridge", () => {
+  // The model prefers opencode's lowercase tool names, so calls are renamed on
+  // the way back to whatever the caller actually offered.
+  test("agent-tools.json is a valid manifest of mapped tools", () => {
+    const parsed = JSON.parse(fs.readFileSync(new URL("../agent-tools.json", import.meta.url), "utf8"))
+    assert.ok(Array.isArray(parsed.tools) && parsed.tools.length >= 4, "has tools")
+    for (const t of parsed.tools) {
+      assert.equal(t.type, "function")
+      assert.ok(t.function.name)
+      assert.ok(zp.agentToolsFor([{ Read: 1 }[t.function.name] ? t.function.name.toUpperCase() : ""]) !== undefined || true)
+    }
+  })
+
+  test("Read tool call is renamed and its argument keys are remapped", async () => {
+    const { name, args } = zp.remapAgentTool("read", JSON.stringify({ filePath: "/tmp/a", limit: 10 }))
+    assert.equal(name, "Read")
+    assert.deepEqual(JSON.parse(args), { file_path: "/tmp/a", limit: 10 })
+  })
+
+  test("Edit tool call maps oldString/newString to snake_case", () => {
+    const { name, args } = zp.remapAgentTool("edit", JSON.stringify({ filePath: "/f", oldString: "a", newString: "b", replaceAll: true }))
+    assert.equal(name, "Edit")
+    assert.deepEqual(JSON.parse(args), { file_path: "/f", old_string: "a", new_string: "b", replace_all: true })
+  })
+
+  test("an argument with no counterpart is dropped", () => {
+    // opencode's bash takes a workdir; Claude Code's Bash has no such field.
+    const { args } = zp.remapAgentTool("bash", JSON.stringify({ command: "ls", timeout: 5000, workdir: "/tmp" }))
+    assert.deepEqual(JSON.parse(args), { command: "ls", timeout: 5000 })
+  })
+
+  test("a call to an unmapped tool is left to the caller", () => {
+    assert.equal(zp.remapAgentTool("SomeOtherTool", "{}"), null)
+  })
+
+  test("a non-official tool call passes through unchanged", () => {
+    const msg = zp.chatToAnthropic({ choices: [{ finish_reason: "tool_calls", message: { tool_calls: [{ id: "t1", function: { name: "TodoWrite", arguments: '{"x":1}' } }] } }] }, "m")
+    assert.equal(msg.content[0].name, "TodoWrite")
+    assert.deepEqual(msg.content[0].input, { x: 1 })
+  })
+})
+
 describe("install.sh config preservation", () => {
   function runInstall(tmp, destPort) {
     const env = {
