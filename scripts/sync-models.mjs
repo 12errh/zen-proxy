@@ -14,7 +14,7 @@ import { execFileSync } from "node:child_process"
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..")
 const MAIN = path.join(ROOT, "zen-proxy.mjs")
 const SNAPSHOT = path.join(ROOT, "free-models.json")
-const UPSTREAM = "https://opencode.ai/zen/v1"
+const UPSTREAM = "https://opencode.ai/inference/v1"
 const UA = "opencode/1.18.30"
 const CONCURRENCY = 3
 const TIMEOUT_MS = 20_000
@@ -65,6 +65,7 @@ async function probe(id, ua, session) {
         authorization: "Bearer public",
         "user-agent": ua,
         "x-opencode-session": session,
+        "x-opencode-session-id": session,
       },
       body: JSON.stringify(
         format === "responses"

@@ -6,8 +6,9 @@
 
 opencode's Zen gateway serves its free `-free` models (`mimo-v2.5-free`, `big-pickle`, `ling-3.0-flash-fin-free`, `nemotron-*-free`, etc.) **only to requests that mimic the opencode client**.
 
-- With the right UA plus an `x-opencode-session` header, `POST https://opencode.ai/zen/v1/chat/completions` with `Authorization: Bearer public` returns HTTP 200.
-- Without the session header the gateway returns **400 MissingSessionID** — `"OpenCode's free tier can only be used in OpenCode"` (this happens even with a valid API key).
+- With the right UA plus the `x-opencode-session` **and** `x-opencode-session-id` headers, `POST https://opencode.ai/inference/v1/chat/completions` with `Authorization: Bearer public` returns HTTP 200.
+- Without a session header the gateway returns **400 MissingSessionID**; with only one of the two session headers it returns **403 FreeTierError**.
+- The legacy `https://opencode.ai/zen/v1` base still answers `/models` but rejects genuine agent traffic with **403 FreeTierError**. The served base is `https://opencode.ai/inference/v1`.
 - Most agents force their own UA and never send a session header, so they cannot use the free tier directly.
 
 zen-proxy solves this by injecting the correct `User-Agent` and a stable per-client `x-opencode-session` upstream, then re-exposing everything as a standard OpenAI-compatible API on `http://127.0.0.1:8787/v1`.

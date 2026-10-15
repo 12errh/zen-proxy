@@ -11,7 +11,7 @@ anonymous free tier &nbsp;◦&nbsp; no accounts &nbsp;◦&nbsp; no keys &nbsp;�
 
 > **Zen Proxy** is a zero-dependency, locally-run OpenAI-compatible proxy that unlocks opencode's Zen free tier **for any coding agent — not just opencode**.
 >
-> opencode gives you free models like `mimo-v2.5-free`, `big-pickle`, and `nemotron` — but only to requests that look like they come from opencode itself: the right `User-Agent` **and** an `x-opencode-session` header. Most agents force their own identity and get shut out with `400 MissingSessionID` ("OpenCode's free tier can only be used in OpenCode") or `429 FreeUsageLimitError`. Zen Proxy quietly speaks for them: it injects the correct `User-Agent`, mints stable per-client session IDs, forwards your real IP, and re-exposes everything as a standard `/v1/chat/completions` + `/v1/models` API.
+> opencode gives you free models like `mimo-v2.5-free`, `big-pickle`, and `nemotron` — but only to requests that look like they come from opencode itself: the right `User-Agent` **and** a complete session identity (`x-opencode-session` *and* `x-opencode-session-id`). Most agents force their own identity and get shut out with `400 MissingSessionID` or `403 FreeTierError` ("OpenCode's free tier can only be used from within OpenCode"). Zen Proxy quietly speaks for them: it injects the correct `User-Agent`, mints stable per-client session IDs, forwards your real IP, and re-exposes everything as a standard `/v1/chat/completions` + `/v1/models` API.
 >
 > The result: whatever tool you love — Cline, Roo Code, Continue, Aider, mimo, or a plain `curl` — can now ride opencode's free models with **zero accounts, zero API keys**, and zero config beyond a `baseURL`.
 
@@ -30,9 +30,9 @@ anonymous free tier &nbsp;◦&nbsp; no accounts &nbsp;◦&nbsp; no keys &nbsp;�
 
 ## why it exists
 
-opencode's free `-free` models (`mimo-v2.5-free`, `big-pickle`, `nemotron`, …) are only served to requests that mimic the real client. Since opencode started requiring an `x-opencode-session` header, anything without it gets `400 MissingSessionID: "OpenCode's free tier can only be used in OpenCode"` — even with a valid API key. Most coding agents — like the *mimo* CLI fork — force their own identity and get slammed with that error (or `429 FreeUsageLimitError`).
+opencode's free `-free` models (`mimo-v2.5-free`, `big-pickle`, `nemotron`, …) are only served to requests that mimic the real client. Since opencode started requiring a full session identity, anything missing it gets `400 MissingSessionID`, and anything carrying only half of it gets `403 FreeTierError: "OpenCode's free tier can only be used from within OpenCode"` — even with a valid API key. The gateway is served from `https://opencode.ai/inference/v1`; the older `/zen/v1` base still lists models but now rejects all agent traffic. Most coding agents — like the *mimo* CLI fork — force their own identity and get slammed with that error (or `429 FreeUsageLimitError`).
 
-**zen-proxy** injects the correct `User-Agent` and a stable synthetic `x-opencode-session` per client, then re-exposes everything as a plain OpenAI API. No accounts, no API keys, no source patches.
+**zen-proxy** injects the correct `User-Agent` and a stable synthetic `x-opencode-session` / `x-opencode-session-id` pair per client, then re-exposes everything as a plain OpenAI API. No accounts, no API keys, no source patches.
 
 > works with: **mimo cli**, **Cline**, **Roo Code**, **Continue**, **Aider**, opencode forks — anything that lets you set a `baseURL` + `apiKey`.
 
@@ -40,7 +40,7 @@ opencode's free `-free` models (`mimo-v2.5-free`, `big-pickle`, `nemotron`, …)
   <p style="margin:0;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:#ccf73a;">▸ feature list</p>
   <ul style="margin:10px 0 0;padding-left:20px;line-height:1.9;font-size:14px;">
     <li><b>OpenAI-compatible API</b> — <code>/v1/chat/completions</code> (stream + non-stream), <code>/v1/models</code>, <code>/v1/responses</code></li>
-    <li><b>UA unlock</b> — injects <code>User-Agent: opencode/1.18.30</code> plus a stable per-client <code>x-opencode-session</code> upstream, the two things that open the free tier</li>
+    <li><b>UA unlock</b> — injects <code>User-Agent: opencode/1.18.30</code> plus a stable per-client <code>x-opencode-session</code> / <code>x-opencode-session-id</code> pair upstream, the things that open the free tier</li>
     <li><b>BYOK</b> — ride anonymous <code>public</code> or bring your own Zen key (stable + no shared-pool throttling)</li>
     <li><b>Smart fallback</b> — tries models in order on <code>429</code>/<code>5xx</code>, honors <code>retry-after</code></li>
     <li><b>Model aliases</b> — e.g. <code>gpt-4o → mimo-v2.5-free</code>, replies rewritten back</li>
@@ -156,11 +156,11 @@ Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded wh
 |---|---|---|
 | `host` | `127.0.0.1` | Bind address (restart needed) |
 | `port` | `8787` | Listen port (restart needed) |
-| `upstream` | `https://opencode.ai/zen/v1` | Zen API base |
+| `upstream` | `https://opencode.ai/inference/v1` | Zen API base |
 | `ua` | `opencode/1.18.30` | The `User-Agent` that unlocks the free tier (auto-updates to new opencode releases) |
 | `autoUA` | `true` | Track opencode releases and update `ua` automatically (`opencode/<latest>`) |
 | `uaRefreshMs` | `21600000` | How often to check for a new opencode version (ms) |
-| `injectSession` | `true` | Mint an `x-opencode-session` header per client (upstream rejects requests without one) |
+| `injectSession` | `true` | Mint the `x-opencode-session` + `x-opencode-session-id` pair per client (upstream rejects requests that lack either) |
 | `gated` (sync state) | — | Models answering `403 FreeTierError`: the free tier only accepts genuine agent requests, so our probe can't verify them. Shown as **agent-only**, kept in the list, never removed |
 | `probeAuth` | `auto` | Credentials for auto-sync health probes: `auto` (your Zen key if set, else anonymous), `anonymous` (always the public free tier), or `key` (always your key, so probes reflect your own quota) |
 | `defaultModel` | `""` | Empty = auto: pick the first *healthy* free model (no more hardcoded/vanished defaults) |

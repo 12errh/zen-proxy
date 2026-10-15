@@ -11,10 +11,22 @@ const CONFIG_PATH = process.env.ZEN_PROXY_CONFIG || path.join(__dirname, "zen-pr
 const UI_PATH = path.join(__dirname, "public", "index.html")
 const ENV = process.env
 
+// Upstream base URL. `/inference/v1` is the base OpenCode documents and the one
+// the CLI itself uses; the older `/zen/v1` path still answers /models but now
+// rejects genuine agent traffic with `403 FreeTierError`, so a config that
+// still points at it silently loses every free model.
+const DEFAULT_UPSTREAM = "https://opencode.ai/inference/v1"
+const LEGACY_UPSTREAMS = new Set(["https://opencode.ai/zen/v1", "https://opencode.ai/zen"])
+function normalizeUpstream(v) {
+  const u = String(v ?? "").trim().replace(/\/+$/, "")
+  if (!u) return DEFAULT_UPSTREAM
+  return LEGACY_UPSTREAMS.has(u.toLowerCase()) ? DEFAULT_UPSTREAM : u
+}
+
 const DEFAULT_CONFIG = {
   host: ENV.HOST ?? "127.0.0.1",
   port: Number(ENV.PORT ?? 8787),
-  upstream: (ENV.ZEN_URL ?? "https://opencode.ai/zen/v1").replace(/\/+$/, ""),
+  upstream: normalizeUpstream(ENV.ZEN_URL ?? DEFAULT_UPSTREAM),
   ua: ENV.ZEN_UA ?? "opencode/1.18.30",
   autoUA: ENV.AUTO_UA !== "0",
   uaRefreshMs: Number(ENV.UA_REFRESH_MS ?? 6 * 3600_000),
@@ -65,7 +77,19 @@ const DEFAULT_CONFIG = {
 function loadConfig() {
   try {
     const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"))
-    return { ...DEFAULT_CONFIG, ...raw }
+    const merged = { ...DEFAULT_CONFIG, ...raw }
+    // Older installs (and the shipped zen-proxy.json) still name the legacy
+    // `/zen/v1` base, which upstream now gates. Upgrade it in place so an
+    // existing config file keeps working after an update.
+    const upstream = normalizeUpstream(merged.upstream)
+    if (upstream !== merged.upstream) {
+      merged.upstream = upstream
+      try {
+        saveConfig({ upstream })
+        log(`upstream migrated to ${upstream} (the legacy /zen/v1 base is no longer served)`)
+      } catch {}
+    }
+    return merged
   } catch {
     return { ...DEFAULT_CONFIG }
   }
@@ -125,23 +149,47 @@ const MAX_BODY = 1024 * 1024
 // not on a chat/responses endpoint, so they are never routable here.
 const NOT_CHAT_SERVABLE = [/^jev-/]
 
-// opencode's free tier requires every request to carry an `x-opencode-session`
-// header (upstream returns 400 `MissingSessionID` otherwise). Generic agents
-// never send one, so we mint stable per-client session IDs and inject them.
+// opencode's free tier requires every request to carry session identity: upstream
+// returns 400 `MissingSessionID` with no session header, and 403 `FreeTierError`
+// when only one of the pair is present. The real CLI sends BOTH headers with the
+// same value, so we mint stable per-client session IDs and inject both.
+// Generic agents send neither, which is why the proxy has to add them.
+//
+// The ID itself has to look like a real one. Upstream decodes the leading 12 hex
+// characters as a creation timestamp and rejects IDs that do not carry a plausible
+// one (`403 FreeTierError`, the same error as a missing header), so a naive
+// `ses_<random hex>` is refused. This mirrors the generator opencode itself uses:
+// `ses_` + 12 hex digits of ~(ms * 0x1000 + counter) + 14 random base62 chars.
+// The trailing characters are random and not checked; the leading 12 are.
+const SESSION_HEADERS = ["x-opencode-session", "x-opencode-session-id"]
+const SESSION_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+// A session stays valid as long as its embedded timestamp is recent. Re-mint on a
+// schedule so a proxy left running for days does not start failing on a stale ID.
+const SESSION_MAX_AGE_MS = 30 * 60_000
 const sessionPool = new Map()
-function genSessionId() {
-  return "ses_" + randomBytes(13).toString("hex")
+let sessionClock = { ms: 0, ctr: 0 }
+function genSessionId(now = Date.now()) {
+  if (now !== sessionClock.ms) {
+    sessionClock.ms = now
+    sessionClock.ctr = 0
+  }
+  sessionClock.ctr++
+  const stamp = BigInt(now) * 0x1000n + BigInt(sessionClock.ctr)
+  const masked = ~stamp
+  const hex = Array.from({ length: 6 }, (_, i) => Number(masked >> BigInt(40 - 8 * i) & 0xffn).toString(16).padStart(2, "0")).join("")
+  const tail = Array.from(randomBytes(14), (b) => SESSION_ALPHABET[b % 62]).join("")
+  return { value: "ses_" + hex + tail, at: now }
 }
 function sessionFor(req) {
   const incoming = req?.headers?.["x-opencode-session"]
   if (typeof incoming === "string" && incoming.trim()) return { value: incoming.trim(), injected: false }
   const key = req ? (ipOmit(clientIp(req)) ? "local" : clientIp(req)) : "server"
-  let id = sessionPool.get(key)
-  if (!id) {
-    id = genSessionId()
-    sessionPool.set(key, id)
+  let hit = sessionPool.get(key)
+  if (!hit || Date.now() - hit.at > SESSION_MAX_AGE_MS) {
+    hit = genSessionId()
+    sessionPool.set(key, hit)
   }
-  return { value: id, injected: true }
+  return { value: hit.value, injected: true }
 }
 function sessionHeader(req) {
   if (!config.injectSession) return undefined
@@ -467,10 +515,15 @@ function zenHeaders(req, auth) {
     "user-agent": config.ua,
   }
   const sess = sessionFor(req)
-  if (sess.injected && config.injectSession) headers["x-opencode-session"] = sess.value
+  // Send both session headers whenever we are allowed to supply one. A client
+  // that brings its own session keeps it; we just mirror it into the second
+  // header so the pair upstream expects is always complete.
+  if (!sess.injected || config.injectSession) {
+    for (const h of SESSION_HEADERS) headers[h] = sess.value
+  }
   const ip = clientIp(req)
   if (!ipOmit(ip)) headers["x-real-ip"] = ip
-  for (const h of ["x-opencode-session", "x-opencode-request", "x-opencode-client", "x-opencode-project"]) {
+  for (const h of ["x-opencode-request", "x-opencode-client", "x-opencode-project"]) {
     const v = req.headers[h]
     if (typeof v === "string" && v) headers[h] = v
   }
@@ -710,7 +763,7 @@ async function probeModel(id, auth, session) {
     authorization: auth,
     "user-agent": config.ua,
   }
-  if (session) headers["x-opencode-session"] = session
+  if (session) for (const h of SESSION_HEADERS) headers[h] = session
   const payload =
     format === "responses"
       ? { model: id, input: "ping", max_output_tokens: 32 }
@@ -1221,7 +1274,7 @@ async function handleTest(req, res) {
           "user-agent": config.ua,
         }
         const sess = sessionHeader(req)
-        if (sess) h["x-opencode-session"] = sess
+        if (sess) for (const name of SESSION_HEADERS) h[name] = sess
         const ip = req.socket.remoteAddress ?? ""
         if (!ipOmit(ip)) h["x-real-ip"] = ip
         return h

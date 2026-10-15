@@ -296,8 +296,43 @@ describe("session injection", () => {
     assert.equal(a1, a2, "same client → same session")
     const b = zp.sessionFor(mockReq({ remoteAddress: "9.9.9.9" })).value
     assert.notEqual(a1, b, "different client → different session")
-    assert.match(a1, /^ses_[0-9a-f]{26}$/)
+    // opencode shape: ses_ + 12 hex digits + 14 random base62 characters.
+    assert.match(a1, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
     assert.ok(zp.sessionFor(mockReq()).injected, "local client gets an injected id")
+  })
+
+  test("a minted session id carries a decodable recent timestamp", () => {
+    // Upstream decodes the leading 12 hex digits as a creation time in opencode's
+    // own format and refuses ids without a plausible one — the same 403 a missing
+    // session header gets. So assert the prefix is the encoding of *some*
+    // millisecond around now, which is the property upstream actually checks.
+    const encode = (now, ctr) => {
+      const a = ~((BigInt(now) << 12n) + BigInt(ctr))
+      return Array.from({ length: 6 }, (_, i) => Number(a >> BigInt(40 - 8 * i) & 0xffn).toString(16).padStart(2, "0")).join("")
+    }
+    const before = Date.now()
+    const id = zp.sessionFor(mockReq({ remoteAddress: "7.7.7.7" })).value
+    const after = Date.now()
+    const prefix = id.slice(4, 16)
+    let ok = false
+    for (let t = before - 1; t <= after + 1 && !ok; t++) {
+      for (const ctr of [1, 2, 3, 4, 5]) if (encode(t, ctr) === prefix) ok = true
+    }
+    assert.ok(ok, `prefix ${prefix} does not encode a timestamp near now`)
+  })
+
+  test("both session headers are sent, with the same value", () => {
+    const req = mockReq({ remoteAddress: "5.5.5.5" })
+    const h = zp.zenHeaders(req, "Bearer public")
+    assert.ok(h["x-opencode-session"], "x-opencode-session present")
+    assert.ok(h["x-opencode-session-id"], "x-opencode-session-id present")
+    assert.equal(h["x-opencode-session"], h["x-opencode-session-id"], "both headers carry one id")
+  })
+
+  test("a client-supplied session is mirrored into the second header", () => {
+    const h = zp.zenHeaders(mockReq({ headers: { "x-opencode-session": "ses_fromclient01" } }), "Bearer public")
+    assert.equal(h["x-opencode-session"], "ses_fromclient01")
+    assert.equal(h["x-opencode-session-id"], "ses_fromclient01")
   })
 })
 
@@ -1611,6 +1646,54 @@ describe("dashboard XSS hardening (static)", () => {
         `no unescaped JS string arg: ${l.trim()}`,
       )
     }
+  })
+})
+
+describe("upstream base URL", () => {
+  // /zen/v1 still serves /models but answers every inference request with
+  // 403 FreeTierError, so a config left pointing at it silently loses the
+  // whole free tier. loadConfig has to upgrade it in place.
+  const loadWith = (upstream) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zen-proxy-upstream-"))
+    const file = path.join(dir, "zen-proxy.json")
+    if (upstream === null) fs.rmSync(file, { force: true })
+    else fs.writeFileSync(file, JSON.stringify({ upstream }))
+    const script = `import { loadConfig } from ${JSON.stringify(new URL("../zen-proxy.mjs", import.meta.url).href)}
+console.log(loadConfig().upstream)`
+    try {
+      return execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+        encoding: "utf8",
+        // CONFIG_PATH is computed at module load, so the override has to arrive
+        // through the environment rather than an assignment inside the script.
+        env: { ...process.env, ZEN_PROXY_CONFIG: file },
+      })
+        // loadConfig logs the migration; the value is the last line it prints.
+        .trim()
+        .split("\n")
+        .pop()
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  test("defaults to the served /inference/v1 base", () => {
+    assert.equal(loadWith(null), "https://opencode.ai/inference/v1")
+  })
+
+  test("a legacy /zen/v1 config is migrated to /inference/v1", () => {
+    assert.equal(loadWith("https://opencode.ai/zen/v1"), "https://opencode.ai/inference/v1")
+  })
+
+  test("a legacy /zen config is migrated too", () => {
+    assert.equal(loadWith("https://opencode.ai/zen"), "https://opencode.ai/inference/v1")
+  })
+
+  test("a trailing slash does not defeat the migration", () => {
+    assert.equal(loadWith("https://opencode.ai/zen/v1/"), "https://opencode.ai/inference/v1")
+  })
+
+  test("an explicit non-legacy upstream is left alone", () => {
+    assert.equal(loadWith("http://127.0.0.1:1234/v1"), "http://127.0.0.1:1234/v1")
   })
 })
 
