@@ -1,6 +1,5 @@
 node_modules/
 .mimocode/
 zen-proxy.json
-free-models.json
 *.log
 .DS_Store

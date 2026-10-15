@@ -146,7 +146,7 @@ Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded wh
 | `gated` (sync state) | — | Models answering `403 FreeTierError`: the free tier only accepts genuine agent requests, so our probe can't verify them. Shown as **agent-only**, kept in the list, never removed |
 | `probeAuth` | `auto` | Credentials for auto-sync health probes: `auto` (your Zen key if set, else anonymous), `anonymous` (always the public free tier), or `key` (always your key, so probes reflect your own quota) |
 | `defaultModel` | `""` | Empty = auto: pick the first *healthy* free model (no more hardcoded/vanished defaults) |
-| `fallbackModels` | `["space-bunny-free","mimo-v2.6-flash-free", …]` | Tried in order on `429`/`5xx` and dead-model `4xx`; auto-sync prunes vanished models and adds new ones |
+| `fallbackModels` | *(from `models.json`)* | Tried in order on `429`/`5xx` and dead-model `4xx`. Omit it to follow the shipped catalog (refreshed by the model-sync Action every 6h); save it from the dashboard to pin your own list |
 | `responsesModels` | `["gpt-5*","gpt-6*","grok-*","muse-spark-*"]` | Models served on `/v1/responses` (patterns may end in `*`); the proxy translates to/from chat completions for you |
 | `rateLimitMax` | `0` (off) | Max chat requests per client per window — `0` disables the limiter |
 | `rateLimitWindowMs` | `60000` | Rate-limit window |
@@ -197,8 +197,11 @@ sudo systemctl enable --now zen-proxy
 
 opencode serves its free models **only to genuine opencode traffic**. Verified by capturing and replaying a real opencode request, the upstream accepts a request only when it carries:
 
+- a valid session pair (`x-opencode-session` **and** `x-opencode-session-id`), **and**
 - `stream: true`, **and**
-- a realistic set of **tool definitions** in the request body
+- a system message carrying opencode's **own** wording (roughly its first 1 kB)
+
+Body size is irrelevant: a realistic 1.5 kB agent prompt of our own wording is refused, and `'x' * 2000` is refused too. Only opencode's actual prompt text passes, so no synthetic probe can verify a free model — a retired model is refused with exactly the same 403, so probing cannot tell the two apart either. Which free models *exist* comes from opencode's public `/models` catalog instead, via `models.json`.
 
 A bare `curl`, a health probe, or any non-agent client gets:
 
@@ -211,14 +214,13 @@ A bare `curl`, a health probe, or any non-agent client gets:
 | badge | meaning |
 |---|---|
 | `ok (live traffic)` | a real request through the proxy succeeded — the strongest signal |
-| `ok` | the health probe got a clean 200 |
-| `agent-only` | free-tier gated: works for real agents, not verifiable by the probe |
+| `agent-only` | the synthetic probe was gated; unproven either way, kept in your list |
 | `flaky` | temporary trouble (timeout, 5xx, rate-limit) |
-| `dead` | upstream says it's gone (`not supported`, 404) — the only state that removes it |
+| `dead` | upstream no longer lists the model in `/models` — the only state that removes it |
 
 ### Does my agent need anything?
 
-If your agent **streams and sends tool definitions** (Claude Code, Cline, Roo Code, Continue, Aider, mimo, opencode itself — all of them do), it works. If it makes simple one-shot calls without tools, those specific calls get gated and the proxy transparently falls back to another free model.
+If your agent **streams** (Claude Code, Cline, Roo Code, Continue, Aider, mimo, opencode itself — all of them do), it works. A one-shot non-streaming client gets gated on those calls, and the proxy transparently falls back to another free model.
 
 You don't need to change anything. When a fallback happens the response tells you:
 

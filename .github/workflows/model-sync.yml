@@ -1,9 +1,15 @@
 name: model-sync
 
-# Keeps the shipped free-model list in sync with opencode's Zen gateway:
-# new -free models get added automatically, vanished ones get dropped, and the
-# hardcoded default stays auto (first healthy free model). Runs a few times a day
+# Keeps models.json in sync with opencode's Zen catalog: new -free models get
+# appended, models upstream no longer offers get removed, and the existing order
+# is preserved so the default model doesn't jump around. Runs a few times a day
 # and can be triggered manually from the Actions tab.
+#
+# There is deliberately no health probe here. The free tier only answers requests
+# that look like genuine agent traffic, so a synthetic probe is refused with 403
+# FreeTierError whether or not the model actually works — and a retired model is
+# refused the same way. The public /models catalog needs no auth and is the only
+# authoritative answer to "which free models exist".
 on:
   schedule:
     - cron: "17 */6 * * *" # every 6 hours, minute 17

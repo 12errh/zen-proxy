@@ -1,10 +1,12 @@
 import { test, describe, beforeEach, after } from "node:test"
 import assert from "node:assert/strict"
 import fs from "node:fs"
+import http from "node:http"
 import os from "node:os"
 import path from "node:path"
-import { execFileSync } from "node:child_process"
+import { execFile, execFileSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
+import { promisify } from "node:util"
 
 // Must be set before importing the module (CONFIG_PATH is computed at load).
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "zen-proxy-test-"))
@@ -1649,6 +1651,147 @@ describe("dashboard XSS hardening (static)", () => {
   })
 })
 
+describe("shipped model catalog (models.json)", () => {
+  // models.json is the source of truth for the free-model list; the model-sync
+  // Action keeps it current and the proxy reads it at startup.
+  const REPO_MODELS = new URL("../models.json", import.meta.url)
+
+  test("models.json exists and is a well-formed catalog", () => {
+    const parsed = JSON.parse(fs.readFileSync(REPO_MODELS, "utf8"))
+    assert.ok(Array.isArray(parsed.models) && parsed.models.length > 0, "has a non-empty models array")
+    assert.match(parsed.updatedAt, /^\d{4}-\d{2}-\d{2}T/)
+    assert.equal(typeof parsed.upstream, "string")
+  })
+
+  test("every shipped id is routable and inside the safe charset", () => {
+    const { models } = JSON.parse(fs.readFileSync(REPO_MODELS, "utf8"))
+    for (const id of models) {
+      assert.match(id, /^[A-Za-z0-9._:@+/%-]+$/)
+      assert.ok(!/^jev-/.test(id), `jev-* is served on /systemone, not chat: ${id}`)
+      assert.equal(new Set(models).size, models.length, "no duplicates")
+    }
+  })
+
+  test("the proxy reads its list from models.json", () => {
+    const { models } = JSON.parse(fs.readFileSync(REPO_MODELS, "utf8"))
+    assert.deepEqual(zp.loadShippedModels(), models)
+  })
+
+  test("a missing or broken models.json falls back to a baked-in list", () => {
+    const run = (contents) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zen-proxy-catalog-"))
+      const file = path.join(dir, "models.json")
+      if (contents !== null) fs.writeFileSync(file, contents)
+      const script = `import { loadShippedModels } from ${JSON.stringify(new URL("../zen-proxy.mjs", import.meta.url).href)}
+console.log(JSON.stringify(loadShippedModels()))`
+      try {
+        return JSON.parse(
+          execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+            encoding: "utf8",
+            env: { ...process.env, ZEN_PROXY_MODELS: file },
+          }).trim(),
+        )
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    }
+    assert.ok(run(null).length > 0, "missing file still yields a list")
+    assert.ok(run("{ not json").length > 0, "unparseable file still yields a list")
+    assert.ok(run(JSON.stringify({ models: [] })).length > 0, "empty catalog still yields a list")
+    assert.deepEqual(run(JSON.stringify({ models: ["a-free", 7, "b/../free", ""] })), ["a-free", "b/../free"])
+  })
+})
+
+describe("model list pinning", () => {
+  // A config that carries its own list is pinned and stays pinned. One that only
+  // ever held a list shipped by an older build is released so it starts tracking
+  // models.json again — otherwise existing installs freeze on a stale list.
+  const load = (cfg) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zen-proxy-pin-"))
+    const file = path.join(dir, "zen-proxy.json")
+    if (cfg !== null) fs.writeFileSync(file, JSON.stringify(cfg))
+    const script = `import { config, isFallbackModelsPinned, loadShippedModels } from ${JSON.stringify(new URL("../zen-proxy.mjs", import.meta.url).href)}
+console.log(JSON.stringify({ pinned: isFallbackModelsPinned(), n: config.fallbackModels.length, shipped: loadShippedModels().length }))`
+    try {
+      return {
+        state: JSON.parse(
+          execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+            encoding: "utf8",
+            env: { ...process.env, ZEN_PROXY_CONFIG: file },
+          })
+            .trim()
+            .split("\n")
+            .pop(),
+        ),
+        onDisk: cfg === null ? null : JSON.parse(fs.readFileSync(file, "utf8")),
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  test("no config file means the list follows models.json", () => {
+    const { state } = load(null)
+    assert.equal(state.pinned, false)
+    assert.equal(state.n, state.shipped)
+  })
+
+  test("a config with no list follows models.json", () => {
+    const { state } = load({ port: 8787 })
+    assert.equal(state.pinned, false)
+    assert.equal(state.n, state.shipped)
+  })
+
+  test("a genuinely custom list is pinned and kept", () => {
+    const { state, onDisk } = load({ fallbackModels: ["space-bunny-free", "not-a-shipped-model"] })
+    assert.equal(state.pinned, true)
+    assert.equal(state.n, 2)
+    assert.deepEqual(onDisk.fallbackModels, ["space-bunny-free", "not-a-shipped-model"])
+  })
+
+  test("a list left by an older build is released back to models.json", () => {
+    // An older build persisted its default list into the user's config, and the
+    // runtime sync pruned dead entries and saved the result — so the stored list
+    // is a subset of what we shipped, never a deliberate edit.
+    const baked = JSON.parse(fs.readFileSync(new URL("../models.json", import.meta.url), "utf8")).models
+    const subset = [baked[0], baked[2]]
+    const { state, onDisk } = load({ fallbackModels: subset })
+    assert.equal(state.pinned, false, "released")
+    assert.equal(state.n, state.shipped)
+    assert.equal("fallbackModels" in onDisk, false, "stale key removed from disk")
+  })
+
+  test("an unrelated save never re-pins the list", () => {
+    // Regression: saveConfig merges the whole in-memory config, so a save
+    // triggered by something else (auto-UA refresh, key change) used to write
+    // fallbackModels back to disk and freeze this install on today's catalog.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zen-proxy-nopin-"))
+    const cfg = path.join(dir, "zen-proxy.json")
+    const mod = new URL("../zen-proxy.mjs", import.meta.url).href
+    fs.writeFileSync(cfg, JSON.stringify({ port: 8799 }))
+    const script = `import { config, saveConfig, isFallbackModelsPinned } from ${JSON.stringify(mod)}
+saveConfig({ ua: "opencode/9.9.9" })
+console.log(JSON.stringify({ pinned: isFallbackModelsPinned(), n: config.fallbackModels.length }))`
+    try {
+      const out = JSON.parse(
+        execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+          encoding: "utf8",
+          env: { ...process.env, ZEN_PROXY_CONFIG: cfg },
+        })
+          .trim()
+          .split("\n")
+          .pop(),
+      )
+      const onDisk = JSON.parse(fs.readFileSync(cfg, "utf8"))
+      assert.equal(out.pinned, false)
+      assert.equal("fallbackModels" in onDisk, false, "list must not be persisted while following models.json")
+      assert.equal(onDisk.ua, "opencode/9.9.9", "the actual change was saved")
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
 describe("upstream base URL", () => {
   // /zen/v1 still serves /models but answers every inference request with
   // 403 FreeTierError, so a config left pointing at it silently loses the
@@ -1694,6 +1837,126 @@ console.log(loadConfig().upstream)`
 
   test("an explicit non-legacy upstream is left alone", () => {
     assert.equal(loadWith("http://127.0.0.1:1234/v1"), "http://127.0.0.1:1234/v1")
+  })
+})
+
+describe("model-sync bot (scripts/sync-models.mjs)", () => {
+  // The bot's whole job is to keep models.json equal to the free subset of
+  // opencode's public catalog, in a stable order. It must never wipe the file,
+  // never re-add a model upstream dropped, and never list a non-chat model.
+  //
+  // These are async because the stub upstream lives in this process: execFile
+  // has to yield so the event loop can answer the bot's request.
+  const execFileP = promisify(execFile)
+  const SCRIPT_REL = "scripts/sync-models.mjs"
+
+  // Spins up a stub catalog endpoint, runs the bot in a throwaway git repo, and
+  // reports what it changed.
+  async function runBot({ start, startRaw, upstream, status = 200 }) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zen-proxy-bot-"))
+    const git = (...a) => execFileSync("git", a, { cwd: dir, encoding: "utf8" })
+    git("init", "-q")
+    git("config", "user.email", "bot@test")
+    git("config", "user.name", "bot")
+    fs.mkdirSync(path.join(dir, "scripts"), { recursive: true })
+    fs.copyFileSync(new URL("../scripts/sync-models.mjs", import.meta.url), path.join(dir, SCRIPT_REL))
+    if (startRaw !== undefined) fs.writeFileSync(path.join(dir, "models.json"), startRaw)
+    else if (start !== null && start !== undefined) fs.writeFileSync(path.join(dir, "models.json"), JSON.stringify(start, null, 2))
+    git("add", "-A")
+    git("commit", "-qm", "seed")
+    const before = execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim()
+
+    const server = http.createServer((req, res) => {
+      res.writeHead(status, { "content-type": "application/json" })
+      res.end(status === 200 ? JSON.stringify({ object: "list", data: (upstream ?? []).map((id) => ({ id, object: "model" })) }) : "nope")
+    })
+    await new Promise((r) => server.listen(0, "127.0.0.1", r))
+    let ok = true
+    let log = ""
+    try {
+      const out = await execFileP(process.execPath, [SCRIPT_REL], {
+        cwd: dir,
+        encoding: "utf8",
+        env: { ...process.env, ZEN_URL: `http://127.0.0.1:${server.address().port}/v1` },
+      })
+      log = out.stdout
+    } catch (e) {
+      ok = false
+      log = `${e.stdout ?? ""}${e.stderr ?? ""}`
+    } finally {
+      server.close()
+    }
+    const after = execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim()
+    const result = { ok, log, committed: before !== after, catalog: JSON.parse(fs.readFileSync(path.join(dir, "models.json"), "utf8")) }
+    fs.rmSync(dir, { recursive: true, force: true })
+    return result
+  }
+
+  test("adds newly offered free models, keeps order, drops vanished ones", async () => {
+    const r = await runBot({
+      start: { models: ["alpha-free", "beta-free", "ghost-free"] },
+      upstream: ["alpha-free", "beta-free", "gamma-free", "paid-model", "delta-preview-free", "beta-free"],
+    })
+    assert.deepEqual(r.catalog.models, ["alpha-free", "beta-free", "delta-preview-free", "gamma-free"])
+    assert.equal(r.committed, true)
+    assert.match(r.log, /added=\[delta-preview-free, gamma-free\]/)
+    assert.match(r.log, /removed=\[ghost-free\]/)
+  })
+
+  test("keeps stealth free models that lack the -free suffix", async () => {
+    // big-pickle has no suffix upstream; a plain suffix filter would evict it.
+    const r = await runBot({ start: null, upstream: ["big-pickle", "alpha-free", "gpt-5"] })
+    assert.deepEqual(r.catalog.models, ["alpha-free", "big-pickle"])
+  })
+
+  test("never lists jev-* (served on /systemone, not chat)", async () => {
+    const r = await runBot({ start: null, upstream: ["alpha-free", "jev-1.13-free", "jev-9-free"] })
+    assert.deepEqual(r.catalog.models, ["alpha-free"])
+  })
+
+  test("keeps only ids inside the safe charset", async () => {
+    // `/` and `.` are legal in provider-qualified ids such as
+    // `alibaba/qwen3.7-plus`, so they stay. What must never survive is
+    // whitespace, quotes, backslashes or shell metacharacters.
+    const r = await runBot({
+      start: null,
+      upstream: ["alpha-free", "nvidia/nemotron-3-free", "bad id-free", "q\"uote-free", "semi;colon-free", "$(cmd)-free"],
+    })
+    assert.ok(r.catalog.models.includes("nvidia/nemotron-3-free"), "provider-qualified ids survive")
+    assert.deepEqual(r.catalog.models, ["alpha-free", "nvidia/nemotron-3-free"])
+  })
+
+  test("is idempotent: an unchanged catalog produces no commit", async () => {
+    const upstream = ["alpha-free", "beta-free"]
+    const first = await runBot({ start: null, upstream })
+    assert.equal(first.committed, true)
+    const second = await runBot({ start: first.catalog, upstream })
+    assert.equal(second.committed, false, "no commit when nothing changed")
+    assert.match(second.log, /unchanged/)
+    assert.deepEqual(second.catalog.models, first.catalog.models)
+  })
+
+  test("refuses to wipe the catalog when upstream offers no free models", async () => {
+    const r = await runBot({ start: { models: ["alpha-free", "beta-free"] }, upstream: ["paid-model"] })
+    assert.equal(r.ok, false, "exits non-zero rather than shipping an empty list")
+    assert.deepEqual(r.catalog.models, ["alpha-free", "beta-free"], "catalog untouched")
+  })
+
+  test("leaves the catalog untouched when upstream errors", async () => {
+    const r = await runBot({ start: { models: ["alpha-free"] }, upstream: [], status: 503 })
+    assert.equal(r.ok, false)
+    assert.deepEqual(r.catalog.models, ["alpha-free"])
+  })
+
+  test("bootstraps from a missing catalog", async () => {
+    const r = await runBot({ start: null, upstream: ["alpha-free", "beta-free"] })
+    assert.deepEqual(r.catalog.models, ["alpha-free", "beta-free"])
+  })
+
+  test("recovers from a corrupt catalog", async () => {
+    const r = await runBot({ startRaw: "{ not json at all", upstream: ["alpha-free", "beta-free"] })
+    assert.equal(r.ok, true)
+    assert.deepEqual(r.catalog.models, ["alpha-free", "beta-free"])
   })
 })
 

@@ -11,6 +11,12 @@ const CONFIG_PATH = process.env.ZEN_PROXY_CONFIG || path.join(__dirname, "zen-pr
 const UI_PATH = path.join(__dirname, "public", "index.html")
 const ENV = process.env
 
+// Model ids only ever travel inside JSON bodies, never a URL or a path, so the
+// guarantee here is narrow but real: whitespace, quotes, backslashes and shell
+// metacharacters can never enter a catalog or config value. `/` and `.` stay
+// because provider-qualified ids legitimately use them (`nvidia/nemotron-3-free`).
+const VALID_MODEL_ID = /^[A-Za-z0-9._:@+/%-]+$/
+
 // Upstream base URL. `/inference/v1` is the base OpenCode documents and the one
 // the CLI itself uses; the older `/zen/v1` path still answers /models but now
 // rejects genuine agent traffic with `403 FreeTierError`, so a config that
@@ -21,6 +27,37 @@ function normalizeUpstream(v) {
   const u = String(v ?? "").trim().replace(/\/+$/, "")
   if (!u) return DEFAULT_UPSTREAM
   return LEGACY_UPSTREAMS.has(u.toLowerCase()) ? DEFAULT_UPSTREAM : u
+}
+
+// ---- shipped model catalog -------------------------------------------------
+// models.json is the source of truth for which free models we offer. The
+// model-sync GitHub Action keeps it current from opencode's public /models
+// endpoint — new free models get appended, ones upstream drops get removed — so
+// a fresh install always starts on the current list without touching this file.
+// Baked in as a last resort so the proxy still runs if models.json is missing
+// (an older checkout, or a partial install).
+const MODELS_PATH = process.env.ZEN_PROXY_MODELS || path.join(__dirname, "models.json")
+const BAKED_MODELS = [
+  "space-bunny-free",
+  "mimo-v2.6-flash-free",
+  "big-pickle",
+  "muse-spark-1.3-contributor-free",
+  "muse-spark-1.2-contributor-free",
+  "nemotron-3.5-lightning-free",
+  "longcat-2.5-preview-free",
+  "step-5-preview-free",
+  "cat-jam-free",
+  "deepseek-v4.1-flash-free",
+  "nemotron-3.5-super-vl-free",
+]
+function loadShippedModels() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(MODELS_PATH, "utf8"))
+    const models = Array.isArray(parsed?.models) ? parsed.models : []
+    const clean = models.filter((id) => typeof id === "string" && VALID_MODEL_ID.test(id))
+    if (clean.length) return clean
+  } catch {}
+  return [...BAKED_MODELS]
 }
 
 const DEFAULT_CONFIG = {
@@ -40,22 +77,7 @@ const DEFAULT_CONFIG = {
   // (see effectiveDefault), so a model that disappears upstream never bricks new
   // installs. Set an explicit model here to pin it.
   defaultModel: ENV.DEFAULT_MODEL ?? "",
-  fallbackModels: JSON.parse(
-    ENV.FALLBACK_MODELS ??
-      JSON.stringify([
-        "space-bunny-free",
-        "mimo-v2.6-flash-free",
-        "big-pickle",
-        "muse-spark-1.3-contributor-free",
-        "muse-spark-1.2-contributor-free",
-        "nemotron-3.5-lightning-free",
-        "longcat-2.5-preview-free",
-        "step-5-preview-free",
-        "cat-jam-free",
-        "deepseek-v4.1-flash-free",
-        "nemotron-3.5-super-vl-free",
-      ]),
-  ),
+  fallbackModels: JSON.parse(ENV.FALLBACK_MODELS ?? JSON.stringify(loadShippedModels())),
   modelAliases: JSON.parse(ENV.MODEL_ALIASES ?? "{}"),
   // opencode Zen serves each model on a specific endpoint family
   // (chat/completions | responses | messages). Patterns may end in `*`.
@@ -75,10 +97,40 @@ const DEFAULT_CONFIG = {
   autoSyncIntervalMs: Number(ENV.AUTO_SYNC_MS ?? 3600000),
 }
 
+// True when the user's own config carries an explicit model list. While it is
+// false the list comes from models.json, so catalog refreshes reach installs that
+// never touched the setting. It flips to true the moment someone edits the list
+// in the dashboard (or sets FALLBACK_MODELS), and "Restore defaults" flips it
+// back.
+let fallbackModelsPinned = false
+
 function loadConfig() {
   try {
     const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"))
     const merged = { ...DEFAULT_CONFIG, ...raw }
+    // A config file that predates the models.json catalog still holds a list
+    // written by an older build. Those are only ever subsets of what we shipped
+    // (the runtime sync used to prune dead entries and save the result), so
+    // treat them as "never edited" and go back to following models.json —
+    // otherwise an existing install would be pinned to a frozen list forever and
+    // never see a catalog refresh. Anyone who really wants their own list can
+    // re-pin it from the dashboard, which re-adds the key.
+    const pinnedList = Array.isArray(raw.fallbackModels) ? raw.fallbackModels.filter((m) => typeof m === "string") : null
+    const looksShipped = pinnedList != null && pinnedList.length > 0 && pinnedList.every((m) => BAKED_MODELS.includes(m))
+    if (looksShipped) {
+      merged.fallbackModels = loadShippedModels()
+      fallbackModelsPinned = false
+      try {
+        // Written straight to disk rather than through saveConfig: loadConfig
+        // runs while `config` is still being initialised, so saveConfig cannot
+        // read it yet.
+        writeConfigFile({ ...raw, fallbackModels: undefined })
+        log("model list now follows models.json (was a default list from an older build)")
+      } catch {}
+    } else {
+      fallbackModelsPinned = pinnedList != null && pinnedList.length > 0
+      if (!fallbackModelsPinned) merged.fallbackModels = loadShippedModels()
+    }
     // Older installs (and the shipped zen-proxy.json) still name the legacy
     // `/zen/v1` base, which upstream now gates. Upgrade it in place so an
     // existing config file keeps working after an update.
@@ -86,13 +138,14 @@ function loadConfig() {
     if (upstream !== merged.upstream) {
       merged.upstream = upstream
       try {
-        saveConfig({ upstream })
+        writeConfigFile({ ...raw, upstream })
         log(`upstream migrated to ${upstream} (the legacy /zen/v1 base is no longer served)`)
       } catch {}
     }
     return merged
   } catch {
-    return { ...DEFAULT_CONFIG }
+    fallbackModelsPinned = false
+    return { ...DEFAULT_CONFIG, fallbackModels: loadShippedModels() }
   }
 }
 
@@ -121,10 +174,31 @@ if (isMain) {
   } catch {}
 }
 
+function isFallbackModelsPinned() {
+  return fallbackModelsPinned
+}
+
+function writeConfigFile(obj) {
+  fs.writeFileSync(CONFIG_PATH + ".tmp", JSON.stringify(obj, null, 2))
+  fs.renameSync(CONFIG_PATH + ".tmp", CONFIG_PATH)
+}
+
 function saveConfig(next) {
   const merged = { ...config, ...next }
-  fs.writeFileSync(CONFIG_PATH + ".tmp", JSON.stringify(merged, null, 2))
-  fs.renameSync(CONFIG_PATH + ".tmp", CONFIG_PATH)
+  // Passing `fallbackModels: undefined` means "drop the pinned list and follow
+  // models.json again". JSON.stringify omits undefined values, so the key is
+  // removed from the file while memory keeps the shipped list in use.
+  const unpin = next && "fallbackModels" in next && next.fallbackModels === undefined
+  if (unpin) {
+    merged.fallbackModels = loadShippedModels()
+    fallbackModelsPinned = false
+  }
+  // While the list is following models.json it must stay out of the config file:
+  // any unrelated save (an auto-UA refresh, a key change) would otherwise merge
+  // the in-memory list back to disk and silently pin this install to whatever
+  // the catalog said today.
+  const forDisk = unpin || !fallbackModelsPinned ? { ...merged, fallbackModels: undefined } : merged
+  writeConfigFile(forDisk)
   config = merged
   return merged
 }
@@ -143,9 +217,8 @@ function sanitize(cfg) {
 }
 
 const ALLOWED = () => new Set([...config.fallbackModels, ...Object.values(config.modelAliases)])
-const requestStats = { total: 0, errors: 0, recent: [], perMinute: new Map(), window60: [] }
-const VALID_MODEL_ID = /^[A-Za-z0-9._:@+/%-]+$/
 const MAX_BODY = 1024 * 1024
+const requestStats = { total: 0, errors: 0, recent: [], perMinute: new Map(), window60: [] }
 // jev-* free models are served on /v1/systemone (structured classification),
 // not on a chat/responses endpoint, so they are never routable here.
 const NOT_CHAT_SERVABLE = [/^jev-/]
@@ -1014,8 +1087,13 @@ async function syncModels() {
     const changed = newList.join(",") !== current.join(",")
     if (changed && newList.length) {
       config.fallbackModels = newList
-      try { saveConfig({ fallbackModels: newList }) } catch {}
-      log(`auto-sync: updated model list (${working.length} ok, ${rateLimited.length} rate-limited, ${gated.length} agent-only, ${flaky.length} flaky, ${dead.length} dead)`)
+      // Only a user-owned list is written back. If the list is still following
+      // models.json, persisting it here would pin this install to today's
+      // catalog and it would never see the next bot refresh.
+      if (fallbackModelsPinned) {
+        try { saveConfig({ fallbackModels: newList }) } catch {}
+      }
+      log(`auto-sync: updated model list (${working.length} ok, ${rateLimited.length} rate-limited, ${gated.length} agent-only, ${flaky.length} flaky, ${dead.length} dead${fallbackModelsPinned ? "" : ", not pinned"})`)
     } else {
       log(`auto-sync: list unchanged (${working.length} ok, ${rateLimited.length} rate-limited, ${gated.length} agent-only, ${flaky.length} flaky, ${dead.length} dead)`)
     }
@@ -1132,18 +1210,16 @@ async function handleApiConfig(req, res) {
   if (!adminAuth(req, res)) return
   if (req.method === "GET") return json(res, 200, { config: sanitize(config) })
   if (req.method === "POST") {
-    // Reset the model list back to the shipped defaults (useful if the list was
-    // trimmed by an older build or edited by hand). User keys are untouched.
+    // Stop following a pinned list and go back to tracking models.json, so this
+    // install sees every catalog refresh from now on. Any hand-added models are
+    // dropped — that is what "restore defaults" means. User keys are untouched.
     try {
       const body = await readBody(req)
       const parsed = body ? JSON.parse(body) : {}
       if (parsed.fallbackModels !== true) return json(res, 400, { error: "unsupported action" })
-      const shipped = JSON.parse(JSON.stringify(DEFAULT_CONFIG.fallbackModels))
-      const kept = config.fallbackModels.filter((m) => !shipped.includes(m))
-      const merged = [...new Set([...kept, ...shipped])]
-      saveConfig({ fallbackModels: merged })
+      saveConfig({ fallbackModels: undefined })
       scheduleSync()
-      log(`model list restored to defaults (${merged.length} models)`)
+      log(`model list restored — now following models.json (${config.fallbackModels.length} models)`)
       return json(res, 200, { ok: true, config: sanitize(config) })
     } catch (err) {
       return json(res, 400, { error: err.message })
@@ -1179,6 +1255,9 @@ async function handleApiConfig(req, res) {
         cleaned.defaultZenKey = config.defaultZenKey
       }
       if (!Array.isArray(cleaned.fallbackModels)) cleaned.fallbackModels = config.fallbackModels
+      // Saving from the dashboard is an explicit edit of the list, so from here on
+      // this install owns it rather than tracking models.json.
+      else fallbackModelsPinned = true
       if (!Array.isArray(cleaned.responsesModels)) cleaned.responsesModels = config.responsesModels
       if (typeof cleaned.modelAliases !== "object" || cleaned.modelAliases === null) {
         cleaned.modelAliases = config.modelAliases
@@ -1225,6 +1304,9 @@ async function handleStatus(req, res) {
     models: {
       total: cache.data.length,
       allowed: ALLOWED().size,
+      // false = following models.json, so catalog refreshes apply automatically.
+      // true = this install owns its own list.
+      followsCatalog: !fallbackModelsPinned,
       served: cache.data.map((m) => m.id),
     },
     sync: {
@@ -1411,7 +1493,11 @@ if (isMain) {
     log(`config file: ${CONFIG_PATH}  UI: /`)
     if (!fs.existsSync(CONFIG_PATH)) {
       try {
-        fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2))
+        // fallbackModels is deliberately left out: it comes from models.json, so
+        // writing it here would pin this install to today's catalog and it would
+        // never see a refresh.
+        const { fallbackModels, ...seed } = config
+        fs.writeFileSync(CONFIG_PATH, JSON.stringify(seed, null, 2))
         log(`created default config: ${CONFIG_PATH}`)
       } catch {}
     }
@@ -1432,6 +1518,8 @@ export {
   isMain,
   config,
   loadConfig,
+  loadShippedModels,
+  isFallbackModelsPinned,
   saveConfig,
   sanitize,
   maskKey,
