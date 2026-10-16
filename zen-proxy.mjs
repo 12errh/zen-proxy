@@ -127,21 +127,16 @@ function loadAgentTools() {
   try {
     const parsed = JSON.parse(fs.readFileSync(AGENT_TOOLS_PATH, "utf8"))
     const tools = Array.isArray(parsed?.tools) ? parsed.tools : []
-    // type is required: chatToolsToResponses() drops anything else, and a hand-written
-    // manifest missing it would make the injected bridge tool unconvertible.
+    // chatToolsToResponses() drops tools without type, which would make the
+    // bridge tool unconvertible and kill the process mid-request.
     agentToolsCache = tools.filter((t) => t?.type === "function" && t?.function?.name && AGENT_TOOL_MAP[t.function.name])
   } catch {}
   return agentToolsCache
 }
 
-// The free tier's gate rejects any request without opencode's own tool
-// definitions. A caller that sends none — a plain chat, pi's auto-compaction,
-// title generation — has nothing for agentToolsFor() to match, so offer the
-// cheapest thing that satisfies the gate: one opencode tool, pinned off with
-// tool_choice so the model cannot call a tool the caller cannot run.
-//
-// `read` is the tool the gateway accepts; measured against the live gateway,
-// every other name in the manifest (bash, edit, write, grep, glob) gets a 403.
+// The gate wants opencode's tools, but a caller that sends none — a plain chat,
+// pi's auto-compaction — has nothing for agentToolsFor() to match. `read` is the
+// only name it accepts; bash, edit, write, grep and glob all 403, measured live.
 function gateBridgeTool() {
   if (!config.agentTools) return null
   const tools = loadAgentTools()
@@ -1133,10 +1128,9 @@ async function handleChat(req, res) {
     if (bridge) {
       const tools = format === "responses" ? chatToolsToResponses([bridge]) : [bridge]
       payload.tools = [...(payload.tools ?? []), ...tools]
-      // shortcut: the Responses API only accepts tool_choice "auto", so on that
-      // route the injected tool stays callable and the model may answer with a
-      // read call the caller cannot run. Remap it in relayResponsesStream the
-      // day the format gains a "none" equivalent.
+      // shortcut: the Responses API takes only tool_choice "auto", so there the
+      // bridge stays callable and the model may answer with a read call the
+      // caller cannot run. Remap it in relayResponsesStream to close that.
       if (format !== "responses") payload.tool_choice = "none"
     }
     let upstreamRes

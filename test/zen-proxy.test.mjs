@@ -2143,16 +2143,8 @@ describe("opencode tool bridge", () => {
 })
 
 describe("free tier gate on the chat path", () => {
-  // The free tier rejects any request that does not carry opencode's own tool
-  // definitions, so a caller's tool-less utility call (pi's auto-compaction,
-  // titles, commit messages) used to get a hard 403. The proxy attaches one
-  // bridge tool instead, pinned off with tool_choice so the model cannot call it.
-  const opencodeNames = Object.keys(zp.AGENT_TOOL_MAP)
-
-  // Stands in for the gate, measured against the live gateway: it accepts a
-  // request carrying opencode's `read` tool and 403s every other tool name in
-  // the manifest. A mock that accepts any manifest name hides the bug this
-  // suite exists to catch.
+  // Accepts only `read`, measured against the live gateway. A mock that accepts
+  // any manifest name lets a wrong bridge tool pass here and 403 in production.
   const gate = (seen) => (u, opts) => {
     const sent = JSON.parse(opts.body)
     seen.push(sent)
@@ -2197,8 +2189,8 @@ describe("free tier gate on the chat path", () => {
     assert.equal(res.state.status, 200)
     assert.match(seen[0].url, /\/responses$/)
     assert.deepEqual((seen[0].sent.tools ?? []).map((t) => t.name), ["read"])
-    // Measured against the live gateway: the Responses API rejects tool_choice
-    // "none" ("only auto is supported"), so the tool goes over unpinned there.
+    // The live gateway rejects tool_choice "none" on /responses ("only auto is
+    // supported"), so this assertion pins the asymmetry rather than an oversight.
     assert.equal(seen[0].sent.tool_choice, undefined)
   })
 
