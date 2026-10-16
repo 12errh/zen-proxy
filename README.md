@@ -10,6 +10,12 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-ccf73a?style=flat-square&labelColor=1a1612" alt="MIT License"></a>
   <img src="https://img.shields.io/badge/node-%3E%3D18-8b8b8b?style=flat-square&labelColor=1a1612" alt="Node 18+">
   <img src="https://img.shields.io/badge/dependencies-0-8b8b8b?style=flat-square&labelColor=1a1612" alt="Zero dependencies">
+  <a href="#any-openai-compatible-agent">
+    <img src="https://img.shields.io/badge/OpenAI_compatible-ccf73a?style=flat-square&labelColor=1a1612&logo=openai" alt="OpenAI compatible">
+  </a>
+  <a href="#claude-code">
+    <img src="https://img.shields.io/badge/Claude_Code-compatible-ccf73a?style=flat-square&labelColor=1a1612&logo=anthropic" alt="Claude Code compatible">
+  </a>
 </p>
 
 ---
@@ -214,8 +220,18 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc      # permanent
 
 ---
 
-## More
+<p align="center">
+  <sub>Machine-readable: <a href="llms.txt">llms.txt</a> &nbsp;·&nbsp; <a href="llms-full.txt">llms-full.txt</a></sub>
+</p>
 
-- [llms.txt](llms.txt) — condensed reference for agents
-- [llms-full.txt](llms-full.txt) — everything in one file
-- Issues: https://github.com/12errh/zen-proxy/issues
+<p align="center">
+  <a href="https://github.com/12errh/zen-proxy/issues">
+    <img src="https://img.shields.io/badge/issues-12errh%2Fzen-proxy-ccf73a?style=flat-square&labelColor=1a1612" alt="Report an issue">
+  </a>
+  <a href="https://github.com/12errh/zen-proxy">
+    <img src="https://img.shields.io/badge/source-12errh%2Fzen-proxy-8b8b8b?style=flat-square&labelColor=1a1612" alt="Source">
+  </a>
+  <a href="LICENSE">
+    <img src="https://img.shields.io/badge/license-MIT-8b8b8b?style=flat-square&labelColor=1a1612" alt="MIT License">
+  </a>
+</p>
