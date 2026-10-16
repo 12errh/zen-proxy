@@ -140,14 +140,25 @@ curl -s http://127.0.0.1:8787/v1/models -H "Authorization: Bearer public"
 
 Claude Code speaks the Anthropic Messages API, which zen-proxy implements directly. The installer drops a `zen-claude` command on your `PATH`:
 
+**Linux / macOS**
+
 ```bash
 zen-proxy &      # terminal 1
 zen-claude       # terminal 2 — done
 ```
 
-That's the whole setup. `zen-claude` runs Claude Code against `http://127.0.0.1:8787` on a free model, and `zen-claude "fix the failing test"` works too.
+**Windows (PowerShell)** — same two commands:
 
-It works by passing `--settings`, not by exporting environment variables — **Claude Code reads env from `~/.claude/settings.json` and that wins over your shell**, so if you already have `ANTHROPIC_BASE_URL` set there, `export` would be silently ignored. The wrapper leaves your existing Claude Code configuration untouched.
+```powershell
+zen-proxy        # terminal 1
+zen-claude       # terminal 2
+```
+
+The installer puts both on your `PATH` (on Windows it also adds `~/.local/bin` to your user `PATH` for you). `zen-claude "fix the failing test"` works too.
+
+That's the whole setup. `zen-claude` runs Claude Code against `http://127.0.0.1:8787` on a free model.
+
+Both launchers work by passing `--settings`, not by exporting environment variables — **Claude Code reads env from `~/.claude/settings.json` and that wins over your shell**, so if you already have `ANTHROPIC_BASE_URL` set there, `export` would be silently ignored. The launchers leave your existing Claude Code configuration untouched, and a plain `claude` still uses it.
 
 <details>
 <summary>Prefer to wire it up yourself?</summary>

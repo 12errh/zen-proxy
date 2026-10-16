@@ -81,12 +81,39 @@ Set-Content -Path $Script -Value @"
 node "$InstallDir\zen-proxy.mjs" `$args
 "@
 
+# Put `zen-proxy` and `zen-claude` on PATH so Windows gets the same two-command
+# experience as Linux and macOS, instead of a long powershell -File invocation.
+$BinDir = Join-Path $HOME ".local\bin"
+New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
+
+Set-Content -Path (Join-Path $BinDir "zen-proxy.cmd") -Value @"
+@echo off
+node "$InstallDir\zen-proxy.mjs" %*
+"@
+
+foreach ($shim in @("claude-zen.ps1", "claude-zen.cmd")) {
+    $src = Join-Path $InstallDir "bin\$shim"
+    if (Test-Path $src) { Copy-Item $src (Join-Path $BinDir $shim) -Force }
+}
+
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if (-not $userPath) { $userPath = "" }
+if (($userPath -split ";") -notcontains $BinDir) {
+    [Environment]::SetEnvironmentVariable("Path", "$userPath;$BinDir", "User")
+    Info "Added $BinDir to your user PATH (restart the terminal to pick it up)"
+}
+
 Info ""
 Info "  zen-proxy installed!"
 Info "  Dashboard: http://127.0.0.1:$Port"
 Info ""
-Info "  Run it:   powershell -ExecutionPolicy Bypass -File `"$Script`""
+Info "  Run it:   zen-proxy"
+Info "  Or:       powershell -ExecutionPolicy Bypass -File `"$Script`""
 Info ""
+if (Get-Command claude -ErrorAction SilentlyContinue) {
+    Info "  Claude Code:  zen-claude   (starts Claude Code wired to this proxy)"
+    Info ""
+}
 Info "  Point your AI agent at:"
 Info "    baseURL = http://127.0.0.1:$Port/v1"
 Info "    apiKey  = public"

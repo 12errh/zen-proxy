@@ -132,12 +132,23 @@ Set `proxyKey` and both the dashboard and the API require that key.
 
 ## Claude Code quick start
 
+Linux / macOS:
+
 ```bash
 zen-proxy &      # terminal 1
 zen-claude       # terminal 2
 ```
 
-`zen-claude` is a wrapper (`bin/claude-zen`) the installer links onto your PATH. It execs `claude --settings claude/zen-proxy.settings.json`, which points Claude Code at `http://127.0.0.1:8787` on a free model. It uses `--settings` rather than exported environment variables because Claude Code reads env from `~/.claude/settings.json`, which takes precedence over the shell — so exporting `ANTHROPIC_BASE_URL` is silently ignored if that file already sets it. Your existing Claude Code configuration is left alone; a plain `claude` still uses it.
+Windows (PowerShell) — the same two commands:
+
+```powershell
+zen-proxy
+zen-claude
+```
+
+`install.sh` links `bin/claude-zen` into `~/.local/bin`; `install.ps1` copies `claude-zen.cmd` + `claude-zen.ps1` (and a `zen-proxy.cmd`) into `%USERPROFILE%\.local\bin` and appends it to the user `PATH`.
+
+`zen-claude` is a wrapper (`bin/claude-zen`) the installer links onto your PATH. It execs `claude --settings claude/zen-proxy.settings.json`, which points Claude Code at `http://127.0.0.1:8787` on a free model. Both launchers use `--settings` rather than exported environment variables because Claude Code reads env from `~/.claude/settings.json`, which takes precedence over the shell — so exporting `ANTHROPIC_BASE_URL` is silently ignored if that file already sets it. Your existing Claude Code configuration is left alone; a plain `claude` still uses it.
 
 ---
 
