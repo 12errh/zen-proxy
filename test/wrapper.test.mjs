@@ -1,10 +1,11 @@
-// The zen-claude launchers have to work by passing --settings, because Claude
-// Code reads env from ~/.claude/settings.json (or %USERPROFILE%\.claude\) and
-// that beats anything exported in the shell — so the "obvious" way of
-// configuring it silently does nothing.
+// zen-claude is meant to be one command: start the proxy if needed, register
+// every free Zen model in Claude Code's /model picker, and clean up on exit.
+// It works by passing --settings, because Claude Code reads env from
+// ~/.claude/settings.json and that beats anything exported in the shell — so the
+// "obvious" way of configuring it silently does nothing.
 import { test, describe } from "node:test"
 import assert from "node:assert/strict"
-import { execFileSync } from "node:child_process"
+import { execFileSync, spawnSync } from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -15,103 +16,204 @@ const REPO = fileURLToPath(new URL("..", import.meta.url))
 const SH = path.join(REPO, "bin", "claude-zen")
 const PS1 = path.join(REPO, "bin", "claude-zen.ps1")
 const CMD = path.join(REPO, "bin", "claude-zen.cmd")
+const MAKER = path.join(REPO, "bin", "make-settings.mjs")
 const SETTINGS = path.join(REPO, "claude", "zen-proxy.settings.json")
 
-describe("launcher settings file", () => {
-  test("points Claude Code at the local proxy with a model pinned", () => {
+// A copy laid out the way the installer produces, on a port nothing is using.
+function stage(port, { fakeClaude = true } = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zen-claude-test-"))
+  for (const sub of ["bin", "claude"]) fs.mkdirSync(path.join(dir, sub), { recursive: true })
+  fs.copyFileSync(SETTINGS, path.join(dir, "claude", "zen-proxy.settings.json"))
+  fs.copyFileSync(SH, path.join(dir, "bin", "claude-zen"))
+  fs.copyFileSync(MAKER, path.join(dir, "bin", "make-settings.mjs"))
+  fs.copyFileSync(path.join(REPO, "zen-proxy.mjs"), path.join(dir, "zen-proxy.mjs"))
+  fs.copyFileSync(path.join(REPO, "models.json"), path.join(dir, "models.json"))
+  fs.copyFileSync(path.join(REPO, "agent-tools.json"), path.join(dir, "agent-tools.json"))
+  fs.writeFileSync(path.join(dir, "zen-proxy.json"), JSON.stringify({ port }))
+  fs.chmodSync(path.join(dir, "bin", "claude-zen"), 0o755)
+
+  if (fakeClaude) {
+    // A stand-in for claude that records the settings it was handed and exits,
+    // so the launcher can be exercised without a real Claude Code session.
+    const fake = path.join(dir, "bin", "claude")
+    fs.writeFileSync(fake, ['#!/usr/bin/env bash',
+      'NEXT=',
+      'for a in "$@"; do',
+      '  if [ "$NEXT" = 1 ]; then cat "$a" > "$(dirname "$0")/../settings-used.json"; echo "$a" > "$(dirname "$0")/../settings-path.txt"; NEXT=; continue; fi',
+      '  [ "$a" = "--settings" ] && NEXT=1',
+      'done',
+      'echo "FAKE-CLAUDE-OK"',
+      ''].join('\n'))
+    fs.chmodSync(fake, 0o755)
+  }
+  return { dir, wrapper: path.join(dir, "bin", "claude-zen") }
+}
+
+// spawnSync, not execFileSync: the launcher writes its progress to stderr and
+// exits 0, and execFileSync discards stderr on success.
+function run(wrapper, { withFakeClaude = true, env = {}, binDir } = {}) {
+  const PATH = withFakeClaude ? `${binDir ?? path.dirname(wrapper)}:${process.env.PATH}` : "/usr/bin:/bin"
+  const r = spawnSync("bash", [wrapper, "-p", "hi"], {
+    encoding: "utf8",
+    env: { ...process.env, PATH, ...env },
+  })
+  return { code: r.status ?? 1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" }
+}
+
+const PORT = 45699
+function down() {
+  const r = spawnSync("curl", ["-fsS", "-m", "2", `http://127.0.0.1:${PORT}/health`], { encoding: "utf8" })
+  return r.status !== 0
+}
+
+describe("launcher settings", () => {
+  test("the static fallback points at the proxy with a model pinned", () => {
     const cfg = JSON.parse(fs.readFileSync(SETTINGS, "utf8"))
     assert.equal(cfg.env.ANTHROPIC_BASE_URL, "http://127.0.0.1:8787")
     assert.equal(cfg.env.ANTHROPIC_AUTH_TOKEN, "public")
-    assert.ok(cfg.env.ANTHROPIC_MODEL, "a model is pinned so no /model is needed")
+    assert.ok(cfg.env.ANTHROPIC_MODEL)
   })
 
   test("both launchers use --settings instead of exporting env", () => {
     for (const f of [SH, PS1]) {
       const src = fs.readFileSync(f, "utf8")
-      assert.match(src, /claude --settings|claude.*--settings/, `${f} passes --settings`)
+      assert.match(src, /--settings/, `${f} passes --settings`)
       assert.doesNotMatch(src, /^\s*export ANTHROPIC_BASE_URL/m, `${f} does not export ANTHROPIC_BASE_URL`)
+    }
+  })
+
+  test("both launchers check for Claude Code and say how to install it", () => {
+    for (const f of [SH, PS1]) {
+      const src = fs.readFileSync(f, "utf8")
+      assert.match(src, /not installed/, `${f} reports a missing Claude Code`)
+      assert.match(src, /@anthropic-ai\/claude-code/, `${f} says how to install it`)
     }
   })
 
   test("the Windows shim calls the PowerShell launcher", () => {
     const cmd = fs.readFileSync(CMD, "utf8")
-    assert.match(cmd, /claude-zen\.ps1/i, "cmd shim delegates to the .ps1")
-    assert.match(cmd, /%~|Bypass/i, "bypasses execution policy so it runs on a fresh machine")
+    assert.match(cmd, /claude-zen\.ps1/i, "delegates to the .ps1")
+    assert.match(cmd, /%~|Bypass/i, "bypasses execution policy")
   })
 
-  test("install.ps1 puts both commands on PATH", () => {
+  test("both installers put the commands on PATH", () => {
+    assert.match(fs.readFileSync(path.join(REPO, "install.sh"), "utf8"), /claude-zen/)
     const ps = fs.readFileSync(path.join(REPO, "install.ps1"), "utf8")
     assert.match(ps, /zen-proxy\.cmd/, "installs a zen-proxy shim")
     assert.match(ps, /claude-zen\.ps1/, "installs the claude-zen launcher")
     assert.match(ps, /SetEnvironmentVariable\("Path"/, "adds the bin dir to the user PATH")
   })
 
-  test("install.sh also puts claude-zen on PATH", () => {
+  test("install.sh tells the user how to fix a stale PATH", () => {
+    // The common post-install failure is a shell that was already open, so its
+    // PATH predates ~/.local/bin.
     const sh = fs.readFileSync(path.join(REPO, "install.sh"), "utf8")
-    assert.match(sh, /claude-zen/, "links claude-zen")
+    assert.match(sh, /not on this shell's PATH|not on your PATH/, "detects an unresolvable command")
+    assert.match(sh, /\.zshrc/, "and says how to fix it permanently")
   })
 })
 
-// Lays out a throwaway copy the way the installer does, so results never depend
-// on whether a proxy happens to be running on the default port.
-function stage(port) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zen-claude-test-"))
-  fs.mkdirSync(path.join(dir, "bin"))
-  fs.mkdirSync(path.join(dir, "claude"))
-  fs.copyFileSync(SETTINGS, path.join(dir, "claude", "zen-proxy.settings.json"))
-  fs.writeFileSync(path.join(dir, "zen-proxy.json"), JSON.stringify({ port }))
-  return { dir, bin: path.join(dir, "bin") }
-}
+describe("model picker generation", () => {
+  test("make-settings.mjs lists every free model with a behavesAs row", () => {
+    const out = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "zen-picker-")), "settings.json")
+    try {
+      const n = Number(execFileSync("node", [MAKER, "1", out], { encoding: "utf8" }).trim())
+      const cfg = JSON.parse(fs.readFileSync(out, "utf8"))
+      assert.ok(n > 0, "found models")
+      assert.equal(cfg.modelPicker.replaceBuiltInOptions, true, "built-in lineup hidden")
+      assert.equal(cfg.modelPicker.options.length, n)
+      for (const o of cfg.modelPicker.options) {
+        assert.ok(o.model, "row names the model actually sent")
+        assert.ok(o.behavesAs, "row tells Claude Code which known model to imitate")
+        assert.notEqual(o.model, o.behavesAs, "behavesAs is a stand-in, not the row's model")
+      }
+      assert.equal(cfg.env.ANTHROPIC_BASE_URL, "http://127.0.0.1:1")
+    } finally {
+      fs.rmSync(path.dirname(out), { recursive: true, force: true })
+    }
+  })
+
+  test("it falls back to the shipped catalog when the proxy is unreachable", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zen-picker-"))
+    const out = path.join(dir, "settings.json")
+    try {
+      const n = Number(execFileSync("node", [MAKER, "1", out], { encoding: "utf8" }).trim())
+      const shipped = JSON.parse(fs.readFileSync(path.join(REPO, "models.json"), "utf8")).models
+      assert.equal(n, shipped.length, "used models.json instead of an empty list")
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
 
 describe("posix launcher (bash)", { skip: isWindows && "bash launcher is posix-only" }, () => {
-  const stageSh = (port) => {
-    const { dir, bin } = stage(port)
-    const wrapper = path.join(bin, "claude-zen")
-    fs.copyFileSync(SH, wrapper)
-    fs.chmodSync(wrapper, 0o755)
-    return { dir, wrapper }
-  }
-
-  const run = (wrapper, viaSymlink = false) => {
-    let target = wrapper
-    if (viaSymlink) {
-      target = path.join(path.dirname(wrapper), "linked-claude-zen")
-      fs.symlinkSync(wrapper, target)
-    }
-    try {
-      const stdout = execFileSync("bash", [target, "-p", "hi"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })
-      return { code: 0, stdout, stderr: "" }
-    } catch (e) {
-      return { code: e.status ?? 1, stdout: String(e.stdout ?? ""), stderr: String(e.stderr ?? "") }
-    }
-  }
-
   test("is executable and valid bash", () => {
     assert.ok(fs.statSync(SH).mode & 0o111, "executable")
     execFileSync("bash", ["-n", SH])
   })
 
-  test("refuses to start when no proxy is listening", () => {
-    const { dir, wrapper } = stageSh(45671)
+  test("does not exec claude, so the cleanup trap survives", () => {
+    // exec replaces the shell: the EXIT trap never runs and an auto-started
+    // proxy is left running after the session ends.
+    const src = fs.readFileSync(SH, "utf8")
+    assert.doesNotMatch(src, /^\s*exec claude/m, "does not exec claude")
+    assert.match(src, /trap cleanup EXIT/, "cleans up on exit")
+  })
+
+  test("reports clearly when Claude Code is not installed", () => {
+    const { dir, wrapper } = stage(PORT, { fakeClaude: false })
     try {
-      const r = run(wrapper)
+      const r = run(wrapper, { withFakeClaude: false })
       assert.notEqual(r.code, 0, "exits non-zero")
-      assert.match(r.stderr, /no zen-proxy/, "says the proxy is not running")
-      assert.doesNotMatch(r.stdout, /Hi!|Claude Code/, "never launches Claude Code")
+      assert.match(r.stderr, /Claude Code is not installed/, "names the problem")
+      assert.match(r.stderr, /npm install -g @anthropic-ai\/claude-code/, "says how to fix it")
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
   })
 
-  test("resolves a symlink to find its settings", () => {
-    // install.sh links claude-zen into ~/.local/bin, so $BASH_SOURCE[0] is the
-    // symlink, not the real script — it has to be resolved first.
-    const { dir, wrapper } = stageSh(45672)
+  test("does not start a proxy when Claude Code is missing", () => {
+    const { dir, wrapper } = stage(PORT, { fakeClaude: false })
     try {
-      const r = run(wrapper, true)
-      assert.notEqual(r.code, 0, "still fails on the health check")
-      assert.doesNotMatch(r.stderr, /could not find/, "located the settings through the symlink")
-      assert.match(r.stderr, /45672/, "and read the port from the config beside the real script")
+      run(wrapper, { withFakeClaude: false })
+      assert.ok(down(), "no proxy was started")
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("one command: starts the proxy, runs claude, then cleans up", () => {
+    const { dir, wrapper } = stage(PORT)
+    try {
+      assert.ok(down(), "precondition: nothing on the port")
+      const r = run(wrapper)
+      assert.equal(r.code, 0, "exits cleanly")
+      assert.match(r.stdout, /FAKE-CLAUDE-OK/, "Claude Code was launched")
+      assert.match(r.stderr, /starting zen-proxy/, "and it said it was starting the proxy")
+
+      const cfg = JSON.parse(fs.readFileSync(path.join(dir, "settings-used.json"), "utf8"))
+      assert.equal(cfg.env.ANTHROPIC_BASE_URL, `http://127.0.0.1:${PORT}`)
+      assert.ok(cfg.modelPicker.options.length > 0, "the picker was populated")
+
+      assert.ok(down(), "proxy was stopped again on exit")
+      const tmp = fs.readFileSync(path.join(dir, "settings-path.txt"), "utf8").trim()
+      assert.equal(fs.existsSync(tmp), false, "temp settings file removed")
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("resolves a symlink to find its files", () => {
+    // install.sh links claude-zen into ~/.local/bin, so $BASH_SOURCE[0] is the
+    // symlink, not the real script.
+    const { dir, wrapper } = stage(PORT)
+    const link = path.join(dir, "linked-claude-zen")
+    fs.symlinkSync(wrapper, link)
+    try {
+      const r = run(link, { binDir: path.join(dir, "bin") })
+      assert.equal(r.code, 0, "ran through the symlink")
+      assert.match(r.stdout, /FAKE-CLAUDE-OK/)
+      assert.doesNotMatch(r.stderr, /could not find/, "found everything beside the real script")
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
@@ -119,27 +221,17 @@ describe("posix launcher (bash)", { skip: isWindows && "bash launcher is posix-o
 })
 
 describe("windows launcher (powershell)", { skip: !isWindows && "powershell launcher is windows-only" }, () => {
-  test("refuses to start when no proxy is listening", () => {
-    const { dir, bin } = stage(45673)
-    fs.copyFileSync(PS1, path.join(bin, "claude-zen.ps1"))
+  test("reports clearly when Claude Code is not installed", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zen-claude-win-"))
+    fs.mkdirSync(path.join(dir, "bin"))
+    fs.copyFileSync(PS1, path.join(dir, "bin", "claude-zen.ps1"))
     try {
-      let stderr = ""
-      let stdout = ""
-      let code = 0
-      try {
-        stdout = execFileSync("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path.join(bin, "claude-zen.ps1")], {
-          encoding: "utf8",
-          stdio: ["ignore", "pipe", "pipe"],
-        })
-      } catch (e) {
-        code = e.status ?? 1
-        stderr = String(e.stderr ?? "")
-        stdout = String(e.stdout ?? "")
-      }
-      assert.notEqual(code, 0, "exits non-zero")
-      // PowerShell Write-Host lands on stdout; the launcher writes failures to
-      // stderr explicitly, so accept either stream but require the message.
-      assert.match(`${stderr}${stdout}`, /no zen-proxy/, "says the proxy is not running")
+      const r = spawnSync("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path.join(dir, "bin", "claude-zen.ps1")], {
+        encoding: "utf8",
+        env: { ...process.env, PATH: "C:\\Windows\\System32" },
+      })
+      assert.notEqual(r.status, 0, "exits non-zero")
+      assert.match(`${r.stderr ?? ""}${r.stdout ?? ""}`, /not installed/, "names the problem")
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }

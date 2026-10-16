@@ -117,10 +117,27 @@ info ""
 info "Run it:            zen-proxy"
 info "Or add PATH:       export PATH=\"\$HOME/.local/bin:\$PATH\""
 info ""
-if [ -L "$HOME/.local/bin/claude-zen" ]; then
-  info "Claude Code:       zen-claude        (starts Claude Code wired to this proxy)"
+# Verify the commands actually resolve. A shell that was already open before the
+# install has a stale PATH, which is the usual reason someone gets
+# "zen-claude: command not found" straight after a successful install - say so
+# here instead of leaving them to guess.
+PATH_OK=1
+for cmd in zen-proxy zen-claude; do
+  if command -v "$cmd" >/dev/null 2>&1; then
+    info "  $cmd is ready"
+  else
+    PATH_OK=0
+    warn "  '$cmd' is installed but not on this shell's PATH."
+    warn "  Fix for this terminal:  export PATH=\"\$HOME/.local/bin:\$PATH\""
+    warn "  Make it permanent:      echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc"
+    warn "                         (use ~/.bashrc instead of ~/.zshrc for bash)"
+  fi
+done
+if [ "$PATH_OK" = "1" ] && command -v claude >/dev/null 2>&1; then
   info ""
+  info "Claude Code:       zen-claude        (starts the proxy and Claude Code together)"
 fi
+info ""
 info "Point your AI agent at:"
 info "  baseURL = http://127.0.0.1:$PORT/v1"
 info "  apiKey  = public"

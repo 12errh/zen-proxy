@@ -132,23 +132,21 @@ Set `proxyKey` and both the dashboard and the API require that key.
 
 ## Claude Code quick start
 
-Linux / macOS:
+One command, on Linux, macOS and Windows alike:
 
 ```bash
-zen-proxy &      # terminal 1
-zen-claude       # terminal 2
-```
-
-Windows (PowerShell) — the same two commands:
-
-```powershell
-zen-proxy
 zen-claude
 ```
 
-`install.sh` links `bin/claude-zen` into `~/.local/bin`; `install.ps1` copies `claude-zen.cmd` + `claude-zen.ps1` (and a `zen-proxy.cmd`) into `%USERPROFILE%\.local\bin` and appends it to the user `PATH`.
+It starts zen-proxy if it is not already running, registers every free Zen model in Claude Code's `/model` picker, launches Claude Code against them, and stops the proxy again on exit. `zen-claude "fix the failing test"` works too. If Claude Code is not installed it says so and prints the install command.
 
-`zen-claude` is a wrapper (`bin/claude-zen`) the installer links onto your PATH. It execs `claude --settings claude/zen-proxy.settings.json`, which points Claude Code at `http://127.0.0.1:8787` on a free model. Both launchers use `--settings` rather than exported environment variables because Claude Code reads env from `~/.claude/settings.json`, which takes precedence over the shell — so exporting `ANTHROPIC_BASE_URL` is silently ignored if that file already sets it. Your existing Claude Code configuration is left alone; a plain `claude` still uses it.
+`bin/claude-zen` (bash) and `bin/claude-zen.ps1` (PowerShell, invoked through `claude-zen.cmd`) implement the same flow. The installer links `claude-zen` into `~/.local/bin` on posix, and copies `claude-zen.cmd` + `claude-zen.ps1` plus a `zen-proxy.cmd` into `%USERPROFILE%\.local\bin` on Windows, adding it to the user PATH.
+
+Both use `--settings` rather than exported environment variables, because Claude Code reads env from `~/.claude/settings.json` and that takes precedence over the shell — so exporting `ANTHROPIC_BASE_URL` is silently ignored if that file already sets it. Existing Claude Code configuration is left alone; a plain `claude` still uses it.
+
+`bin/make-settings.mjs` generates the settings: it reads the live model list from the proxy's `/v1/models` (falling back to `models.json`) and writes one `modelPicker` row per free model, each with `behavesAs` set to a model this Claude Code version already knows. `replaceBuiltInOptions` hides Claude Code's own lineup, whose models the proxy cannot serve.
+
+If `zen-claude` is installed but the shell reports `command not found`, that shell's PATH predates the install: `export PATH="$HOME/.local/bin:$PATH"`.
 
 ---
 

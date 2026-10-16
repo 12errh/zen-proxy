@@ -97,6 +97,8 @@ The proxy listens on `http://127.0.0.1:8787` and prints its URLs on startup.
 
 ## Setup
 
+**Using Claude Code?** Just run `zen-claude` — it starts the proxy and configures everything. See [Claude Code](#claude-code).
+
 ### Any OpenAI-compatible agent (Cline, Roo, Continue, Aider, mimo, opencode)
 
 Set the base URL to `http://127.0.0.1:8787/v1` and the API key to `public`. That's the whole configuration.
@@ -138,65 +140,62 @@ curl -s http://127.0.0.1:8787/v1/models -H "Authorization: Bearer public"
 
 ### Claude Code
 
-Claude Code speaks the Anthropic Messages API, which zen-proxy implements directly. The installer drops a `zen-claude` command on your `PATH`:
-
-**Linux / macOS**
+Claude Code speaks the Anthropic Messages API, which zen-proxy implements directly. **One command:**
 
 ```bash
-zen-proxy &      # terminal 1
-zen-claude       # terminal 2 — done
+zen-claude
 ```
 
-**Windows (PowerShell)** — same two commands:
+That's it. `zen-claude` starts the proxy if it isn't already running, registers every free Zen model in Claude Code's `/model` picker, launches Claude Code against them, and stops the proxy again when you exit. `zen-claude "fix the failing test"` works too.
 
-```powershell
-zen-proxy        # terminal 1
-zen-claude       # terminal 2
+Works identically on Linux, macOS and Windows — the installer puts `zen-proxy` and `zen-claude` on your `PATH`.
+
+It checks for Claude Code first and tells you how to install it if it is missing:
+
+```
+zen-claude: Claude Code is not installed.
+
+  Install it, then run zen-claude again:
+    npm install -g @anthropic-ai/claude-code
 ```
 
-The installer puts both on your `PATH` (on Windows it also adds `~/.local/bin` to your user `PATH` for you). `zen-claude "fix the failing test"` works too.
+#### Picking a model
 
-That's the whole setup. `zen-claude` runs Claude Code against `http://127.0.0.1:8787` on a free model.
+`zen-claude` generates a settings file listing every model the proxy is currently serving, so Claude Code's `/model` picker shows your free Zen models instead of its own lineup:
 
-Both launchers work by passing `--settings`, not by exporting environment variables — **Claude Code reads env from `~/.claude/settings.json` and that wins over your shell**, so if you already have `ANTHROPIC_BASE_URL` set there, `export` would be silently ignored. The launchers leave your existing Claude Code configuration untouched, and a plain `claude` still uses it.
+```
+/model
+  Default
+  big-pickle
+  cat-jam-free
+  ll-alpha-free
+  mimo-v2.6-flash-free
+  ...
+```
+
+The list is read from the running proxy, so it is whatever is live right now rather than whatever shipped. The first model is also the default.
 
 <details>
-<summary>Prefer to wire it up yourself?</summary>
+<summary>How it works, and how to do it by hand</summary>
+
+Both launchers pass `--settings` rather than exporting environment variables — **Claude Code reads env from `~/.claude/settings.json` and that wins over your shell**, so if you already have `ANTHROPIC_BASE_URL` set there, `export` is silently ignored. The launchers leave your existing Claude Code configuration alone; a plain `claude` still uses it.
+
+To wire it up yourself:
 
 ```bash
 claude --settings ./claude/zen-proxy.settings.json
 ```
 
-Or copy the two variables into `~/.claude/settings.json`:
+The generated picker is written from `bin/make-settings.mjs`; each row sets `behavesAs` so Claude Code handles an unfamiliar model id sensibly, while still sending that exact id to the proxy.
 
-```jsonc
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",
-    "ANTHROPIC_AUTH_TOKEN": "public",
-    "ANTHROPIC_MODEL": "space-bunny-free"
-  }
-}
+If `zen-claude` is installed but your shell says `command not found`, your shell's `PATH` predates the install:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"        # this terminal
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc   # permanent
 ```
 
-Switch back to the original Claude Code with a plain `claude`.
-
 </details>
-
-Two things worth knowing:
-
-- **Claude Code warns the model is outside its catalog** and assumes a 200k context window. Set `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the free model's real limit to avoid premature auto-compact.
-- **Why OpenCode's tools get attached.** With only Claude Code's own tools the gateway returns `403` — measured, not assumed. zen-proxy therefore adds a handful of OpenCode's built-in tools alongside Claude Code's, **only those Claude Code has a counterpart for**, and translates calls back:
-
-  | Attached as | You get back | Arguments |
-  |---|---|---|
-  | `read` | `Read` | `filePath` → `file_path` |
-  | `edit` | `Edit` | `filePath`, `oldString`, `newString` → `file_path`, `old_string`, `new_string` |
-  | `write` | `Write` | `filePath` → `file_path` |
-  | `bash` | `Bash` | `workdir` dropped (no counterpart) |
-  | `grep`, `glob`, `list` | `Grep`, `Glob`, `LS` | passed through |
-
-  A tool Claude Code doesn't offer is never attached, so the model can't request something that can't run. Set `agentTools: false` to turn this off.
 
 ### Verify it works
 

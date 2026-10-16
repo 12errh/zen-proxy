@@ -1,33 +1,41 @@
-# Zen Claude launcher for Windows — the PowerShell counterpart of bin/claude-zen.
-#
-# Claude Code reads env from %USERPROFILE%\.claude\settings.json, and that takes
-# precedence over the shell. Exporting ANTHROPIC_BASE_URL is therefore not enough
-# when that file already sets one — this passes --settings instead, which does
-# win, and leaves the existing Claude Code configuration untouched.
+# Zen Claude launcher for Windows - the PowerShell counterpart of bin/claude-zen.
+# One command: starts zen-proxy if it is not running, registers every free Zen
+# model in Claude Code's /model picker, and cleans up on exit.
 [CmdletBinding()]
 param([Parameter(ValueFromRemainingArguments = $true)] [string[]] $ClaudeArgs)
 
 $ErrorActionPreference = "Stop"
 
-# Locate the settings file beside this script (installer copies the pair together).
+# The installer copies this next to zen-proxy, so $PSScriptRoot is the real location.
 $here = $PSScriptRoot
-$settings = $null
-foreach ($cand in @(
-    (Join-Path $here "..\claude\zen-proxy.settings.json"),
-    (Join-Path $here "claude\zen-proxy.settings.json"),
-    (Join-Path $here "zen-proxy.settings.json"))) {
-    if (Test-Path $cand) { $settings = (Resolve-Path $cand).Path; break }
-}
-if (-not $settings) {
-    [Console]::Error.WriteLine("zen-claude: could not find claude\zen-proxy.settings.json")
-    exit 1
+$root = Split-Path $here -Parent
+
+function Fail([string]$msg) { [Console]::Error.WriteLine($msg); exit 1 }
+
+# ---- 1. Claude Code must be installed --------------------------------------
+if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
+    Fail @"
+zen-claude: Claude Code is not installed.
+
+  Install it, then run zen-claude again:
+    npm install -g @anthropic-ai/claude-code
+    (or: https://claude.com/claude-code)
+
+  If it is installed but not on your PATH, open a new terminal.
+"@
 }
 
-# The proxy's port comes from its own config, so a non-default setup is honoured.
+# ---- 2. Locate the proxy and its config -----------------------------------
+$main = $null
+foreach ($c in @((Join-Path $root "zen-proxy.mjs"), (Join-Path (Split-Path $root -Parent) "zen-proxy.mjs"))) {
+    if (Test-Path $c) { $main = $c; break }
+}
+if (-not $main) { Fail "zen-claude: could not find zen-proxy.mjs" }
+
 $config = $env:ZEN_PROXY_CONFIG
 if (-not $config) {
-    foreach ($cand in @((Join-Path $here "..\zen-proxy.json"), (Join-Path $here "zen-proxy.json"))) {
-        if (Test-Path $cand) { $config = $cand; break }
+    foreach ($c in @((Join-Path $root "zen-proxy.json"), (Join-Path (Split-Path $root -Parent) "zen-proxy.json"))) {
+        if (Test-Path $c) { $config = $c; break }
     }
 }
 $port = 8787
@@ -38,22 +46,51 @@ if ($config -and (Test-Path $config)) {
     } catch {}
 }
 
-# Check /health first so we never launch Claude Code against nothing.
+function Test-ZenProxy {
+    try {
+        $r = Invoke-WebRequest -Uri "http://127.0.0.1:$port/health" -TimeoutSec 2 -UseBasicParsing
+        return $r.StatusCode -eq 200
+    } catch { return $false }
+}
+
+# ---- 3. Start the proxy if it is not already up ----------------------------
+$proc = $null
+$log = $null
+if (-not (Test-ZenProxy)) {
+    [Console]::Error.WriteLine("zen-claude: starting zen-proxy on port $port ...")
+    $log = Join-Path $env:TEMP ("zen-proxy." + [guid]::NewGuid().ToString() + ".log")
+    $proc = Start-Process -FilePath "node" -ArgumentList $main -PassThru -NoNewWindow `
+        -RedirectStandardOutput $log -RedirectStandardError "$log.err"
+    $ok = $false
+    for ($i = 0; $i -lt 40; $i++) {
+        if (Test-ZenProxy) { $ok = $true; break }
+        Start-Sleep -Milliseconds 250
+        if ($proc.HasExited) { break }
+    }
+    if (-not $ok) {
+        [Console]::Error.WriteLine("zen-claude: zen-proxy failed to start. Log:")
+        if (Test-Path $log) { Get-Content $log -Tail 20 | ForEach-Object { [Console]::Error.WriteLine($_) } }
+        if ($proc -and -not $proc.HasExited) { $proc.Kill() }
+        Fail "zen-claude: zen-proxy did not come up."
+    }
+}
+
+# ---- 4. Build settings that list every free model -------------------------
+$settings = Join-Path $env:TEMP ("zen-claude-settings." + [guid]::NewGuid().ToString() + ".json")
+$maker = Join-Path $here "make-settings.mjs"
+if (-not (Test-Path $maker)) { $maker = Join-Path $root "bin\make-settings.mjs" }
+
 try {
-    $r = Invoke-WebRequest -Uri "http://127.0.0.1:$port/health" -TimeoutSec 3 -UseBasicParsing
-    if ($r.StatusCode -ne 200) { throw "unhealthy" }
-} catch {
-    # stderr, not Write-Host, so a caller can detect the failure.
-    [Console]::Error.WriteLine("zen-claude: no zen-proxy responding on port $port - start it first:")
-    [Console]::Error.WriteLine("            zen-proxy")
-    exit 1
-}
+    $out = & node $maker $port $settings 2>$null
+    $count = if ($out) { [int]($out | Select-Object -Last 1) } else { 0 }
+} catch { $count = 0 }
+if ($count -le 0) { Fail "zen-claude: could not determine the free model list." }
 
-$claude = Get-Command claude -ErrorAction SilentlyContinue
-if (-not $claude) {
-    [Console]::Error.WriteLine("zen-claude: 'claude' not found on PATH - install Claude Code first")
-    exit 1
+try {
+    & claude --settings $settings @ClaudeArgs
+} finally {
+    Remove-Item $settings -ErrorAction SilentlyContinue
+    if ($log) { Remove-Item $log, "$log.err" -ErrorAction SilentlyContinue }
+    if ($proc -and -not $proc.HasExited) { $proc.Kill() }
 }
-
-& claude --settings $settings @ClaudeArgs
 exit $LASTEXITCODE
