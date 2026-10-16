@@ -11,10 +11,10 @@
   <img src="https://img.shields.io/badge/node-%3E%3D18-8b8b8b?style=flat-square&labelColor=1a1612" alt="Node 18+">
   <img src="https://img.shields.io/badge/dependencies-0-8b8b8b?style=flat-square&labelColor=1a1612" alt="Zero dependencies">
   <a href="#any-openai-compatible-agent">
-    <img src="https://img.shields.io/badge/OpenAI_compatible-ccf73a?style=flat-square&labelColor=1a1612&logo=openai" alt="OpenAI compatible">
+    <img src="https://img.shields.io/badge/OpenAI_compatible-8b8b8b?style=flat-square&labelColor=1a1612&logo=openai" alt="OpenAI compatible">
   </a>
   <a href="#claude-code">
-    <img src="https://img.shields.io/badge/Claude_Code-compatible-ccf73a?style=flat-square&labelColor=1a1612&logo=anthropic" alt="Claude Code compatible">
+    <img src="https://img.shields.io/badge/Claude_Code-compatible-8b8b8b?style=flat-square&labelColor=1a1612&logo=anthropic" alt="Claude Code compatible">
   </a>
 </p>
 
@@ -226,10 +226,7 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc      # permanent
 
 <p align="center">
   <a href="https://github.com/12errh/zen-proxy/issues">
-    <img src="https://img.shields.io/badge/issues-12errh%2Fzen-proxy-ccf73a?style=flat-square&labelColor=1a1612" alt="Report an issue">
-  </a>
-  <a href="https://github.com/12errh/zen-proxy">
-    <img src="https://img.shields.io/badge/source-12errh%2Fzen-proxy-8b8b8b?style=flat-square&labelColor=1a1612" alt="Source">
+    <img src="https://img.shields.io/github/issues/12errh/zen-proxy?style=flat-square&labelColor=1a1612&color=8b8b8b" alt="Open issues">
   </a>
   <a href="LICENSE">
     <img src="https://img.shields.io/badge/license-MIT-8b8b8b?style=flat-square&labelColor=1a1612" alt="MIT License">

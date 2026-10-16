@@ -282,3 +282,35 @@ describe("windows launcher (powershell)", { skip: !isWindows && "powershell laun
     }
   })
 })
+
+describe("README badges", () => {
+  // shields.io answers a malformed badge with HTTP 200 and an SVG whose title
+  // is "404: badge not found". Checking the status code alone — which is what
+  // I did before shipping two of these — reports success for a broken badge.
+  const badges = [...fs.readFileSync(path.join(REPO, "README.md"), "utf8").matchAll(/https:\/\/img\.shields\.io\/[^"\s]+/g)].map(
+    (m) => m[0].replace(/&amp;/g, "&"),
+  )
+
+  test("there are badges to check", () => {
+    assert.ok(badges.length >= 5, `expected several badges, found ${badges.length}`)
+  })
+
+  test("none of them are malformed", { skip: !process.env.NETWORK && "needs network" }, async () => {
+    const broken = []
+    for (const url of badges) {
+      const res = await fetch(url)
+      const body = await res.text()
+      if (!res.ok || /badge not found|invalid/.test(body)) broken.push(url)
+    }
+    assert.deepEqual(broken, [], `shields.io could not render:\n  ${broken.join("\n  ")}`)
+  })
+
+  test("every anchor a badge links to exists", () => {
+    const md = fs.readFileSync(path.join(REPO, "README.md"), "utf8")
+    const headings = [...md.matchAll(/^#{1,6} (.+)$/gm)].map((m) =>
+      m[1].toLowerCase().replace(/[`*]/g, "").replace(/[^a-z0-9 -]/g, "").trim().replace(/ +/g, "-"),
+    )
+    const anchors = [...md.matchAll(/href="#([a-z0-9-]+)"/g)].map((m) => m[1])
+    assert.deepEqual(anchors.filter((a) => !headings.includes(a)), [])
+  })
+})
