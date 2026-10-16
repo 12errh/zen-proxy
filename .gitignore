@@ -1,5 +1,7 @@
 node_modules/
 .mimocode/
 zen-proxy.json
+# local publish mirror of this repo; never commit or install from it
+zen-proxy/
 *.log
 .DS_Store

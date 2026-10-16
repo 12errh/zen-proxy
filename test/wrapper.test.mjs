@@ -104,6 +104,16 @@ describe("launcher settings", () => {
     assert.match(ps, /SetEnvironmentVariable\("Path"/, "adds the bin dir to the user PATH")
   })
 
+  test("the installer links the command under the name the docs use", () => {
+    // The command is zen-claude but the script is bin/claude-zen. Linking only
+    // the script's own name means `zen-claude` is "command not found" after a
+    // successful install — which is exactly what it looked like from the outside.
+    const sh = fs.readFileSync(path.join(REPO, "install.sh"), "utf8")
+    assert.match(sh, /bin\/claude-zen" "\$HOME\/\.local\/bin\/zen-claude"/, "install.sh links zen-claude")
+    const ps = fs.readFileSync(path.join(REPO, "install.ps1"), "utf8")
+    assert.match(ps, /zen-claude\.cmd/, "install.ps1 provides zen-claude.cmd")
+  })
+
   test("install.sh tells the user how to fix a stale PATH", () => {
     // The common post-install failure is a shell that was already open, so its
     // PATH predates ~/.local/bin.

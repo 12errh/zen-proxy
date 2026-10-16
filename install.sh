@@ -50,8 +50,16 @@ fi
 
 if [ -n "$LOCAL_SRC" ]; then
   [ -d "$LOCAL_SRC" ] || die "Local source not found: $LOCAL_SRC"
-  cp -r "$LOCAL_SRC/." "$INSTALL_DIR/"
-  rm -rf "$INSTALL_DIR/.mimocode" "$INSTALL_DIR/node_modules" "$INSTALL_DIR/.git" "$INSTALL_DIR/zen-proxy.json.tmp"
+  # Clear the tree first (the config is preserved separately below), then copy
+  # with exclusions rather than copying and deleting after: copying .git from the
+  # source tree fails outright, and a publish mirror named zen-proxy/ would
+  # collide with the zen-proxy launcher this script installs.
+  find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 ! -name zen-proxy.json -exec rm -rf {} + 2>/dev/null || true
+  ( cd "$LOCAL_SRC" && tar -cf - \
+      --exclude=./.git --exclude=./node_modules --exclude=./.mimocode \
+      --exclude=./zen-proxy --exclude=./zen-proxy.json . ) \
+    | ( cd "$INSTALL_DIR" && tar -xf - )
+  rm -f "$INSTALL_DIR/zen-proxy.json.tmp"
   info "Copied from local source: $LOCAL_SRC"
 else
   TARBALL="https://codeload.github.com/$REPO/tar.gz/refs/heads/main"
@@ -102,11 +110,15 @@ ln -sf "$INSTALL_DIR/zen-proxy" "$HOME/.local/bin/zen-proxy" 2>/dev/null || {
   ln -sf "$INSTALL_DIR/zen-proxy" "$HOME/.local/bin/zen-proxy"
 }
 
-# claude-zen: launch Claude Code already pointed at this proxy.
+# zen-claude: launch Claude Code already pointed at this proxy, one command.
 # It has to pass --settings because Claude Code reads env from
 # ~/.claude/settings.json, which wins over anything exported in your shell.
+#
+# The command is zen-claude (the script is bin/claude-zen); link both names so an
+# install that predates the rename keeps working.
 if [ -f "$INSTALL_DIR/bin/claude-zen" ]; then
   mkdir -p "$HOME/.local/bin"
+  ln -sf "$INSTALL_DIR/bin/claude-zen" "$HOME/.local/bin/zen-claude"
   ln -sf "$INSTALL_DIR/bin/claude-zen" "$HOME/.local/bin/claude-zen"
 fi
 

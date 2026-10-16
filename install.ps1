@@ -95,6 +95,10 @@ foreach ($shim in @("claude-zen.ps1", "claude-zen.cmd")) {
     $src = Join-Path $InstallDir "bin\$shim"
     if (Test-Path $src) { Copy-Item $src (Join-Path $BinDir $shim) -Force }
 }
+# The command is zen-claude; the script is claude-zen.ps1. Provide both names.
+if (Test-Path (Join-Path $BinDir "claude-zen.cmd")) {
+    Copy-Item (Join-Path $BinDir "claude-zen.cmd") (Join-Path $BinDir "zen-claude.cmd") -Force
+}
 
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
 if (-not $userPath) { $userPath = "" }
@@ -111,7 +115,7 @@ Info "  Run it:   zen-proxy"
 Info "  Or:       powershell -ExecutionPolicy Bypass -File `"$Script`""
 Info ""
 if (Get-Command claude -ErrorAction SilentlyContinue) {
-    Info "  Claude Code:  zen-claude   (starts Claude Code wired to this proxy)"
+    Info "  Claude Code:  zen-claude   (starts the proxy and Claude Code together)"
     Info ""
 }
 Info "  Point your AI agent at:"
