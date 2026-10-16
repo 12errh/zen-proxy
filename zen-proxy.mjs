@@ -1119,18 +1119,18 @@ async function handleChat(req, res) {
   let lastStatus = 502
   let used = requested
   const bridge = body.tools?.length ? [] : gateBridgeTools()
+    const bridged = bridge.length > 0
   for (const model of candidates) {
     used = model
     const format = modelFormat(model)
     const payload =
       format === "responses" ? responsesRequest(body, model, isStream) : { ...body, model }
-    if (bridge.length) {
-      const tools = format === "responses" ? chatToolsToResponses(bridge) : bridge
-      payload.tools = tools
-      // shortcut: the Responses API takes only tool_choice "auto", so there the
-      // bridge stays callable and the model may answer with a call the caller
-      // cannot run. Remap it in relayResponsesStream to close that.
-      if (format !== "responses") payload.tool_choice = "none"
+    if (bridged) {
+      payload.tools = format === "responses" ? chatToolsToResponses(bridge) : bridge
+      // The gateway takes only "auto" on /responses, so forwarding anything the
+      // caller sent there is a hard error rather than a hint.
+      if (format === "responses") delete payload.tool_choice
+      else payload.tool_choice = "none"
     }
     let upstreamRes
     try {
@@ -1149,9 +1149,9 @@ async function handleChat(req, res) {
     if (upstreamRes.ok) {
       if (isStream) {
         if (format === "responses") {
-          relayResponsesStream(req, res, upstreamRes, requested)
+          relayResponsesStream(req, res, upstreamRes, requested, bridged)
         } else {
-          relayStream(req, res, upstreamRes, requested)
+          relayStream(req, res, upstreamRes, requested, bridged)
         }
         res.on("finish", () => { recordReq(req, `${requested}→${model}`, Date.now() - start, 200); recordObserved(model, true) })
         return
@@ -1161,7 +1161,7 @@ async function handleChat(req, res) {
         if (format === "responses") {
           recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
           recordObserved(model, true)
-          return json(res, 200, responsesToChat(content, requested, model))
+          return json(res, 200, stripToolCalls(responsesToChat(content, requested, model), bridged))
         }
         if (model !== requested) {
           // Make the fallback visible to any client, not just JSON readers.
@@ -1171,6 +1171,7 @@ async function handleChat(req, res) {
         if (content && typeof content === "object") {
           content.model = requested
           if (model !== requested) content.zen_served_by = model
+          stripToolCalls(content, bridged)
         }
         recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
         recordObserved(model, true)
@@ -1409,7 +1410,21 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy) {
   return pump()
 }
 
-function relayStream(req, res, upstreamRes, requested) {
+// A caller that sent no tools cannot run one, and the gateway hands them back
+// anyway — it ignores tool_choice "none" and answers a plain summarization
+// prompt with real read calls, which pi treats as a hard failure. So drop them
+// from the reply, and never claim a tool call in finish_reason.
+function stripToolCalls(chunk, strip) {
+  if (!strip) return chunk
+  for (const choice of chunk?.choices ?? []) {
+    const body = choice?.delta ?? choice?.message
+    if (body?.tool_calls) delete body.tool_calls
+    if (choice?.finish_reason === "tool_calls") choice.finish_reason = "stop"
+  }
+  return chunk
+}
+
+function relayStream(req, res, upstreamRes, requested, strip = false) {
   res.writeHead(200, {
     "content-type": upstreamRes.headers.get("content-type") ?? "text/event-stream",
     "cache-control": "no-cache",
@@ -1443,7 +1458,7 @@ function relayStream(req, res, upstreamRes, requested) {
         while ((idx = buffer.indexOf("\n\n")) !== -1) {
           const block = buffer.slice(0, idx)
           buffer = buffer.slice(idx + 2)
-          const out = rewriteSSE(block, requested)
+          const out = rewriteSSE(block, requested, strip)
           if (out) res.write(out)
         }
       }
@@ -1511,7 +1526,7 @@ async function probeModel(id, auth, session) {
 }
 
 // Stream a Responses SSE body back as chat.completion.chunk SSE.
-function relayResponsesStream(req, res, upstreamRes, requested) {
+function relayResponsesStream(req, res, upstreamRes, requested, strip = false) {
   res.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
@@ -1568,10 +1583,14 @@ function relayResponsesStream(req, res, upstreamRes, requested) {
             continue
           }
           if (data?.type === "error" || data?.error) continue
-          for (const delta of responsesEventToDeltas(event, data, state)) send([{ index: 0, delta, finish_reason: null }])
+          for (const delta of responsesEventToDeltas(event, data, state)) {
+            if (strip && delta.tool_calls) delete delta.tool_calls
+            if (Object.keys(delta).length === 0) continue
+            send([{ index: 0, delta, finish_reason: null }])
+          }
         }
       }
-      send([{ index: 0, delta: {}, finish_reason: state.finish }], state.usage ? { usage: usageToChat(state.usage) } : {})
+      send([{ index: 0, delta: {}, finish_reason: strip ? "stop" : state.finish }], state.usage ? { usage: usageToChat(state.usage) } : {})
       res.write("data: [DONE]\n\n")
       res.end()
     } catch {
@@ -1583,7 +1602,7 @@ function relayResponsesStream(req, res, upstreamRes, requested) {
   return pump()
 }
 
-function rewriteSSE(block, requested) {
+function rewriteSSE(block, requested, strip = false) {
   if (!block.trim()) return null
   const lines = block.split("\n")
   const out = []
@@ -1597,6 +1616,7 @@ function rewriteSSE(block, requested) {
       try {
         const parsed = JSON.parse(payload)
         if (parsed && typeof parsed === "object" && "model" in parsed) parsed.model = requested
+        stripToolCalls(parsed, strip)
         out.push(`data: ${JSON.stringify(parsed)}`)
       } catch {
         out.push(line)
