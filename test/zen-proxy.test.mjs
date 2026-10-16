@@ -2113,6 +2113,17 @@ describe("opencode tool bridge", () => {
     }
   })
 
+  test("a tool without type cannot be converted, so the manifest filter rejects it", () => {
+    // The bridge spreads the conversion result into the payload. A tool without
+    // type converts to undefined, and spreading that killed the process
+    // mid-request — hence the type check in loadAgentTools().
+    assert.equal(zp.chatToolsToResponses([{ function: { name: "read" } }]), undefined)
+    assert.equal(zp.chatToolsToResponses([{ type: "function", function: { name: "read" } }])[0].name, "read")
+    for (const t of zp.loadAgentTools()) {
+      assert.ok(zp.chatToolsToResponses([t])?.length, `${t.function.name} is not convertible`)
+    }
+  })
+
   test("Read tool call is renamed and its argument keys are remapped", async () => {
     const { name, args } = zp.remapAgentTool("read", JSON.stringify({ filePath: "/tmp/a", limit: 10 }))
     assert.equal(name, "Read")
