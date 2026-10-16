@@ -2142,6 +2142,84 @@ describe("opencode tool bridge", () => {
   })
 })
 
+describe("free tier gate on the chat path", () => {
+  // The free tier rejects any request that does not carry opencode's own tool
+  // definitions, so a caller's tool-less utility call (pi's auto-compaction,
+  // titles, commit messages) used to get a hard 403. The proxy attaches one
+  // bridge tool instead, pinned off with tool_choice so the model cannot call it.
+  const opencodeNames = Object.keys(zp.AGENT_TOOL_MAP)
+
+  // Stands in for the gate, measured against the live gateway: it accepts a
+  // request carrying opencode's `read` tool and 403s every other tool name in
+  // the manifest. A mock that accepts any manifest name hides the bug this
+  // suite exists to catch.
+  const gate = (seen) => (u, opts) => {
+    const sent = JSON.parse(opts.body)
+    seen.push(sent)
+    const carries = (sent.tools ?? []).some((t) => (t.function?.name ?? t.name) === "read")
+    if (!carries) {
+      return jsonResponse({ error: { type: "FreeTierError", message: "free tier" } }, 403)
+    }
+    return jsonResponse({ id: "c1", model: sent.model, choices: [{ index: 0, message: { role: "assistant", content: "ok" } }] })
+  }
+
+  async function post(body) {
+    const seen = []
+    globalThis.fetch = routeFetch([["/chat/completions", gate(seen)]])
+    const res = mockRes()
+    await zp.handleChat(mockReq({ _body: JSON.stringify(body) }), res)
+    return { res, seen }
+  }
+
+  test("a tool-less chat request is given one opencode tool and tool_choice none", async () => {
+    const { res, seen } = await post({
+      model: DEFAULT_MODEL,
+      messages: [{ role: "system", content: "s" }, { role: "user", content: "hi" }],
+    })
+    assert.equal(res.state.status, 200, "the gate accepts a tool-less caller")
+    const bridge = (seen[0].tools ?? []).map((t) => t.function.name)
+    assert.deepEqual(bridge, ["read"], "the gateway only accepts opencode's read tool, so that is what must be sent")
+    assert.equal(seen[0].tool_choice, "none", "the model must not call a tool the caller never offered")
+  })
+
+  test("a tool-less responses request is given the same bridge", async () => {
+    zp.saveConfig({ responsesModels: ["gpt-5*"], fallbackModels: ["gpt-5.5"], defaultModel: "gpt-5.5" })
+    const seen = []
+    globalThis.fetch = async (u, opts) => {
+      const sent = JSON.parse(opts.body)
+      seen.push({ url: String(u), sent })
+      const carries = (sent.tools ?? []).some((t) => (t.name ?? t.function?.name) === "read")
+      if (!carries) return jsonResponse({ error: { type: "FreeTierError", message: "free tier" } }, 403)
+      return jsonResponse({ id: "r1", model: sent.model, output: [{ type: "message", content: [{ type: "output_text", text: "yo" }] }] })
+    }
+    const res = mockRes()
+    await zp.handleChat(mockReq({ _body: JSON.stringify({ model: "gpt-5.5", messages: [{ role: "user", content: "hi" }] }) }), res)
+    assert.equal(res.state.status, 200)
+    assert.match(seen[0].url, /\/responses$/)
+    assert.deepEqual((seen[0].sent.tools ?? []).map((t) => t.name), ["read"])
+    // Measured against the live gateway: the Responses API rejects tool_choice
+    // "none" ("only auto is supported"), so the tool goes over unpinned there.
+    assert.equal(seen[0].sent.tool_choice, undefined)
+  })
+
+  test("a caller's own tools are left runnable — no tool_choice pinning", async () => {
+    const { seen } = await post({
+      model: DEFAULT_MODEL,
+      messages: [{ role: "user", content: "hi" }],
+      tools: [{ type: "function", function: { name: "read", parameters: { type: "object" } } }],
+    })
+    assert.deepEqual(seen[0].tools.map((t) => t.function.name), ["read"], "caller's tools pass through")
+    assert.equal(seen[0].tool_choice, undefined, "an agent turn must still be free to call tools")
+  })
+
+  test("agentTools:false keeps meaning never inject", async () => {
+    zp.saveConfig({ agentTools: false })
+    const { seen } = await post({ model: DEFAULT_MODEL, messages: [{ role: "user", content: "hi" }] })
+    assert.equal(seen[0].tools, undefined)
+    assert.equal(seen[0].tool_choice, undefined)
+  })
+})
+
 describe("install.sh config preservation", () => {
   function runInstall(tmp, destPort) {
     const env = {

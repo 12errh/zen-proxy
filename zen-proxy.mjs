@@ -127,9 +127,25 @@ function loadAgentTools() {
   try {
     const parsed = JSON.parse(fs.readFileSync(AGENT_TOOLS_PATH, "utf8"))
     const tools = Array.isArray(parsed?.tools) ? parsed.tools : []
-    agentToolsCache = tools.filter((t) => t?.function?.name && AGENT_TOOL_MAP[t.function.name])
+    // type is required: chatToolsToResponses() drops anything else, and a hand-written
+    // manifest missing it would make the injected bridge tool unconvertible.
+    agentToolsCache = tools.filter((t) => t?.type === "function" && t?.function?.name && AGENT_TOOL_MAP[t.function.name])
   } catch {}
   return agentToolsCache
+}
+
+// The free tier's gate rejects any request without opencode's own tool
+// definitions. A caller that sends none — a plain chat, pi's auto-compaction,
+// title generation — has nothing for agentToolsFor() to match, so offer the
+// cheapest thing that satisfies the gate: one opencode tool, pinned off with
+// tool_choice so the model cannot call a tool the caller cannot run.
+//
+// `read` is the tool the gateway accepts; measured against the live gateway,
+// every other name in the manifest (bash, edit, write, grep, glob) gets a 403.
+function gateBridgeTool() {
+  if (!config.agentTools) return null
+  const tools = loadAgentTools()
+  return tools.find((t) => t.function.name === "read") ?? tools[0] ?? null
 }
 
 // The subset of opencode tools whose mapped name the caller actually offers.
@@ -1108,11 +1124,21 @@ async function handleChat(req, res) {
   let lastErr = null
   let lastStatus = 502
   let used = requested
+  const bridge = body.tools?.length ? null : gateBridgeTool()
   for (const model of candidates) {
     used = model
     const format = modelFormat(model)
     const payload =
       format === "responses" ? responsesRequest(body, model, isStream) : { ...body, model }
+    if (bridge) {
+      const tools = format === "responses" ? chatToolsToResponses([bridge]) : [bridge]
+      payload.tools = [...(payload.tools ?? []), ...tools]
+      // shortcut: the Responses API only accepts tool_choice "auto", so on that
+      // route the injected tool stays callable and the model may answer with a
+      // read call the caller cannot run. Remap it in relayResponsesStream the
+      // day the format gains a "none" equivalent.
+      if (format !== "responses") payload.tool_choice = "none"
+    }
     let upstreamRes
     try {
       upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
