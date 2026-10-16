@@ -2113,6 +2113,17 @@ describe("opencode tool bridge", () => {
     }
   })
 
+  test("a tool without type cannot be converted, so the manifest filter rejects it", () => {
+    // The bridge spreads the conversion result into the payload. A tool without
+    // type converts to undefined, and spreading that killed the process
+    // mid-request — hence the type check in loadAgentTools().
+    assert.equal(zp.chatToolsToResponses([{ function: { name: "read" } }]), undefined)
+    assert.equal(zp.chatToolsToResponses([{ type: "function", function: { name: "read" } }])[0].name, "read")
+    for (const t of zp.loadAgentTools()) {
+      assert.ok(zp.chatToolsToResponses([t])?.length, `${t.function.name} is not convertible`)
+    }
+  })
+
   test("Read tool call is renamed and its argument keys are remapped", async () => {
     const { name, args } = zp.remapAgentTool("read", JSON.stringify({ filePath: "/tmp/a", limit: 10 }))
     assert.equal(name, "Read")
@@ -2139,6 +2150,146 @@ describe("opencode tool bridge", () => {
     const msg = zp.chatToAnthropic({ choices: [{ finish_reason: "tool_calls", message: { tool_calls: [{ id: "t1", function: { name: "TodoWrite", arguments: '{"x":1}' } }] } }] }, "m")
     assert.equal(msg.content[0].name, "TodoWrite")
     assert.deepEqual(msg.content[0].input, { x: 1 })
+  })
+})
+
+describe("free tier gate on the chat path", () => {
+  // The gate accepts `read` and 403s bash, edit, write, grep and glob, measured
+  // against the live gateway and independently re-checked on the PR. This mock
+  // hardcodes that rule, so it cannot catch the gate itself changing — it only
+  // catches the proxy sending the wrong tools.
+  const carriesRead = (tools) => (tools ?? []).some((t) => (t.function?.name ?? t.name) === "read")
+
+  // Records every outgoing body and 403s unless the manifest came through.
+  function recorder(reply) {
+    const seen = []
+    const handler = (u, opts) => {
+      const sent = JSON.parse(opts.body)
+      seen.push({ url: String(u), sent })
+      if (!carriesRead(sent.tools)) return jsonResponse({ error: { type: "FreeTierError", message: "free tier" } }, 403)
+      return reply(sent)
+    }
+    return { seen, handler }
+  }
+
+  const chatReply = (sent) =>
+    jsonResponse({ id: "c1", model: sent.model, choices: [{ index: 0, message: { role: "assistant", content: "ok" } }] })
+  const responsesReply = (sent) =>
+    jsonResponse({ id: "r1", model: sent.model, output: [{ type: "message", content: [{ type: "output_text", text: "yo" }] }] })
+
+  async function post(body, reply = chatReply) {
+    const { seen, handler } = recorder(reply)
+    globalThis.fetch = routeFetch([["/", handler]])
+    const res = mockRes()
+    await zp.handleChat(mockReq({ _body: JSON.stringify(body) }), res)
+    return { res, seen }
+  }
+
+  // Streaming variant: the upstream SSE is passed straight through.
+  async function postSse(body, upstream) {
+    globalThis.fetch = routeFetch([["/", () => upstream]])
+    const res = mockRes()
+    await zp.handleChat(mockReq({ _body: JSON.stringify(body) }), res)
+    return { res, seen: res.body }
+  }
+
+  test("a tool-less chat request carries opencode's whole manifest, pinned off", async () => {
+    const { res, seen } = await post({
+      model: DEFAULT_MODEL,
+      messages: [{ role: "system", content: "s" }, { role: "user", content: "hi" }],
+    })
+    assert.equal(res.state.status, 200, "the gate accepts a tool-less caller")
+    // opencode sends its full registry on every call, filtering it by relevance
+    // never, so the proxy sends the whole manifest too.
+    assert.deepEqual(
+      seen[0].sent.tools.map((t) => t.function.name),
+      zp.loadAgentTools().map((t) => t.function.name),
+    )
+    assert.equal(seen[0].sent.tool_choice, "none", "the model must not call a tool the caller never offered")
+  })
+
+  test("a tool-less responses request is given the same bridge", async () => {
+    zp.saveConfig({ responsesModels: ["gpt-5*"], fallbackModels: ["gpt-5.5"], defaultModel: "gpt-5.5" })
+    const { res, seen } = await post(
+      { model: "gpt-5.5", messages: [{ role: "user", content: "hi" }] },
+      responsesReply,
+    )
+    assert.equal(res.state.status, 200)
+    assert.match(seen[0].url, /\/responses$/)
+    assert.deepEqual(
+      seen[0].sent.tools.map((t) => t.name),
+      zp.loadAgentTools().map((t) => t.function.name),
+    )
+    // The live gateway rejects tool_choice "none" on /responses ("only auto is
+    // supported"), so this assertion pins the asymmetry rather than an oversight.
+    assert.equal(seen[0].sent.tool_choice, undefined)
+  })
+
+  test("a tool-less responses request drops a tool_choice that route cannot take", async () => {
+    zp.saveConfig({ responsesModels: ["gpt-5*"], fallbackModels: ["gpt-5.5"], defaultModel: "gpt-5.5" })
+    const { res, seen } = await post(
+      { model: "gpt-5.5", tool_choice: "none", messages: [{ role: "user", content: "hi" }] },
+      responsesReply,
+    )
+    assert.equal(res.state.status, 200)
+    assert.equal(seen[0].sent.tool_choice, undefined, "forwarding it would be a hard upstream error")
+  })
+
+  test("a tool-less request that the gateway answers with a tool call gets it stripped", async () => {
+    // The gateway ignores tool_choice "none" and emits real tool calls anyway,
+    // so pinning alone does not hold: a client like pi hard-fails on a tool call
+    // during summarization. The call has to be dropped from the reply.
+    const sse = new Response(
+      `data: ${JSON.stringify({ model: "up", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "c1", type: "function", function: { name: "read", arguments: '{"filePath":"/etc/hostname"}' } }] } }] })}\n\n` +
+        `data: ${JSON.stringify({ model: "up", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}\n\n` +
+        "data: [DONE]\n\n",
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    )
+    const { seen, res } = await postSse({ model: DEFAULT_MODEL, stream: true, messages: [{ role: "user", content: "read /etc/hostname" }] }, sse)
+    await res.done
+    assert.equal(res.state.status, 200)
+    assert.ok(!seen.includes("tool_calls"), `tool call reached the caller: ${seen}`)
+    assert.ok(!seen.includes('"finish_reason":"tool_calls"'), "finish_reason still claims a tool call")
+  })
+
+  test("a tool-less non-streaming reply loses its tool call too", async () => {
+    const body = { id: "c1", model: "up", choices: [{ index: 0, finish_reason: "tool_calls", message: { role: "assistant", tool_calls: [{ id: "t1", type: "function", function: { name: "read", arguments: "{}" } }] } }] }
+    const { res } = await post(
+      { model: DEFAULT_MODEL, messages: [{ role: "user", content: "read it" }] },
+      () => jsonResponse(body),
+    )
+    assert.equal(res.state.status, 200)
+    assert.deepEqual(JSON.parse(res.body).choices[0].message.tool_calls, undefined)
+  })
+
+  test("an agent request keeps its tool calls", async () => {
+    const body = { id: "c1", model: "up", choices: [{ index: 0, finish_reason: "tool_calls", message: { role: "assistant", tool_calls: [{ id: "t1", type: "function", function: { name: "read", arguments: "{}" } }] } }] }
+    const { res } = await post(
+      {
+        model: DEFAULT_MODEL,
+        messages: [{ role: "user", content: "read it" }],
+        tools: [{ type: "function", function: { name: "read", parameters: { type: "object" } } }],
+      },
+      () => jsonResponse(body),
+    )
+    assert.equal(JSON.parse(res.body).choices[0].message.tool_calls[0].function.name, "read")
+  })
+
+  test("a caller's own tools are left runnable — no tool_choice pinning", async () => {
+    const { seen } = await post({
+      model: DEFAULT_MODEL,
+      messages: [{ role: "user", content: "hi" }],
+      tools: [{ type: "function", function: { name: "read", parameters: { type: "object" } } }],
+    })
+    assert.deepEqual(seen[0].sent.tools.map((t) => t.function.name), ["read"], "caller's tools pass through")
+    assert.equal(seen[0].sent.tool_choice, undefined, "an agent turn must still be free to call tools")
+  })
+
+  test("agentTools:false keeps meaning never inject", async () => {
+    zp.saveConfig({ agentTools: false })
+    const { seen } = await post({ model: DEFAULT_MODEL, messages: [{ role: "user", content: "hi" }] })
+    assert.equal(seen[0].sent.tools, undefined)
+    assert.equal(seen[0].sent.tool_choice, undefined)
   })
 })
 

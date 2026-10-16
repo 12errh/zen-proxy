@@ -116,6 +116,8 @@ zen-proxy sits in front of that gateway and identifies your agent as a real sess
 | Streaming, a system message, tool definitions | Real agents already send these; the proxy fills gaps where it can |
 
 For `/v1/messages` specifically, the gateway also requires OpenCode's own tool manifest, so zen-proxy attaches those tools alongside Claude Code's and renames the resulting calls back. **Claude Code's system prompt is passed through untouched.**
+
+The OpenAI-shaped routes get no name mapping, so they are handled differently: a request carrying **no tools at all** — an agent's own internal call, like summarization or title generation — is given OpenCode's own tool manifest so it passes the gate, exactly as opencode sends it on every call. The gateway does not honour `tool_choice: "none"` — it answers a plain summarization prompt with real `read` calls — so any tool call is stripped from the reply instead, on both OpenAI-shaped routes.
 </details>
 
 <details>
@@ -144,7 +146,7 @@ For `/v1/messages` specifically, the gateway also requires OpenCode's own tool m
 | `upstream` | `https://opencode.ai/inference/v1` | Zen gateway base |
 | `ua` / `autoUA` | `opencode/1.18.30` / `true` | User-Agent sent upstream; auto-tracks OpenCode releases |
 | `injectSession` | `true` | Mint and send the session header pair |
-| `agentTools` | `true` | Attach OpenCode's tools to `/v1/messages` |
+| `agentTools` | `true` | Attach OpenCode's tools to `/v1/messages`, and to tool-less requests on the OpenAI-shaped routes |
 | `defaultModel` | `""` | Empty = auto-pick the first working free model |
 | `fallbackModels` | *(from [`models.json`](models.json))* | Tried in order on failure. Omit to follow the catalog; save once to pin your own list |
 | `modelAliases` | `{}` | e.g. `{"gpt-4o": "space-bunny-free"}` |
