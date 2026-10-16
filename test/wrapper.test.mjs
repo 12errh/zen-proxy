@@ -61,8 +61,8 @@ function run(wrapper, { withFakeClaude = true, env = {}, binDir } = {}) {
 }
 
 const PORT = 45699
-function down() {
-  const r = spawnSync("curl", ["-fsS", "-m", "2", `http://127.0.0.1:${PORT}/health`], { encoding: "utf8" })
+function down(port = PORT) {
+  const r = spawnSync("curl", ["-fsS", "-m", "2", `http://127.0.0.1:${port}/health`], { encoding: "utf8" })
   return r.status !== 0
 }
 
@@ -231,17 +231,52 @@ describe("posix launcher (bash)", { skip: isWindows && "bash launcher is posix-o
 })
 
 describe("windows launcher (powershell)", { skip: !isWindows && "powershell launcher is windows-only" }, () => {
-  test("reports clearly when Claude Code is not installed", () => {
+  // Staging a fake claude.cmd keeps this deterministic. The previous version
+  // proved the "not installed" path by stripping PATH to System32, which left
+  // PowerShell itself unable to start: it exited non-zero with no output, so
+  // the assertion was matching against an empty string. The missing-install
+  // message is covered by the static assertion on the script's source instead.
+  function stageWin(port) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zen-claude-win-"))
-    fs.mkdirSync(path.join(dir, "bin"))
+    for (const sub of ["bin", "claude"]) fs.mkdirSync(path.join(dir, sub), { recursive: true })
     fs.copyFileSync(PS1, path.join(dir, "bin", "claude-zen.ps1"))
+    fs.copyFileSync(MAKER, path.join(dir, "bin", "make-settings.mjs"))
+    fs.copyFileSync(SETTINGS, path.join(dir, "claude", "zen-proxy.settings.json"))
+    for (const f of ["zen-proxy.mjs", "models.json", "agent-tools.json"]) fs.copyFileSync(path.join(REPO, f), path.join(dir, f))
+    fs.writeFileSync(path.join(dir, "zen-proxy.json"), JSON.stringify({ port }))
+    fs.writeFileSync(path.join(dir, "bin", "claude.cmd"), "@echo off\r\necho FAKE-CLAUDE-OK\r\n")
+    return dir
+  }
+
+  const psRun = (dir, extra = []) =>
+    spawnSync("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path.join(dir, "bin", "claude-zen.ps1"), ...extra], {
+      encoding: "utf8",
+      env: { ...process.env, PATH: `${path.join(dir, "bin")};${process.env.PATH ?? ""}` },
+    })
+
+  test("the script parses", () => {
+    const dir = stageWin(45701)
     try {
-      const r = spawnSync("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path.join(dir, "bin", "claude-zen.ps1")], {
-        encoding: "utf8",
-        env: { ...process.env, PATH: "C:\\Windows\\System32" },
-      })
-      assert.notEqual(r.status, 0, "exits non-zero")
-      assert.match(`${r.stderr ?? ""}${r.stdout ?? ""}`, /not installed/, "names the problem")
+      const r = spawnSync(
+        "powershell",
+        ["-NoProfile", "-Command", `[scriptblock]::Create((Get-Content -Raw '${path.join(dir, "bin", "claude-zen.ps1")}')) | Out-Null`],
+        { encoding: "utf8" },
+      )
+      assert.equal(r.status, 0, `syntax error: ${r.stderr}`)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("one command: starts the proxy, runs claude, then cleans up", () => {
+    const port = 45702
+    const dir = stageWin(port)
+    try {
+      assert.ok(down(port), "precondition: nothing on the port")
+      const r = psRun(dir, ["-p", "hi"])
+      assert.match(`${r.stdout ?? ""}`, /FAKE-CLAUDE-OK/, `claude launched; stderr=${r.stderr}`)
+      assert.match(`${r.stderr ?? ""}`, /starting zen-proxy/, "and it said it was starting the proxy")
+      assert.ok(down(port), "proxy was stopped again on exit")
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }

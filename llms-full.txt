@@ -138,15 +138,15 @@ One command, on Linux, macOS and Windows alike:
 zen-claude
 ```
 
-It starts zen-proxy if it is not already running, registers every free Zen model in Claude Code's `/model` picker, launches Claude Code against them, and stops the proxy again on exit. `zen-claude "fix the failing test"` works too. If Claude Code is not installed it says so and prints the install command.
+It starts zen-proxy if it is not already running, waits for it to answer, registers every live free Zen model in Claude Code's `/model` picker, launches Claude Code against them, and stops the proxy again on exit. It deliberately does not `exec claude`; if it did, its exit trap would never fire and the auto-started proxy would be left running. `zen-claude "fix the failing test"` works too. If Claude Code is not installed it says so and prints the install command.
 
-`bin/claude-zen` (bash) and `bin/claude-zen.ps1` (PowerShell, invoked through `claude-zen.cmd`) implement the same flow. The installer links `claude-zen` into `~/.local/bin` on posix, and copies `claude-zen.cmd` + `claude-zen.ps1` plus a `zen-proxy.cmd` into `%USERPROFILE%\.local\bin` on Windows, adding it to the user PATH.
+`bin/claude-zen` (bash) and `bin/claude-zen.ps1` (PowerShell, invoked through `claude-zen.cmd`) implement the same flow. Note the command is `zen-claude` while the script is `bin/claude-zen`; the installer links **both** names on posix (`~/.local/bin`) and copies both `.cmd` shims on Windows (`%USERPROFILE%\.local\bin`), adding that directory to the user PATH. Linking only the script's own basename was a real bug that shipped: it installed `claude-zen`, so `zen-claude` reported `command not found` after an otherwise successful install. There is now a test asserting the installer links the name the docs use.
 
 Both use `--settings` rather than exported environment variables, because Claude Code reads env from `~/.claude/settings.json` and that takes precedence over the shell — so exporting `ANTHROPIC_BASE_URL` is silently ignored if that file already sets it. Existing Claude Code configuration is left alone; a plain `claude` still uses it.
 
 `bin/make-settings.mjs` generates the settings: it reads the live model list from the proxy's `/v1/models` (falling back to `models.json`) and writes one `modelPicker` row per free model, each with `behavesAs` set to a model this Claude Code version already knows. `replaceBuiltInOptions` hides Claude Code's own lineup, whose models the proxy cannot serve.
 
-If `zen-claude` is installed but the shell reports `command not found`, that shell's PATH predates the install: `export PATH="$HOME/.local/bin:$PATH"`.
+If `zen-claude` reports `command not found`, check the symlink exists before blaming PATH: `ls -l ~/.local/bin/zen-claude`. If it is missing, re-run the installer — an older one linked only `claude-zen`. If it exists but the shell cannot see it, the shell's PATH predates the install: `export PATH="$HOME/.local/bin:$PATH"`. The installer verifies both `zen-proxy` and `zen-claude` resolve and prints the exact fix when they do not.
 
 ---
 
