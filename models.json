@@ -1,5 +1,5 @@
 {
-  "updatedAt": "2026-10-16T11:23:53.889Z",
+  "updatedAt": "2026-10-16T16:39:01.290Z",
   "upstream": "https://opencode.ai/inference/v1",
   "models": [
     "space-bunny-free",
@@ -9,10 +9,10 @@
     "muse-spark-1.2-contributor-free",
     "nemotron-3.5-lightning-free",
     "longcat-2.5-preview-free",
-    "cat-jam-free",
     "deepseek-v4.1-flash-free",
     "nemotron-3.5-super-vl-free",
     "glm-5.3-flash-free",
-    "ll-alpha-free"
+    "ll-alpha-free",
+    "beam-free"
   ]
 }
