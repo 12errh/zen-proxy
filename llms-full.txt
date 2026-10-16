@@ -130,6 +130,17 @@ Set `proxyKey` and both the dashboard and the API require that key.
 
 ---
 
+## Claude Code quick start
+
+```bash
+zen-proxy &      # terminal 1
+zen-claude       # terminal 2
+```
+
+`zen-claude` is a wrapper (`bin/claude-zen`) the installer links onto your PATH. It execs `claude --settings claude/zen-proxy.settings.json`, which points Claude Code at `http://127.0.0.1:8787` on a free model. It uses `--settings` rather than exported environment variables because Claude Code reads env from `~/.claude/settings.json`, which takes precedence over the shell — so exporting `ANTHROPIC_BASE_URL` is silently ignored if that file already sets it. Your existing Claude Code configuration is left alone; a plain `claude` still uses it.
+
+---
+
 ## Anthropic API (Claude Code)
 
 `POST /v1/messages` and `POST /v1/messages/count_tokens` implement the Anthropic Messages protocol: system blocks, message content blocks, images, `tool_use`/`tool_result`, `thinking`, `tool_choice` and `stop_sequences` are all translated to the endpoint family the target model actually uses, and the reply is translated back including the full streaming envelope (`message_start` → `content_block_*` → `message_delta` → `message_stop`). Errors use Anthropic's `{type:"error",error:{type,message}}` shape. Both `x-api-key` and `Authorization: Bearer` authenticate.

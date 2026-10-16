@@ -138,19 +138,39 @@ curl -s http://127.0.0.1:8787/v1/models -H "Authorization: Bearer public"
 
 ### Claude Code
 
-Claude Code speaks the Anthropic Messages API, which zen-proxy implements directly:
+Claude Code speaks the Anthropic Messages API, which zen-proxy implements directly. The installer drops a `zen-claude` command on your `PATH`:
 
 ```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
-export ANTHROPIC_AUTH_TOKEN=public     # any value; it falls back to the anonymous tier
-claude
+zen-proxy &      # terminal 1
+zen-claude       # terminal 2 — done
 ```
 
-Then, inside Claude Code:
+That's the whole setup. `zen-claude` runs Claude Code against `http://127.0.0.1:8787` on a free model, and `zen-claude "fix the failing test"` works too.
 
+It works by passing `--settings`, not by exporting environment variables — **Claude Code reads env from `~/.claude/settings.json` and that wins over your shell**, so if you already have `ANTHROPIC_BASE_URL` set there, `export` would be silently ignored. The wrapper leaves your existing Claude Code configuration untouched.
+
+<details>
+<summary>Prefer to wire it up yourself?</summary>
+
+```bash
+claude --settings ./claude/zen-proxy.settings.json
 ```
-/model space-bunny-free
+
+Or copy the two variables into `~/.claude/settings.json`:
+
+```jsonc
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",
+    "ANTHROPIC_AUTH_TOKEN": "public",
+    "ANTHROPIC_MODEL": "space-bunny-free"
+  }
+}
 ```
+
+Switch back to the original Claude Code with a plain `claude`.
+
+</details>
 
 Two things worth knowing:
 

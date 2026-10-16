@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Start Claude Code pointed at a local zen-proxy.
+#
+#   zen-claude            # interactive
+#   zen-claude "fix the failing test"
+#
+# Claude Code reads env from ~/.claude/settings.json, which takes precedence
+# over your shell. Exporting ANTHROPIC_BASE_URL is therefore not enough when
+# that file already sets it — this wrapper passes --settings instead, which does
+# win, and leaves your existing Claude Code configuration untouched.
+set -euo pipefail
+
+# The installer links this into ~/.local/bin, so resolve the symlink before
+# looking for the settings file next to the real script.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  LINK_DIR="$(cd -P "$(dirname -- "$SOURCE")" && pwd)"
+  SOURCE="$(readlink -- "$SOURCE")"
+  case "$SOURCE" in /*) ;; *) SOURCE="$LINK_DIR/$SOURCE" ;; esac
+done
+HERE="$(cd -P "$(dirname -- "$SOURCE")" && pwd)"
+# Look beside the wrapper (source checkout or installed copy), then one level up.
+SETTINGS=""
+for candidate in \
+  "$HERE/../claude/zen-proxy.settings.json" \
+  "$HERE/claude/zen-proxy.settings.json" \
+  "$HERE/zen-proxy.settings.json"; do
+  if [ -f "$candidate" ]; then SETTINGS="$(cd -- "$(dirname -- "$candidate")" && pwd)/$(basename -- "$candidate")"; break; fi
+done
+[ -n "$SETTINGS" ] || { echo "zen-claude: could not find claude/zen-proxy.settings.json" >&2; exit 1; }
+
+CONFIG="${ZEN_PROXY_CONFIG:-}"
+if [ -z "$CONFIG" ]; then
+  for candidate in "$HERE/../zen-proxy.json" "$HERE/zen-proxy.json"; do
+    if [ -f "$candidate" ]; then CONFIG="$candidate"; break; fi
+  done
+fi
+# The proxy's port comes from its own config, so a non-default setup is honoured.
+PORT=8787
+if [ -n "$CONFIG" ]; then
+  PORT="$(node -e 'try{console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).port||8787)}catch{console.log(8787)}' "$CONFIG" 2>/dev/null || echo 8787)"
+fi
+
+if ! curl -fsS -m 3 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+  echo "zen-claude: no zen-proxy responding on port $PORT — start it first:" >&2
+  echo "            zen-proxy          (or: node zen-proxy.mjs)" >&2
+  exit 1
+fi
+
+exec claude --settings "$SETTINGS" "$@"

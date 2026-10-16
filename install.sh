@@ -102,6 +102,14 @@ ln -sf "$INSTALL_DIR/zen-proxy" "$HOME/.local/bin/zen-proxy" 2>/dev/null || {
   ln -sf "$INSTALL_DIR/zen-proxy" "$HOME/.local/bin/zen-proxy"
 }
 
+# claude-zen: launch Claude Code already pointed at this proxy.
+# It has to pass --settings because Claude Code reads env from
+# ~/.claude/settings.json, which wins over anything exported in your shell.
+if [ -f "$INSTALL_DIR/bin/claude-zen" ]; then
+  mkdir -p "$HOME/.local/bin"
+  ln -sf "$INSTALL_DIR/bin/claude-zen" "$HOME/.local/bin/claude-zen"
+fi
+
 info ""
 info "✓ zen-proxy installed!"
 info "  Dashboard: http://127.0.0.1:$PORT"
@@ -109,6 +117,10 @@ info ""
 info "Run it:            zen-proxy"
 info "Or add PATH:       export PATH=\"\$HOME/.local/bin:\$PATH\""
 info ""
+if [ -L "$HOME/.local/bin/claude-zen" ]; then
+  info "Claude Code:       zen-claude        (starts Claude Code wired to this proxy)"
+  info ""
+fi
 info "Point your AI agent at:"
 info "  baseURL = http://127.0.0.1:$PORT/v1"
 info "  apiKey  = public"
