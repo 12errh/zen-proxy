@@ -2181,6 +2181,19 @@ const server = http.createServer(router)
 server.requestTimeout = 0
 server.headersTimeout = 60_000
 
+// A proxy is a long-lived daemon: one bad request must not take it down for the
+// rest of the session. Node kills the process on an unhandled rejection by
+// default, and there are fire-and-forget calls here (the stream relays, the
+// periodic sync and UA refresh), so a single thrown error used to end the
+// server with nothing in the client's face but a connection error. Log it and
+// keep serving.
+process.on("unhandledRejection", (err) => {
+  log(`unhandled rejection (ignored): ${err?.stack || err?.message || err}`)
+})
+process.on("uncaughtException", (err) => {
+  log(`uncaught exception (ignored): ${err?.stack || err?.message || err}`)
+})
+
 server.on("error", (err) => {
   if (err.code === "EADDRINUSE") {
     console.error(`Port ${config.port} already in use. Set PORT or edit zen-proxy.json.`)

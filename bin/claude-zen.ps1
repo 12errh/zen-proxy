@@ -73,6 +73,35 @@ if (-not (Test-ZenProxy)) {
         if ($proc -and -not $proc.HasExited) { $proc.Kill() }
         Fail "zen-claude: zen-proxy did not come up."
     }
+
+    # Watch the proxy for as long as Claude Code runs. A proxy that dies
+    # mid-session leaves the agent talking to a closed port, and the only symptom
+    # is a connection error with nothing to explain it. $runFlag is how the
+    # watcher knows Claude Code is still going.
+    $runFlag = Join-Path $env:TEMP ("zen-claude-run." + [guid]::NewGuid().ToString() + ".flag")
+    Set-Content -Path $runFlag -Value "1"
+    $watcher = Start-ThreadJob -ScriptBlock {
+        param($Main, $Port, $Log, $RunFlag)
+        $restarts = 0
+        while (Test-Path $RunFlag) {
+            Start-Sleep -Seconds 2
+            if (-not (Test-Path $RunFlag)) { break }
+            try { $r = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/health" -TimeoutSec 2 -UseBasicParsing } catch { $r = $null }
+            if ($r) { continue }
+            $restarts++
+            if ($restarts -gt 10) {
+                [Console]::Error.WriteLine("zen-claude: zen-proxy kept dying; giving up on restarts.")
+                break
+            }
+            [Console]::Error.WriteLine("zen-claude: zen-proxy stopped, restarting ($restarts/10)...")
+            Start-Process -FilePath "node" -ArgumentList $Main -NoNewWindow `
+                -RedirectStandardOutput $Log -RedirectStandardError "$Log.err" | Out-Null
+            for ($i = 0; $i -lt 40; $i++) {
+                try { $r = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/health" -TimeoutSec 2 -UseBasicParsing; break } catch { }
+                Start-Sleep -Milliseconds 250
+            }
+        }
+    } -ArgumentList $main, $port, $log, $runFlag
 }
 
 # ---- 4. Build settings that list every free model -------------------------
@@ -89,6 +118,12 @@ if ($count -le 0) { Fail "zen-claude: could not determine the free model list." 
 try {
     & claude --settings $settings @ClaudeArgs
 } finally {
+    if ($runFlag) { Remove-Item $runFlag -ErrorAction SilentlyContinue }
+    if ($watcher) {
+        # Give the watcher a moment to stop its proxy before we delete its log.
+        try { $watcher | Wait-Job -Timeout 4 | Out-Null } catch { }
+        Remove-Job $watcher -Force -ErrorAction SilentlyContinue
+    }
     Remove-Item $settings -ErrorAction SilentlyContinue
     if ($log) { Remove-Item $log, "$log.err" -ErrorAction SilentlyContinue }
     if ($proc -and -not $proc.HasExited) { $proc.Kill() }

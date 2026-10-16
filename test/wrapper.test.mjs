@@ -314,3 +314,47 @@ describe("README badges", () => {
     assert.deepEqual(anchors.filter((a) => !headings.includes(a)), [])
   })
 })
+
+describe("the launcher keeps the proxy alive", () => {
+  // Reproduces the reported failure: the proxy goes away partway through a
+  // session and the agent is left talking to a closed port, with a connection
+  // error as the only symptom.
+  function stage() {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zen-watch-"))
+    for (const sub of ["bin", "claude"]) fs.mkdirSync(path.join(dir, sub), { recursive: true })
+    fs.copyFileSync(SH, path.join(dir, "bin", "claude-zen"))
+    fs.copyFileSync(MAKER, path.join(dir, "bin", "make-settings.mjs"))
+    fs.copyFileSync(SETTINGS, path.join(dir, "claude", "zen-proxy.settings.json"))
+    for (const f of ["zen-proxy.mjs", "models.json", "agent-tools.json"]) fs.copyFileSync(path.join(REPO, f), path.join(dir, f))
+    fs.writeFileSync(path.join(dir, "zen-proxy.json"), JSON.stringify({ port: PORT }))
+    // A stand-in for Claude Code that kills the proxy halfway through, the way a
+    // crash or an OOM kill would, then keeps running for a few more seconds.
+    fs.writeFileSync(
+      path.join(dir, "bin", "claude"),
+      `#!/usr/bin/env bash\ncurl -fsS -m 5 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1 || exit 9\n` +
+        `pkill -f "zen-proxy.mjs" 2>/dev/null; sleep 6\n` +
+        `curl -fsS -m 5 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1 && echo PROXY-STILL-THERE || echo PROXY-GONE\n`,
+    )
+    fs.chmodSync(path.join(dir, "bin", "claude"), 0o755)
+    return dir
+  }
+
+  test("restarts the proxy if it dies while Claude Code is running", () => {
+    const dir = stage()
+    try {
+      assert.ok(down(), "precondition: nothing on the port")
+      const r = spawnSync("bash", [path.join(dir, "bin", "claude-zen")], {
+        encoding: "utf8",
+        env: { ...process.env, PATH: `${path.join(dir, "bin")}:${process.env.PATH ?? ""}` },
+        timeout: 90_000,
+      })
+      const out = `${r.stdout ?? ""}${r.stderr ?? ""}`
+      assert.match(out, /restarting \(1\/10\)/, `expected a restart, got: ${out}`)
+      assert.match(out, /PROXY-STILL-THERE/, `proxy should be back up by the end: ${out}`)
+    } finally {
+      for (const p of spawnSync("pgrep", ["-f", `zen-proxy.mjs`], { encoding: "utf8" }).stdout.split("\n").filter(Boolean))
+        try { process.kill(Number(p), "SIGKILL") } catch {}
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
