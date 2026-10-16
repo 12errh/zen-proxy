@@ -2163,14 +2163,18 @@ describe("free tier gate on the chat path", () => {
     return { res, seen }
   }
 
-  test("a tool-less chat request is given one opencode tool and tool_choice none", async () => {
+  test("a tool-less chat request carries opencode's whole manifest, pinned off", async () => {
     const { res, seen } = await post({
       model: DEFAULT_MODEL,
       messages: [{ role: "system", content: "s" }, { role: "user", content: "hi" }],
     })
     assert.equal(res.state.status, 200, "the gate accepts a tool-less caller")
-    const bridge = (seen[0].tools ?? []).map((t) => t.function.name)
-    assert.deepEqual(bridge, ["read"], "the gateway only accepts opencode's read tool, so that is what must be sent")
+    // opencode sends its full registry on every call, filtering it by relevance
+    // never, so the proxy sends the whole manifest too.
+    assert.deepEqual(
+      (seen[0].tools ?? []).map((t) => t.function.name),
+      zp.loadAgentTools().map((t) => t.function.name),
+    )
     assert.equal(seen[0].tool_choice, "none", "the model must not call a tool the caller never offered")
   })
 
@@ -2188,7 +2192,10 @@ describe("free tier gate on the chat path", () => {
     await zp.handleChat(mockReq({ _body: JSON.stringify({ model: "gpt-5.5", messages: [{ role: "user", content: "hi" }] }) }), res)
     assert.equal(res.state.status, 200)
     assert.match(seen[0].url, /\/responses$/)
-    assert.deepEqual((seen[0].sent.tools ?? []).map((t) => t.name), ["read"])
+    assert.deepEqual(
+      (seen[0].sent.tools ?? []).map((t) => t.name),
+      zp.loadAgentTools().map((t) => t.function.name),
+    )
     // The live gateway rejects tool_choice "none" on /responses ("only auto is
     // supported"), so this assertion pins the asymmetry rather than an oversight.
     assert.equal(seen[0].sent.tool_choice, undefined)

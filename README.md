@@ -117,7 +117,7 @@ zen-proxy sits in front of that gateway and identifies your agent as a real sess
 
 For `/v1/messages` specifically, the gateway also requires OpenCode's own tool manifest, so zen-proxy attaches those tools alongside Claude Code's and renames the resulting calls back. **Claude Code's system prompt is passed through untouched.**
 
-The OpenAI-shaped routes get no name mapping, so they are handled differently: a request carrying **no tools at all** — an agent's own internal call, like summarization or title generation — is given one OpenCode tool so it passes the gate. On `/v1/chat/completions` that tool is pinned off, so the model cannot call something the caller cannot run; on `/v1/responses` it is not.
+The OpenAI-shaped routes get no name mapping, so they are handled differently: a request carrying **no tools at all** — an agent's own internal call, like summarization or title generation — is given OpenCode's own tool manifest so it passes the gate, exactly as opencode sends it on every call. On `/v1/chat/completions` those tools are pinned off, so the model cannot call something the caller cannot run; on `/v1/responses` they are not.
 </details>
 
 <details>

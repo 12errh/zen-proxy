@@ -135,12 +135,11 @@ function loadAgentTools() {
 }
 
 // The gate wants opencode's tools, but a caller that sends none — a plain chat,
-// pi's auto-compaction — has nothing for agentToolsFor() to match. `read` is the
-// only name it accepts; bash, edit, write, grep and glob all 403, measured live.
-function gateBridgeTool() {
-  if (!config.agentTools) return null
-  const tools = loadAgentTools()
-  return tools.find((t) => t.function.name === "read") ?? tools[0] ?? null
+// pi's auto-compaction — has nothing for agentToolsFor() to match. opencode
+// attaches its whole registry on every call and never filters it by relevance,
+// so the proxy sends the whole manifest too; the gate takes it on `read` alone.
+function gateBridgeTools() {
+  return config.agentTools ? loadAgentTools() : []
 }
 
 // The subset of opencode tools whose mapped name the caller actually offers.
@@ -1119,18 +1118,18 @@ async function handleChat(req, res) {
   let lastErr = null
   let lastStatus = 502
   let used = requested
-  const bridge = body.tools?.length ? null : gateBridgeTool()
+  const bridge = body.tools?.length ? [] : gateBridgeTools()
   for (const model of candidates) {
     used = model
     const format = modelFormat(model)
     const payload =
       format === "responses" ? responsesRequest(body, model, isStream) : { ...body, model }
-    if (bridge) {
-      const tools = format === "responses" ? chatToolsToResponses([bridge]) : [bridge]
-      payload.tools = [...(payload.tools ?? []), ...tools]
+    if (bridge.length) {
+      const tools = format === "responses" ? chatToolsToResponses(bridge) : bridge
+      payload.tools = tools
       // shortcut: the Responses API takes only tool_choice "auto", so there the
-      // bridge stays callable and the model may answer with a read call the
-      // caller cannot run. Remap it in relayResponsesStream to close that.
+      // bridge stays callable and the model may answer with a call the caller
+      // cannot run. Remap it in relayResponsesStream to close that.
       if (format !== "responses") payload.tool_choice = "none"
     }
     let upstreamRes
