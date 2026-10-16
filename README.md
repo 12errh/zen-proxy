@@ -16,39 +16,58 @@
 
 ## Start here
 
+### Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/12errh/zen-proxy/main/install.sh | bash
+```
+
+```powershell
+irm https://raw.githubusercontent.com/12errh/zen-proxy/main/install.ps1 | iex
+```
+
+<sub>That is the entire installation — no account, no API key, no `npm install`. Now pick your agent below.</sub>
+
+---
+
 ### Claude Code
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/12errh/zen-proxy/main/install.sh | bash   # Windows: irm https://raw.githubusercontent.com/12errh/zen-proxy/main/install.ps1 | iex
 zen-claude
 ```
 
-One command. It starts the proxy, loads every live free Zen model into Claude Code's `/model` picker, runs Claude Code, and shuts the proxy down when you exit. Same on Linux, macOS and Windows. Your existing Claude Code config is never touched.
+<sub>Identical on Linux, macOS and Windows.</sub>
 
-### Any other agent
+It starts the proxy if it is not already running, loads every live free Zen model into Claude Code's `/model` picker, runs Claude Code, and stops the proxy again when you exit. Your existing Claude Code config is never touched.
 
-Cline, Roo Code, Continue, Aider, mimo, opencode forks, anything with a `baseURL`:
+---
+
+### Any OpenAI-compatible agent
+
+<sub>Cline, Roo Code, Continue, Aider, mimo, opencode forks — anything with a `baseURL` setting.</sub>
 
 | Setting | Value |
 |---|---|
 | Base URL | `http://127.0.0.1:8787/v1` |
 | API key | `public` |
-| Model | anything from [`GET /v1/models`](http://127.0.0.1:8787/v1/models) |
+| Model | anything from `GET /v1/models` |
 
-<details>
-<summary>Start the proxy yourself instead</summary>
-
-```bash
-zen-proxy            # http://127.0.0.1:8787, with a dashboard at /
-```
-</details>
-
-### Check it works
+Confirm the proxy is up:
 
 ```bash
 curl -s http://127.0.0.1:8787/health
 # {"ok":true,"upstream":"https://opencode.ai/inference/v1"}
 ```
+
+<details>
+<summary>Run the proxy yourself</summary>
+
+```bash
+zen-proxy     # http://127.0.0.1:8787 — dashboard at /
+```
+
+It stays up until you stop it, so you point your agent at it once and keep using it. `zen-claude` does this for you and cleans up after.
+</details>
 
 ---
 
