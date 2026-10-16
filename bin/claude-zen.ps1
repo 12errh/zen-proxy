@@ -19,7 +19,7 @@ foreach ($cand in @(
     if (Test-Path $cand) { $settings = (Resolve-Path $cand).Path; break }
 }
 if (-not $settings) {
-    Write-Error "zen-claude: could not find claude\zen-proxy.settings.json"
+    [Console]::Error.WriteLine("zen-claude: could not find claude\zen-proxy.settings.json")
     exit 1
 }
 
@@ -43,14 +43,15 @@ try {
     $r = Invoke-WebRequest -Uri "http://127.0.0.1:$port/health" -TimeoutSec 3 -UseBasicParsing
     if ($r.StatusCode -ne 200) { throw "unhealthy" }
 } catch {
-    Write-Host "zen-claude: no zen-proxy responding on port $port - start it first:" -ForegroundColor Yellow
-    Write-Host "            zen-proxy"
+    # stderr, not Write-Host, so a caller can detect the failure.
+    [Console]::Error.WriteLine("zen-claude: no zen-proxy responding on port $port - start it first:")
+    [Console]::Error.WriteLine("            zen-proxy")
     exit 1
 }
 
 $claude = Get-Command claude -ErrorAction SilentlyContinue
 if (-not $claude) {
-    Write-Error "zen-claude: 'claude' not found on PATH - install Claude Code first"
+    [Console]::Error.WriteLine("zen-claude: 'claude' not found on PATH - install Claude Code first")
     exit 1
 }
 

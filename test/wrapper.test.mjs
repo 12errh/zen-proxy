@@ -124,18 +124,22 @@ describe("windows launcher (powershell)", { skip: !isWindows && "powershell laun
     fs.copyFileSync(PS1, path.join(bin, "claude-zen.ps1"))
     try {
       let stderr = ""
+      let stdout = ""
       let code = 0
       try {
-        execFileSync("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path.join(bin, "claude-zen.ps1")], {
+        stdout = execFileSync("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path.join(bin, "claude-zen.ps1")], {
           encoding: "utf8",
           stdio: ["ignore", "pipe", "pipe"],
         })
       } catch (e) {
         code = e.status ?? 1
         stderr = String(e.stderr ?? "")
+        stdout = String(e.stdout ?? "")
       }
       assert.notEqual(code, 0, "exits non-zero")
-      assert.match(stderr, /no zen-proxy/, "says the proxy is not running")
+      // PowerShell Write-Host lands on stdout; the launcher writes failures to
+      // stderr explicitly, so accept either stream but require the message.
+      assert.match(`${stderr}${stdout}`, /no zen-proxy/, "says the proxy is not running")
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
