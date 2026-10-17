@@ -315,7 +315,7 @@ describe("README badges", () => {
   })
 })
 
-describe("the launcher keeps the proxy alive", () => {
+describe("the launcher keeps the proxy alive", { skip: isWindows && "drives the bash launcher, which is posix-only" }, () => {
   // Reproduces the reported failure: the proxy goes away partway through a
   // session and the agent is left talking to a closed port, with a connection
   // error as the only symptom.
@@ -332,7 +332,9 @@ describe("the launcher keeps the proxy alive", () => {
     fs.writeFileSync(
       path.join(dir, "bin", "claude"),
       `#!/usr/bin/env bash\ncurl -fsS -m 5 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1 || exit 9\n` +
-        `pkill -f "zen-proxy.mjs" 2>/dev/null; sleep 6\n` +
+        // Scoped to the staged path: a bare `pkill -f zen-proxy.mjs` matches
+        // every proxy on the machine, including one the developer is running.
+        `pkill -f '${dir}/zen-proxy.mjs' 2>/dev/null; sleep 6\n` +
         `curl -fsS -m 5 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1 && echo PROXY-STILL-THERE || echo PROXY-GONE\n`,
     )
     fs.chmodSync(path.join(dir, "bin", "claude"), 0o755)
@@ -352,7 +354,11 @@ describe("the launcher keeps the proxy alive", () => {
       assert.match(out, /restarting \(1\/10\)/, `expected a restart, got: ${out}`)
       assert.match(out, /PROXY-STILL-THERE/, `proxy should be back up by the end: ${out}`)
     } finally {
-      for (const p of spawnSync("pgrep", ["-f", `zen-proxy.mjs`], { encoding: "utf8" }).stdout.split("\n").filter(Boolean))
+      // Sweep only the proxy this test staged — its command line contains the
+      // temp dir. `pgrep -f zen-proxy.mjs` would match any proxy the developer
+      // has running, and its stdout is null where pgrep does not exist.
+      const pgrep = spawnSync("pgrep", ["-f", path.join(dir, "zen-proxy.mjs")], { encoding: "utf8" })
+      for (const p of (pgrep.stdout ?? "").split("\n").filter(Boolean))
         try { process.kill(Number(p), "SIGKILL") } catch {}
       fs.rmSync(dir, { recursive: true, force: true })
     }
