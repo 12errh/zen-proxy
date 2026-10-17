@@ -1070,11 +1070,24 @@ async function handleMessages(req, res) {
   // The model the client chose is tried first; transient failures are retried
   // against that same model before the chain moves on.
   const retries = config.retriesPerModel > 0 ? Math.floor(config.retriesPerModel) : 0
+  // Same bridge rule as the chat path: a caller that sends no tools (title-gen
+  // helper calls, plain API use) gets opencode's whole manifest pinned off, or
+  // the gate answers 403 for every model and the request walks the chain.
+  const bridge = (body?.tools ?? []).length ? [] : gateBridgeTools()
+  const bridged = bridge.length > 0
   for (const model of candidates) {
     const chosen = model === candidates[0]
     used = model
     const format = modelFormat(model)
-    const payload = format === "responses" ? responsesRequest(anthropicToChatBody(body, model), model, isStream) : anthropicToChatBody(body, model)
+    // Upstream only ever sees streams (see collectChatCompletion); whether the
+    // client asked for one decides how the reply is shaped, not what is sent.
+    const payload = format === "responses" ? responsesRequest(anthropicToChatBody(body, model), model, true) : { ...anthropicToChatBody(body, model), stream: true }
+    if (bridged) {
+      payload.tools = format === "responses" ? chatToolsToResponses(bridge) : bridge
+      // /responses takes only "auto"; the chat endpoint takes the pin.
+      if (format === "responses") delete payload.tool_choice
+      else payload.tool_choice = "none"
+    }
     let delayMs = 0
     for (let attempt = 0; attempt <= retries; attempt++) {
       if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs))
@@ -1108,7 +1121,7 @@ async function handleMessages(req, res) {
       if (upstreamRes.ok) {
         if (isStream) {
           const chunks = format === "responses" ? responsesChunksAsChat(upstreamRes) : sseChunks(upstreamRes)
-          relayAnthropicStream(req, res, chunks, requested, model)
+          relayAnthropicStream(req, res, chunks, requested, model, bridged)
           res.on("finish", () => {
             recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
             recordObserved(model, true)
@@ -1116,8 +1129,8 @@ async function handleMessages(req, res) {
           return
         }
         try {
-          const content = await upstreamRes.json()
-          const shaped = format === "responses" ? responsesToChat(content, requested, model) : content
+          const content = format === "responses" ? await collectResponses(upstreamRes) : await collectChatCompletion(upstreamRes)
+          const shaped = stripToolCalls(format === "responses" ? responsesToChat(content, requested, model) : content, bridged)
           recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
           recordObserved(model, true)
           if (model !== requested) {
@@ -1166,7 +1179,7 @@ async function handleMessages(req, res) {
   // unrelated failures (e.g. a retired model's 410 "deprecated").
   const finalErr = firstErr ?? lastErr
   const finalStatus = firstErr ? firstStatus : lastStatus
-  recordReq(req, `${requested}→${used}`, Date.now() - start, finalStatus)
+  recordReq(req, requested, Date.now() - start, finalStatus)
   const e = anthropicError(finalStatus, finalErr ?? { error: { type: "api_error", message: "all free models are unavailable" } })
   res.writeHead(e.status, { "content-type": "application/json" })
   res.end(JSON.stringify(e.body))
@@ -1210,8 +1223,10 @@ async function handleChat(req, res) {
     const chosen = model === candidates[0]
     used = model
     const format = modelFormat(model)
+    // Streams upstream regardless of what the client asked for — see
+    // collectChatCompletion — and the collector puts the shape back.
     const payload =
-      format === "responses" ? responsesRequest(body, model, isStream) : { ...body, model }
+      format === "responses" ? responsesRequest(body, model, true) : { ...body, model, stream: true }
     if (bridged) {
       payload.tools = format === "responses" ? chatToolsToResponses(bridge) : bridge
       // The gateway takes only "auto" on /responses, so forwarding anything the
@@ -1257,7 +1272,7 @@ async function handleChat(req, res) {
           return
         }
         try {
-          const content = await upstreamRes.json()
+          const content = format === "responses" ? await collectResponses(upstreamRes) : await collectChatCompletion(upstreamRes)
           if (format === "responses") {
             recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
             recordObserved(model, true)
@@ -1324,7 +1339,10 @@ async function handleChat(req, res) {
   // unrelated failures (e.g. a retired model's 410 "deprecated").
   const finalStatus = firstErr ? firstStatus : lastStatus
   const finalErr = firstErr ?? lastErr
-  recordReq(req, `${requested}→${used}`, Date.now() - start, finalStatus)
+  // Nothing served this request, so the feed names no server — the last model
+  // tried is an implementation detail and used to read as "another model
+  // answered" while the error shown actually came from the requested one.
+  recordReq(req, requested, Date.now() - start, finalStatus)
   res.writeHead(finalStatus, { "content-type": "application/json" })
   res.end(
     JSON.stringify(finalErr ?? { error: { type: "free_usage_limit_error", message: "all free models are rate-limited" } }),
@@ -1354,6 +1372,84 @@ async function* sseChunks(upstreamRes) {
       reader.cancel()
     } catch {}
   }
+}
+
+// The free-tier gate only answers streaming traffic: a non-streaming request is
+// refused with 403 FreeTierError for every model, no matter which one is asked.
+// That used to walk the whole fallback chain (~5s), mark every model as failed
+// on the dashboard and return a 403 that read like a different model had been
+// used. So a non-streaming client request is sent upstream as a stream and the
+// SSE is re-assembled into the plain JSON the client asked for.
+async function collectChatCompletion(upstreamRes) {
+  if (!/text\/event-stream/i.test(upstreamRes.headers.get("content-type") ?? "")) return upstreamRes.json()
+  const message = { role: "assistant", content: "" }
+  const out = {
+    id: `chatcmpl-${randomBytes(12).toString("hex")}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: "",
+    choices: [{ index: 0, message, finish_reason: "stop" }],
+  }
+  const toolCalls = []
+  for await (const block of sseChunks(upstreamRes)) {
+    let raw = ""
+    for (const line of block.split("\n")) if (line.startsWith("data:")) raw = line.slice(5).trim()
+    if (!raw || raw === "[DONE]") continue
+    let d
+    try {
+      d = JSON.parse(raw)
+    } catch {
+      continue
+    }
+    if (d?.error) throw new Error(d.error.message ?? "upstream stream error")
+    if (d?.id) out.id = d.id
+    if (d?.model) out.model = d.model
+    if (d?.created) out.created = d.created
+    if (d?.usage) out.usage = d.usage
+    const choice = d?.choices?.[0]
+    if (!choice) continue
+    const delta = choice.delta ?? {}
+    if (typeof delta.content === "string" && delta.content) message.content += delta.content
+    if (typeof delta.reasoning_content === "string" && delta.reasoning_content)
+      message.reasoning_content = (message.reasoning_content ?? "") + delta.reasoning_content
+    for (const tc of delta.tool_calls ?? []) {
+      const idx = tc.index ?? 0
+      const cur = toolCalls[idx] ?? (toolCalls[idx] = { id: tc.id ?? `call_${idx}`, type: "function", function: { name: "", arguments: "" } })
+      if (tc.id) cur.id = tc.id
+      if (tc.function?.name) cur.function.name = tc.function.name
+      if (tc.function?.arguments) cur.function.arguments += tc.function.arguments
+    }
+    if (choice.finish_reason) out.choices[0].finish_reason = choice.finish_reason
+  }
+  const calls = toolCalls.filter(Boolean)
+  if (calls.length) {
+    message.tool_calls = calls
+    if (out.choices[0].finish_reason === "stop") out.choices[0].finish_reason = "tool_calls"
+  }
+  return out
+}
+
+// Same idea for /responses: the finished response object arrives whole in the
+// `response.completed` event, which is exactly what responsesToChat expects.
+async function collectResponses(upstreamRes) {
+  if (!/text\/event-stream/i.test(upstreamRes.headers.get("content-type") ?? "")) return upstreamRes.json()
+  let result = null
+  for await (const block of sseChunks(upstreamRes)) {
+    let raw = ""
+    for (const line of block.split("\n")) if (line.startsWith("data:")) raw = line.slice(5).trim()
+    if (!raw || raw === "[DONE]") continue
+    let d
+    try {
+      d = JSON.parse(raw)
+    } catch {
+      continue
+    }
+    if (d?.error) throw new Error(d.error.message ?? "upstream stream error")
+    if (d?.type === "response.completed" || d?.type === "response.incomplete") result = d.response ?? result
+    else if (d?.response?.output) result = d.response
+  }
+  if (!result) throw new Error("stream ended without a completed response")
+  return result
 }
 
 // Responses SSE -> chat-shaped SSE text blocks, so the Anthropic translator
@@ -1402,7 +1498,7 @@ async function* responsesChunksAsChat(upstreamRes) {
 // then message_delta carrying stop_reason and usage, then message_stop. Tool
 // arguments arrive as input_json_delta, so they are buffered until the block ends
 // rather than being re-parsed per chunk.
-function relayAnthropicStream(req, res, chunks, requested, servedBy) {
+function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = false) {
   res.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
@@ -1468,7 +1564,9 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy) {
             if (d.usage) st.usage = d.usage
             const choice = d.choices?.[0]
             const delta = choice?.delta ?? {}
-            if (choice?.finish_reason) st.finish = choice.finish_reason
+            // The bridge tools exist only to satisfy the gate; a caller that
+            // offered none must never see a call to one (see stripToolCalls).
+            if (choice?.finish_reason) st.finish = strip && choice.finish_reason === "tool_calls" ? "stop" : choice.finish_reason
             if (typeof delta.content === "string" && delta.content) {
               closeThink()
               if (!st.textOpen) {
@@ -1484,7 +1582,7 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy) {
               }
               emit("content_block_delta", { index: 0, delta: { type: "thinking_delta", thinking: delta.reasoning_content } })
             }
-            for (const tc of delta.tool_calls ?? []) {
+            for (const tc of strip ? [] : delta.tool_calls ?? []) {
               closeThink()
               closeText()
               const tIndex = tc.index ?? 0
