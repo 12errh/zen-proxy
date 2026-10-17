@@ -42,11 +42,17 @@ async function loadModels() {
 }
 
 const models = await loadModels()
+const firstModel = models[0] ?? "space-bunny-free"
 const settings = {
   env: {
     ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}`,
     ANTHROPIC_AUTH_TOKEN: "public",
-    ANTHROPIC_MODEL: models[0] ?? "space-bunny-free",
+    ANTHROPIC_MODEL: firstModel,
+    // Claude Code sends its built-in haiku id for background work (titles,
+    // quotas, summaries). Left unset, those requests name a model this proxy
+    // cannot serve and it has to silently answer with its default — pinning the
+    // id keeps every request naming a model the proxy actually serves.
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: firstModel,
     CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT: "1",
   },
   modelPicker: {

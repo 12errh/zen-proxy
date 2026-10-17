@@ -171,6 +171,13 @@ function remapAgentTool(name, rawArgs) {
   return { name: spec.name, args: JSON.stringify(out) }
 }
 
+// Request bodies get big in real sessions: Claude Code's compaction POSTs the
+// whole transcript (base64 images included) and upstream itself accepted a 30MB
+// probe untouched. The old 1MB ceiling turned those requests into 413s, which
+// Claude Code surfaces as "request size limit reached" and abandons the session.
+// The default mirrors Anthropic's own 32MB guidance; `maxBodyBytes` overrides it.
+const MAX_BODY = 32 * 1024 * 1024
+
 const DEFAULT_CONFIG = {
   host: ENV.HOST ?? "127.0.0.1",
   port: Number(ENV.PORT ?? 8787),
@@ -208,6 +215,11 @@ const DEFAULT_CONFIG = {
     ENV.RESPONSES_MODELS ??
       JSON.stringify(["gpt-5*", "gpt-6*", "grok-*", "muse-spark-*"]),
   ),
+  maxBodyBytes: Number(ENV.MAX_BODY_BYTES ?? MAX_BODY),
+  // How many extra attempts a request gets against the *same* model when it
+  // fails transiently (429/5xx/network) before the fallback chain moves on.
+  retriesPerModel: Number(ENV.RETRIES_PER_MODEL ?? 2),
+  retryBackoffMs: Number(ENV.RETRY_BACKOFF_MS ?? 500),
   rateLimitMax: Number(ENV.RATE_LIMIT_MAX ?? 0),
   rateLimitWindowMs: Number(ENV.RATE_LIMIT_WINDOW_MS ?? 60_000),
   proxyKey: ENV.PROXY_KEY ?? "",
@@ -339,7 +351,6 @@ function sanitize(cfg) {
 }
 
 const ALLOWED = () => new Set([...config.fallbackModels, ...Object.values(config.modelAliases)])
-const MAX_BODY = 1024 * 1024
 const requestStats = { total: 0, errors: 0, recent: [], perMinute: new Map(), window60: [] }
 // jev-* free models are served on /v1/systemone (structured classification),
 // not on a chat/responses endpoint, so they are never routable here.
@@ -419,11 +430,25 @@ const RETRYABLE_ERROR_TYPES = new Set([
 // still break out immediately.
 function retryableUpstream(status, body) {
   if (status === 429 || status >= 500) return true
+  // 410 Gone is what a retired model id returns; auto-sync may not have caught
+  // up yet, so the chain has to keep walking instead of surfacing "deprecated".
+  if (status === 410) return true
   if (status < 400 || status > 499) return false
   const t = body?.error?.type ?? body?.type ?? ""
   const msg = String(body?.error?.message ?? body?.message ?? "")
   if (RETRYABLE_ERROR_TYPES.has(t)) return true
-  return /model is unavailable|not supported|only be used in opencode|free tier can only|no such model|does not exist|overloaded|temporarily.*limit|upstream request failed/i.test(msg)
+  return /model is unavailable|not supported|only be used in opencode|free tier can only|no such model|does not exist|has been deprecated|no longer available|overloaded|temporarily.*limit|upstream request failed/i.test(msg)
+}
+
+// Transient means waiting and asking the *same* model again can plausibly
+// succeed (provider hiccup, rate limit, network blip). Model-level verdicts —
+// free-tier gate 403s, geo blocks, retired ids — are deterministic, so those
+// skip straight to the next candidate rather than burning retries on a
+// foregone conclusion.
+function transientUpstream(status, body) {
+  if (status === 429 || status >= 500) return true
+  const t = body?.error?.type ?? body?.type ?? ""
+  return t === "server_error" || t === "api_error" || t === "upstream_error" || t === "ProviderError"
 }
 
 // ---- endpoint family resolution -------------------------------------------
@@ -516,11 +541,21 @@ function anthropicToChatMessages(system, messages) {
         })
       } else if (type === "tool_result") {
         flush()
+        // A tool result may carry images: Claude Code's Read on a picture sends
+        // an image block inside the tool_result, and nothing else. Chat
+        // endpoints reject images in role "tool", so the text stays on the tool
+        // message and the pictures follow as a user turn — the same shape the
+        // Responses translation already uses. Without this the model only saw
+        // an empty text fallback and the picture silently vanished.
+        const images = Array.isArray(b.content)
+          ? b.content.filter((p) => p?.type === "image").map(anthropicImageUrl).filter(Boolean)
+          : []
         out.push({
           role: "tool",
           tool_call_id: b.tool_use_id ?? b.id ?? "call_0",
           content: typeof b.content === "string" ? b.content : textOf(b.content) || " ",
         })
+        if (images.length) out.push({ role: "user", content: images.map((url) => ({ type: "image_url", image_url: { url } })) })
       }
     }
     flush()
@@ -945,7 +980,14 @@ function authForUpstream(req) {
   return "Bearer public"
 }
 
-async function readBody(req, limit = MAX_BODY) {
+// The configured ceiling wins when it is a positive number; 0/absent keeps the
+// shipped default (see MAX_BODY).
+function maxBodyBytes() {
+  const n = Number(config.maxBodyBytes)
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : MAX_BODY
+}
+
+async function readBody(req, limit = maxBodyBytes()) {
   let raw = ""
   for await (const chunk of req) {
     raw += chunk
@@ -1022,71 +1064,110 @@ async function handleMessages(req, res) {
 
   let lastErr = null
   let lastStatus = 502
+  let firstErr = null
+  let firstStatus = 0
   let used = requested
+  // The model the client chose is tried first; transient failures are retried
+  // against that same model before the chain moves on.
+  const retries = config.retriesPerModel > 0 ? Math.floor(config.retriesPerModel) : 0
   for (const model of candidates) {
+    const chosen = model === candidates[0]
     used = model
     const format = modelFormat(model)
     const payload = format === "responses" ? responsesRequest(anthropicToChatBody(body, model), model, isStream) : anthropicToChatBody(body, model)
-    let upstreamRes
-    try {
-      upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
-        method: "POST",
-        headers: zenHeaders(req, auth),
-        body: JSON.stringify(payload),
-        signal: isStream ? req.signal : AbortSignal.timeout(config.timeoutMs),
-      })
-    } catch (err) {
-      lastErr = { error: { type: "api_error", message: err.message } }
-      lastStatus = 502
-      continue
-    }
+    let delayMs = 0
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs))
+      delayMs = 0
+      let upstreamRes
+      try {
+        upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
+          method: "POST",
+          headers: zenHeaders(req, auth),
+          body: JSON.stringify(payload),
+          signal: isStream ? req.signal : AbortSignal.timeout(config.timeoutMs),
+        })
+      } catch (err) {
+        lastErr = { error: { type: "api_error", message: err.message } }
+        lastStatus = 502
+        if (attempt < retries) {
+          delayMs = config.retryBackoffMs * (attempt + 1)
+          continue
+        }
+        recordObserved(model, false)
+        break
+      }
 
-    if (upstreamRes.status === 401 && !triedFallback && fallbackAuth && fallbackAuth !== auth) {
-      triedFallback = true
-      auth = fallbackAuth
-      continue
-    }
+      if (upstreamRes.status === 401 && !triedFallback && fallbackAuth && fallbackAuth !== auth) {
+        triedFallback = true
+        auth = fallbackAuth
+        attempt--
+        continue
+      }
 
-    if (upstreamRes.ok) {
-      if (isStream) {
-        const chunks = format === "responses" ? responsesChunksAsChat(upstreamRes) : sseChunks(upstreamRes)
-        relayAnthropicStream(req, res, chunks, requested, model)
-        res.on("finish", () => {
+      if (upstreamRes.ok) {
+        if (isStream) {
+          const chunks = format === "responses" ? responsesChunksAsChat(upstreamRes) : sseChunks(upstreamRes)
+          relayAnthropicStream(req, res, chunks, requested, model)
+          res.on("finish", () => {
+            recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
+            recordObserved(model, true)
+          })
+          return
+        }
+        try {
+          const content = await upstreamRes.json()
+          const shaped = format === "responses" ? responsesToChat(content, requested, model) : content
           recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
           recordObserved(model, true)
-        })
-        return
+          if (model !== requested) {
+            res.setHeader?.("x-zen-served-by", model)
+            res.setHeader?.("x-zen-fallback", "true")
+          }
+          return json(res, 200, chatToAnthropic(shaped, requested, model))
+        } catch {
+          recordReq(req, requested, Date.now() - start, 502)
+          return json(res, 502, anthropicError(502, { error: { type: "api_error", message: "bad upstream response" } }).body)
+        }
       }
-      try {
-        const content = await upstreamRes.json()
-        const shaped = format === "responses" ? responsesToChat(content, requested, model) : content
-        recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
-        recordObserved(model, true)
-        return json(res, 200, chatToAnthropic(shaped, requested, model))
-      } catch {
-        recordReq(req, requested, Date.now() - start, 502)
-        return json(res, 502, anthropicError(502, { error: { type: "api_error", message: "bad upstream response" } }).body)
-      }
-    }
 
-    try {
-      lastErr = await upstreamRes.json()
-    } catch {
-      lastErr = { error: { type: "api_error", message: `upstream returned ${upstreamRes.status}` } }
-    }
-    lastStatus = upstreamRes.status
-    if (retryableUpstream(upstreamRes.status, lastErr)) {
+      try {
+        lastErr = await upstreamRes.json()
+      } catch {
+        lastErr = { error: { type: "api_error", message: `upstream returned ${upstreamRes.status}` } }
+      }
+      lastStatus = upstreamRes.status
+      const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
+      if (transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
+        delayMs = Math.max(config.retryBackoffMs * (attempt + 1), retryAfterMs)
+        continue
+      }
       recordObserved(model, false)
-      const wait = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
-      if (wait > 0) await new Promise((r) => setTimeout(r, wait))
-      continue
+      if (retryableUpstream(upstreamRes.status, lastErr)) {
+        if (retryAfterMs > 0) await new Promise((r) => setTimeout(r, retryAfterMs))
+        break
+      }
+      // A deterministic client-visible error (bad request, auth, …): report it
+      // as-is rather than masking it with the rest of the chain.
+      recordReq(req, `${requested}→${used}`, Date.now() - start, lastStatus)
+      const e = anthropicError(lastStatus, lastErr)
+      res.writeHead(e.status, { "content-type": "application/json" })
+      res.end(JSON.stringify(e.body))
+      return
     }
-    recordObserved(model, false)
-    break
+    if (chosen && firstErr == null) {
+      firstErr = lastErr
+      firstStatus = lastStatus
+    }
   }
 
-  recordReq(req, `${requested}→${used}`, Date.now() - start, lastStatus)
-  const e = anthropicError(lastStatus, lastErr ?? { error: { type: "api_error", message: "all free models are unavailable" } })
+  // Every candidate failed. Surface the error from the model the client asked
+  // for — the tail of the chain is an implementation detail and used to leak
+  // unrelated failures (e.g. a retired model's 410 "deprecated").
+  const finalErr = firstErr ?? lastErr
+  const finalStatus = firstErr ? firstStatus : lastStatus
+  recordReq(req, `${requested}→${used}`, Date.now() - start, finalStatus)
+  const e = anthropicError(finalStatus, finalErr ?? { error: { type: "api_error", message: "all free models are unavailable" } })
   res.writeHead(e.status, { "content-type": "application/json" })
   res.end(JSON.stringify(e.body))
 }
@@ -1117,10 +1198,16 @@ async function handleChat(req, res) {
 
   let lastErr = null
   let lastStatus = 502
+  let firstErr = null
+  let firstStatus = 0
   let used = requested
+  // The model the client chose is tried first; transient failures are retried
+  // against that same model before the chain moves on.
+  const retries = config.retriesPerModel > 0 ? Math.floor(config.retriesPerModel) : 0
   const bridge = body.tools?.length ? [] : gateBridgeTools()
-    const bridged = bridge.length > 0
+  const bridged = bridge.length > 0
   for (const model of candidates) {
+    const chosen = model === candidates[0]
     used = model
     const format = modelFormat(model)
     const payload =
@@ -1132,80 +1219,115 @@ async function handleChat(req, res) {
       if (format === "responses") delete payload.tool_choice
       else payload.tool_choice = "none"
     }
-    let upstreamRes
-    try {
-      upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
-        method: "POST",
-        headers: zenHeaders(req, auth),
-        body: JSON.stringify(payload),
-        signal: isStream ? req.signal : AbortSignal.timeout(config.timeoutMs),
-      })
-    } catch (err) {
-      lastErr = { error: { type: "upstream_error", message: err.message } }
-      lastStatus = 502
-      continue
-    }
-
-    if (upstreamRes.ok) {
-      if (isStream) {
-        if (format === "responses") {
-          relayResponsesStream(req, res, upstreamRes, requested, bridged)
-        } else {
-          relayStream(req, res, upstreamRes, requested, bridged)
-        }
-        res.on("finish", () => { recordReq(req, `${requested}→${model}`, Date.now() - start, 200); recordObserved(model, true) })
-        return
-      }
+    let delayMs = 0
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs))
+      delayMs = 0
+      let upstreamRes
       try {
-        const content = await upstreamRes.json()
-        if (format === "responses") {
+        upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
+          method: "POST",
+          headers: zenHeaders(req, auth),
+          body: JSON.stringify(payload),
+          signal: isStream ? req.signal : AbortSignal.timeout(config.timeoutMs),
+        })
+      } catch (err) {
+        lastErr = { error: { type: "upstream_error", message: err.message } }
+        lastStatus = 502
+        if (attempt < retries) {
+          delayMs = config.retryBackoffMs * (attempt + 1)
+          continue
+        }
+        recordObserved(model, false)
+        break
+      }
+
+      if (upstreamRes.ok) {
+        if (isStream) {
+          if (model !== requested) {
+            res.setHeader?.("x-zen-served-by", model)
+            res.setHeader?.("x-zen-fallback", "true")
+          }
+          if (format === "responses") {
+            relayResponsesStream(req, res, upstreamRes, requested, bridged)
+          } else {
+            relayStream(req, res, upstreamRes, requested, bridged)
+          }
+          res.on("finish", () => { recordReq(req, `${requested}→${model}`, Date.now() - start, 200); recordObserved(model, true) })
+          return
+        }
+        try {
+          const content = await upstreamRes.json()
+          if (format === "responses") {
+            recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
+            recordObserved(model, true)
+            if (model !== requested) {
+              res.setHeader?.("x-zen-served-by", model)
+              res.setHeader?.("x-zen-fallback", "true")
+            }
+            return json(res, 200, stripToolCalls(responsesToChat(content, requested, model), bridged))
+          }
+          if (model !== requested) {
+            // Make the fallback visible to any client, not just JSON readers.
+            res.setHeader?.("x-zen-served-by", model)
+            res.setHeader?.("x-zen-fallback", "true")
+          }
+          if (content && typeof content === "object") {
+            content.model = requested
+            if (model !== requested) content.zen_served_by = model
+            stripToolCalls(content, bridged)
+          }
           recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
           recordObserved(model, true)
-          return json(res, 200, stripToolCalls(responsesToChat(content, requested, model), bridged))
+          return json(res, 200, content)
+        } catch {
+          recordReq(req, requested, Date.now() - start, 502)
+          return json(res, 502, { error: { type: "upstream_error", message: "bad upstream response" } })
         }
-        if (model !== requested) {
-          // Make the fallback visible to any client, not just JSON readers.
-          res.setHeader?.("x-zen-served-by", model)
-          res.setHeader?.("x-zen-fallback", "true")
-        }
-        if (content && typeof content === "object") {
-          content.model = requested
-          if (model !== requested) content.zen_served_by = model
-          stripToolCalls(content, bridged)
-        }
-        recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
-        recordObserved(model, true)
-        return json(res, 200, content)
-      } catch {
-        recordReq(req, requested, Date.now() - start, 502)
-        return json(res, 502, { error: { type: "upstream_error", message: "bad upstream response" } })
       }
-    }
 
-    try {
-      lastErr = await upstreamRes.json()
-    } catch {
-      lastErr = { error: { type: "upstream_error", message: `upstream returned ${upstreamRes.status}` } }
-    }
-    lastStatus = upstreamRes.status
-    // Try the next candidate not only on 429/5xx but also when the upstream
-    // reports a model/environment-level failure (e.g. a provider that is
-    // temporarily "unavailable", a geo-blocked free model, or a stale model id)
-    // so one dead model doesn't brick the whole request.
-    if (retryableUpstream(upstreamRes.status, lastErr)) {
+      try {
+        lastErr = await upstreamRes.json()
+      } catch {
+        lastErr = { error: { type: "upstream_error", message: `upstream returned ${upstreamRes.status}` } }
+      }
+      lastStatus = upstreamRes.status
+      const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
+      if (transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
+        delayMs = Math.max(config.retryBackoffMs * (attempt + 1), retryAfterMs)
+        continue
+      }
+      // Try the next candidate not only on 429/5xx but also when the upstream
+      // reports a model/environment-level failure (e.g. a provider that is
+      // temporarily "unavailable", a geo-blocked free model, or a stale model
+      // id) so one dead model doesn't brick the whole request.
       recordObserved(model, false)
-      const wait = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
-      if (wait > 0) await new Promise((r) => setTimeout(r, wait))
-      continue
+      if (retryableUpstream(upstreamRes.status, lastErr)) {
+        if (retryAfterMs > 0) await new Promise((r) => setTimeout(r, retryAfterMs))
+        break
+      }
+      // A deterministic client-visible error (bad request, auth, …): report it
+      // as-is rather than masking it with the rest of the chain.
+      recordReq(req, `${requested}→${used}`, Date.now() - start, lastStatus)
+      res.writeHead(lastStatus, { "content-type": "application/json" })
+      res.end(JSON.stringify(lastErr))
+      return
     }
-    recordObserved(model, false)
-    break
+    if (chosen && firstErr == null) {
+      firstErr = lastErr
+      firstStatus = lastStatus
+    }
   }
 
-  recordReq(req, `${requested}→${used}`, Date.now() - start, lastStatus)
-  res.writeHead(lastStatus, { "content-type": "application/json" })
+  // Every candidate failed. Surface the error from the model the client asked
+  // for — the tail of the chain is an implementation detail and used to leak
+  // unrelated failures (e.g. a retired model's 410 "deprecated").
+  const finalStatus = firstErr ? firstStatus : lastStatus
+  const finalErr = firstErr ?? lastErr
+  recordReq(req, `${requested}→${used}`, Date.now() - start, finalStatus)
+  res.writeHead(finalStatus, { "content-type": "application/json" })
   res.end(
-    JSON.stringify(lastErr ?? { error: { type: "free_usage_limit_error", message: "all free models are rate-limited" } }),
+    JSON.stringify(finalErr ?? { error: { type: "free_usage_limit_error", message: "all free models are rate-limited" } }),
   )
 }
 
@@ -1285,6 +1407,9 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy) {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
     connection: "keep-alive",
+    // Streaming responses get no JSON body a client could inspect, so the
+    // serving model is exposed as headers instead.
+    ...(servedBy && servedBy !== requested ? { "x-zen-served-by": servedBy, "x-zen-fallback": "true" } : {}),
   })
   const id = `msg_${randomBytes(12).toString("hex")}`
   const emit = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`)
@@ -1714,13 +1839,15 @@ async function syncModels() {
           else if (r.status === 429 && !bodyErr) { rateLimited.push(id); modelHealth.set(id, 0) }
           else {
             // Only drop a model from the user's config on definitive proof that it
-            // is gone: "not supported", 404, "no such model". Everything else
-            // (403 FreeTierError, 429, timeouts, 5xx) is a *temporary* access or
-            // capacity condition — the model comes back on its own, so deleting it
-            // would silently shrink the user's list and lose it forever.
+            // is gone: "not supported", 404, 410 Gone, "no such model", "has been
+            // deprecated". Everything else (403 FreeTierError, 429, timeouts, 5xx)
+            // is a *temporary* access or capacity condition — the model comes back
+            // on its own, so deleting it would silently shrink the user's list and
+            // lose it forever.
             const gone =
               r.status === 404 ||
-              /model_not_found|no such model|does not exist|is not supported|not supported/i.test(bodyErr)
+              r.status === 410 ||
+              /model_not_found|no such model|does not exist|is not supported|not supported|has been deprecated|no longer available/i.test(bodyErr)
             // Key/auth problems are not model problems either.
             const authErr = /AuthError|invalid api key|missing api key/i.test(bodyErr)
             // 403 FreeTierError means "only real opencode clients may use this".
@@ -2286,6 +2413,8 @@ export {
   scheduleUA,
   parseRetryAfter,
   retryableUpstream,
+  transientUpstream,
+  maxBodyBytes,
   toBool,
   sessionFor,
   sessionHeader,
