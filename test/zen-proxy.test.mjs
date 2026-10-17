@@ -530,7 +530,7 @@ describe("sync prunes unsupported models", () => {
       assert.equal(s.ok, true)
       assert.deepEqual([...zp.config.fallbackModels].sort(), [...list].sort(), `config intact after sync #${i + 1}`)
       assert.ok(!s.dead.includes("mimo-v2.5-free"), "temporary block is not 'dead'")
-      assert.ok(s.gated.includes("mimo-v2.5-free"), "reported as agent-only (gated), not flaky")
+      assert.ok(s.gated.includes("mimo-v2.5-free"), "reported as gate-blocked, not flaky")
     }
   })
 
@@ -578,7 +578,7 @@ describe("sync prunes unsupported models", () => {
     assert.ok(zp.config.fallbackModels.includes("space-bunny-free"), "working model kept")
   })
 
-  test("free-tier gated models are still added, since agents can use them", async () => {
+  test("models the gate refuses even for agent-shaped probes are still added", async () => {
     zp.saveConfig({ fallbackModels: [], autoSyncIntervalMs: 0, cacheMs: 0 })
     globalThis.fetch = routeFetch([
       ["/models", () => jsonResponse({ data: [{ id: "gated-flash-free" }] })],
@@ -586,8 +586,66 @@ describe("sync prunes unsupported models", () => {
     ])
     const s = await zp.syncModels()
     assert.equal(s.ok, true)
-    assert.ok(s.gated.includes("gated-flash-free"), "reported as agent-only")
-    assert.ok(zp.config.fallbackModels.includes("gated-flash-free"), "added, because real agents can use it")
+    assert.ok(s.gated.includes("gated-flash-free"), "reported as gate-blocked")
+    assert.ok(zp.config.fallbackModels.includes("gated-flash-free"), "added, because the block can lift")
+  })
+
+  test("health probes are agent-shaped, so the gate accepts them", async () => {
+    // The real gate refuses requests without opencode's tool manifest or
+    // without streaming; this mock does the same. Bare pings used to land
+    // every model in gated, which told the user nothing about whether it
+    // actually works.
+    const list = ["space-bunny-free", "mimo-v2.5-free"]
+    zp.saveConfig({ fallbackModels: [...list], defaultModel: "", autoSyncIntervalMs: 0, cacheMs: 0 })
+    const seen = []
+    globalThis.fetch = routeFetch([
+      ["/models", () => jsonResponse({ data: list.map((id) => ({ id })) })],
+      [
+        "/chat/completions",
+        (u, opts) => {
+          const body = JSON.parse(opts.body)
+          seen.push(body)
+          const agentShaped = body.stream === true && Array.isArray(body.tools) && body.tools.length > 0
+          return agentShaped
+            ? jsonResponse({ model: "ok", choices: [] })
+            : jsonResponse({ type: "error", error: { type: "FreeTierError", message: "free tier can only be used from within OpenCode" } }, 403)
+        },
+      ],
+    ])
+    const s = await zp.syncModels()
+    assert.equal(s.ok, true)
+    assert.deepEqual([...s.working].sort(), [...list].sort(), "both models probe as genuinely working")
+    assert.equal(s.gated.length, 0, "nothing is written off as gate-blocked")
+    assert.ok(seen.length >= 2 && seen.every((b) => b.stream === true), "every probe streams")
+    assert.ok(seen.every((b) => b.tools?.length > 0), "every probe carries the tool manifest")
+    assert.ok(seen.every((b) => b.tool_choice === "none"), "ping replies stay plain text, not tool calls")
+  })
+
+  test("responses-format models get an agent-shaped probe on /responses", async () => {
+    zp.saveConfig({
+      fallbackModels: ["muse-spark-1.3-contributor-free"],
+      responsesModels: ["gpt-5*", "gpt-6*", "grok-*", "muse-spark-*"],
+      defaultModel: "",
+      autoSyncIntervalMs: 0,
+      cacheMs: 0,
+    })
+    let sentBody
+    globalThis.fetch = routeFetch([
+      ["/models", () => jsonResponse({ data: [] })],
+      [
+        "/responses",
+        (u, opts) => {
+          sentBody = JSON.parse(opts.body)
+          return jsonResponse({ model: "ok" })
+        },
+      ],
+    ])
+    const s = await zp.syncModels()
+    assert.ok(s.working.includes("muse-spark-1.3-contributor-free"), "reported working")
+    assert.equal(sentBody.stream, true, "responses probe streams too")
+    assert.ok(sentBody.tools?.length > 0, "responses probe carries converted tools")
+    assert.equal(sentBody.input, "ping")
+    assert.ok(!("tool_choice" in sentBody), "responses payload stays in responses dialect")
   })
 })
 
@@ -760,14 +818,16 @@ describe("auth visibility & key test", () => {
     assert.ok(!JSON.parse(JSON.stringify(st.auth)).zenKey.includes("zen-secret"), "key masked")
   })
 
-  test("/api/test sends an explicit zenKey override", async () => {
+  test("/api/test sends an agent-shaped probe and an explicit zenKey override", async () => {
     const m = zp.config.fallbackModels[0]
     let sentAuth
+    let sentBody
     globalThis.fetch = routeFetch([
       [
         "/chat/completions",
         (u, opts) => {
           sentAuth = opts.headers["authorization"]
+          sentBody = JSON.parse(opts.body)
           return jsonResponse({ model: "ok", choices: [] })
         },
       ],
@@ -777,6 +837,9 @@ describe("auth visibility & key test", () => {
     await zp.handleTest(req, res)
     assert.equal(res.state.status, 200)
     assert.equal(sentAuth, "Bearer sk-custom-zen-key")
+    assert.equal(sentBody.stream, true, "probe streams like a real client")
+    assert.ok(sentBody.tools?.length > 0, "probe carries opencode's tool manifest")
+    assert.equal(sentBody.tool_choice, "none", "ping answers stay plain text")
   })
 })
 
@@ -1059,7 +1122,7 @@ describe("model list self-healing", () => {
     ])
     const s = await zp.syncModels()
     assert.equal(s.ok, true)
-    assert.ok(s.gated.includes("blocked-flash-free"), "reported as agent-only, not flaky")
+    assert.ok(s.gated.includes("blocked-flash-free"), "reported as gate-blocked, not flaky")
     assert.ok(zp.config.fallbackModels.includes("blocked-flash-free"), "but still added to the list so it can recover")
   })
 
@@ -1102,7 +1165,7 @@ describe("restore model list", () => {
 })
 
 describe("test endpoint honest reporting", () => {
-  test("free-tier gate is reported as agent-only, not as a failure", async () => {
+  test("free-tier gate refusing even an agent-shaped probe is reported as gated, not as a failure", async () => {
     const m = zp.config.fallbackModels[0]
     globalThis.fetch = routeFetch([
       [

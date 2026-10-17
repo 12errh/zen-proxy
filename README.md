@@ -125,8 +125,8 @@ The OpenAI-shaped routes get no name mapping, so they are handled differently: a
 
 - **This rides an anonymous free tier.** Per-IP quotas, shared pool, sometimes saturated. Bring a key if you need reliability.
 - **A bare `curl` gets `403`.** The gateway only answers genuine *agent* traffic. Every agent above does this; a hand-rolled chat client won't.
-- **A model marked "agent-only" is not broken.** The gateway refuses synthetic health probes, so the proxy learns real health from your actual requests — `ok (live traffic)`. Models are never dropped on a temporary block.
-- **Model existence comes from the catalog, not from probing.** A retired model and a healthy one are refused identically, so no probe can tell them apart.
+- **Health probes are agent-shaped.** Sync sends each model the same thing a real client sends — opencode's tool manifest plus `stream: true` — so `ok` means the model genuinely answered. A model marked `gate-blocked` is one the free-tier gate refused even for that shape; blocks lift on their own and the model is never dropped. Real traffic is still tracked on top (`ok (live traffic)`).
+- **Probing tells real health; the catalog tells existence.** A retired model answers `400 Model is unavailable` and is not added, while a live one answers with a stream — so the list reflects what actually works, not just what upstream advertises.
 - **Fallbacks announce themselves** via `zen_served_by` and the `x-zen-served-by` / `x-zen-fallback` headers.
 - **`agent-tools.json` is a capture of OpenCode's tools.** If OpenCode changes its tool schemas, the `/v1/messages` bridge may stop satisfying the gateway. Re-capture it from any OpenCode request.
 </details>

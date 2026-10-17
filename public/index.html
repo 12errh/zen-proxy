@@ -635,10 +635,11 @@ async function testModel(m) {
   try {
     const r = await api("/api/test", { method: "POST", body: JSON.stringify({ model: m }) })
     if (r.gated) {
-      // The free tier only accepts genuine agent traffic, so a bare ping can't
-      // confirm or deny these. Say so instead of showing a red ✗.
-      cell.innerHTML = `<span class="badge mut" tabindex="0" data-tip="${escapeAttr(TIP.gated)}">◦ agent-only</span> <span class="hint">works for real agents, not verifiable here</span>`
-      toast(m + " is agent-only — real agent requests can use it", "ok")
+      // The probe now looks like agent traffic, so a gate refusal means the
+      // free tier is blocking this model even for real clients. Be honest:
+      // it is not a happy "ok", and not a red ✗ either.
+      cell.innerHTML = `<span class="badge mut" tabindex="0" data-tip="${escapeAttr(TIP.gated)}">◦ gate-blocked</span> <span class="hint">the free-tier gate refused an agent-shaped probe</span>`
+      toast(m + " is gate-blocked — the free tier refused an agent-shaped probe", "bad")
       return
     }
     const cls = r.ok ? "ok" : "bad"
@@ -651,7 +652,7 @@ async function testModel(m) {
 const TIP = {
   live: "A real request through this proxy just succeeded.",
   ok: "Health probe got a clean 200 upstream.",
-  gated: "Free tier takes real agent traffic only. A probe can't confirm it.",
+  gated: "The free-tier gate refused even an agent-shaped probe (tools + stream). Real requests will likely fail until the block lifts.",
   flaky: "Temporary trouble — timeout or 5xx. Kept, it recovers.",
   limited: "Upstream returned 429. Quota refills.",
   dead: "Upstream says it's gone (404). Only state that removes it.",
@@ -660,7 +661,7 @@ const TIP = {
   notconfigured: "Upstream has it, your list doesn't.",
   syncing: "Probing every free model right now.",
   syncnever: "Auto-sync has not run yet.",
-  syncdone: "Last health check. Agent-only models are fine — a probe just can't confirm them.",
+  syncdone: "Last health check. Models are probed exactly the way real agent traffic hits them.",
 }
 
 function modelStatus(m, sync) {
@@ -671,7 +672,7 @@ function modelStatus(m, sync) {
   if (!sync || !sync.at) return { cls: "mut", label: "untested", tip: TIP.untested }
   if (sync.working?.includes(m)) return { cls: "ok", label: "ok", tip: TIP.ok }
   if (sync.rateLimited?.includes(m)) return { cls: "warn", label: "rate-limited", tip: TIP.limited }
-  if (sync.gated?.includes(m)) return { cls: "mut", label: "agent-only", tip: TIP.gated }
+  if (sync.gated?.includes(m)) return { cls: "warn", label: "gate-blocked", tip: TIP.gated }
   if (sync.flaky?.includes(m)) return { cls: "warn", label: "flaky", tip: TIP.flaky }
   if (sync.dead?.includes(m)) return { cls: "bad", label: "dead", tip: TIP.dead }
   return { cls: "mut", label: "untested", tip: TIP.untested }
@@ -686,7 +687,7 @@ function renderSync(s) {
   if (s.running) { el.textContent = "auto-sync: probing…"; el.className = "badge warn"; el.setAttribute("data-tip", TIP.syncing); return }
   if (!s.at) { el.textContent = "auto-sync: never"; el.className = "badge mut"; el.setAttribute("data-tip", TIP.syncnever); return }
   const ago = fmtUp(Math.max(1, Math.floor((Date.now() - s.at) / 1000))) + " ago"
-  el.textContent = `auto-sync: ${ago} · ${s.working.length} ok · ${s.rateLimited.length} rate-limited · ${(s.gated||[]).length} agent-only · ${s.flaky.length} flaky · ${s.dead.length} dead`
+  el.textContent = `auto-sync: ${ago} · ${s.working.length} ok · ${s.rateLimited.length} rate-limited · ${(s.gated||[]).length} gate-blocked · ${s.flaky.length} flaky · ${s.dead.length} dead`
   el.className = "badge " + (s.ok ? (s.dead.length ? "warn" : "ok") : "bad")
   el.setAttribute("data-tip", TIP.syncdone)
 }
@@ -713,8 +714,8 @@ async function testZenKey() {
   try {
     const r = await api("/api/test", { method: "POST", body: JSON.stringify(body) })
     if (r.gated) {
-      hint.innerHTML = '<span style="color:var(--mut)">◦ key accepted, model is agent-only</span>'
-      toast("Key reached the free tier (model is agent-only)", "ok")
+      hint.innerHTML = '<span style="color:var(--coral)">◦ gate refused an agent-shaped probe</span>'
+      toast("The free-tier gate refused an agent-shaped probe", "bad")
     } else {
       hint.innerHTML = r.ok
         ? '<span style="color:var(--ink)">✓ works (' + r.model + ")</span>"

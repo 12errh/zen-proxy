@@ -856,9 +856,9 @@ function num(v, dflt) {
   return Number.isFinite(n) ? n : dflt
 }
 const syncState = { at: 0, ok: false, running: false, working: [], rateLimited: [], flaky: [], gated: [], dead: [], error: "", ms: 0 }
-// Health learned from real client traffic. The free tier rejects our synthetic
-// health probe (it only accepts genuine agent-shaped requests), so real traffic
-// is the only trustworthy signal that a model is actually serving.
+// Health learned from real client traffic, kept alongside the agent-shaped
+// probe in probeModel(). Real traffic is the ground truth: it can disagree
+// with a probe when a gate lifts or a quota refills mid-cycle.
 const observed = new Map()
 function recordObserved(model, ok) {
   if (!model) return
@@ -1627,27 +1627,52 @@ function probeAuthHeader() {
   return "Bearer public"
 }
 
+// Health probes have to look like agent traffic or the free-tier gate refuses
+// them with FreeTierError before a model is ever reached: opencode's own tool
+// manifest plus `stream: true` is what a real client sends, so the probe sends
+// exactly that. Without it every model used to land in the "gate-blocked"
+// bucket, which told the user nothing about whether it actually works.
+function agentProbePayload(id, format) {
+  const tools = gateBridgeTools()
+  if (format === "responses") {
+    const payload = { model: id, input: "ping", max_output_tokens: 32, stream: true }
+    const converted = chatToolsToResponses(tools)
+    if (converted) payload.tools = converted
+    return payload
+  }
+  const payload = { model: id, messages: [{ role: "user", content: "ping" }], max_tokens: 5, stream: true }
+  if (tools.length) {
+    payload.tools = tools
+    // The bridge is for the gate, not the answer: a "ping" should come back as
+    // text, never as a tool call.
+    payload.tool_choice = "none"
+  }
+  return payload
+}
+
 // One-shot liveness probe for a model, using the endpoint family that model
 // actually lives on. Returns the raw Response so sync can classify it.
 async function probeModel(id, auth, session) {
   const format = modelFormat(id)
   const headers = {
     "content-type": "application/json",
-    accept: "application/json",
+    accept: "application/json, text/event-stream",
     authorization: auth,
     "user-agent": config.ua,
   }
   if (session) for (const h of SESSION_HEADERS) headers[h] = session
-  const payload =
-    format === "responses"
-      ? { model: id, input: "ping", max_output_tokens: 32 }
-      : { model: id, messages: [{ role: "user", content: "ping" }], max_tokens: 5 }
-  return fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
+  const r = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
     method: "POST",
     headers,
-    body: JSON.stringify(payload),
+    body: JSON.stringify(agentProbePayload(id, format)),
     signal: AbortSignal.timeout(Math.min(config.timeoutMs, 30_000)),
   })
+  // A live model answers the streamed probe with SSE, and sync only needs the
+  // status. Hang up instead of waiting for the model to finish its "ping".
+  if (r.ok) {
+    try { await r.body?.cancel() } catch {}
+  }
+  return r
 }
 
 // Stream a Responses SSE body back as chat.completion.chunk SSE.
@@ -1850,9 +1875,11 @@ async function syncModels() {
               /model_not_found|no such model|does not exist|is not supported|not supported|has been deprecated|no longer available/i.test(bodyErr)
             // Key/auth problems are not model problems either.
             const authErr = /AuthError|invalid api key|missing api key/i.test(bodyErr)
-            // 403 FreeTierError means "only real opencode clients may use this".
-            // Our probe is not a real client, so this tells us nothing about
-            // whether the model works — don't call it flaky, and never remove it.
+            // 403 FreeTierError even though the probe was agent-shaped (tools +
+            // stream, see agentProbePayload). The gate refused the exact shape
+            // a real client sends — likely a session/trust condition the probe
+            // can't satisfy, so it says nothing about the model's health. Never
+            // call it flaky, never remove it.
             const isGated = /FreeTierError|free tier can only/i.test(bodyErr)
             // Temporary blocks: keep the model, just remember it is unhealthy.
             const temporary = /RegionError|not available in your country|rate.?limit|overloaded/i.test(bodyErr)
@@ -1900,9 +1927,9 @@ async function syncModels() {
       if (fallbackModelsPinned) {
         try { saveConfig({ fallbackModels: newList }) } catch {}
       }
-      log(`auto-sync: updated model list (${working.length} ok, ${rateLimited.length} rate-limited, ${gated.length} agent-only, ${flaky.length} flaky, ${dead.length} dead${fallbackModelsPinned ? "" : ", not pinned"})`)
+      log(`auto-sync: updated model list (${working.length} ok, ${rateLimited.length} rate-limited, ${gated.length} gate-blocked, ${flaky.length} flaky, ${dead.length} dead${fallbackModelsPinned ? "" : ", not pinned"})`)
     } else {
-      log(`auto-sync: list unchanged (${working.length} ok, ${rateLimited.length} rate-limited, ${gated.length} agent-only, ${flaky.length} flaky, ${dead.length} dead)`)
+      log(`auto-sync: list unchanged (${working.length} ok, ${rateLimited.length} rate-limited, ${gated.length} gate-blocked, ${flaky.length} flaky, ${dead.length} dead)`)
     }
     syncState.working = working
     syncState.rateLimited = rateLimited
@@ -2159,7 +2186,7 @@ async function handleTest(req, res) {
       headers: (() => {
         const h = {
           "content-type": "application/json",
-          accept: "application/json",
+          accept: "application/json, text/event-stream",
           authorization: auth,
           "user-agent": config.ua,
         }
@@ -2169,21 +2196,23 @@ async function handleTest(req, res) {
         if (!ipOmit(ip)) h["x-real-ip"] = ip
         return h
       })(),
-      body: JSON.stringify(
-        format === "responses"
-          ? { model, input: "ping", max_output_tokens: 32 }
-          : { model, messages: [{ role: "user", content: "ping" }], max_tokens: 5 },
-      ),
+      // Same agent-shaped payload the sync probe sends, so TEST reports what a
+      // real client would get instead of a gate refusal it never earned.
+      body: JSON.stringify(agentProbePayload(model, format)),
       signal: AbortSignal.timeout(config.timeoutMs),
     })
+    if (upstreamRes.ok) {
+      try { await upstreamRes.body?.cancel() } catch {}
+    }
     let detail = ""
     let gated = false
     try {
       const parsed = await upstreamRes.json()
       if (format === "responses") detail = parsed.error?.message ?? (typeof parsed.output_text === "string" ? parsed.output_text : "")
       else detail = parsed.error?.message ?? parsed.choices?.[0]?.message?.content ?? ""
-      // A free-tier gate here is not a failure of the model: the free tier only
-      // accepts genuine agent traffic, which a bare ping never is.
+      // A FreeTierError on an agent-shaped probe means the gate refused even the
+      // shape a real client sends; flag it, but it still may not be the model's
+      // fault, so it is reported as gated rather than broken.
       if (upstreamRes.status === 403 && /FreeTierError|free tier can only/i.test(detail)) gated = true
     } catch {}
     json(res, 200, {
@@ -2193,7 +2222,7 @@ async function handleTest(req, res) {
       format,
       status: upstreamRes.status,
       ms: Date.now() - start,
-      detail: gated ? "free tier accepts real agent requests only — this probe can't verify it" : detail,
+      detail: gated ? "the free-tier gate refused even an agent-shaped probe — real agent traffic may still get through" : detail,
     })
   } catch (err) {
     if (err && err.statusCode === 413) {
