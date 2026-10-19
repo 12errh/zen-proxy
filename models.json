@@ -1,8 +1,7 @@
 {
-  "updatedAt": "2026-10-17T04:24:52.565Z",
+  "updatedAt": "2026-10-19T13:13:55.329Z",
   "upstream": "https://opencode.ai/inference/v1",
   "models": [
-    "space-bunny-free",
     "mimo-v2.6-flash-free",
     "big-pickle",
     "nemotron-3.5-lightning-free",
@@ -10,6 +9,7 @@
     "deepseek-v4.1-flash-free",
     "nemotron-3.5-super-vl-free",
     "glm-5.3-flash-free",
-    "beam-free"
+    "beam-free",
+    "minimax-m3.1-flash-free"
   ]
 }
