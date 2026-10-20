@@ -149,6 +149,29 @@ function agentToolsFor(callerToolNames) {
   return loadAgentTools().filter((t) => wanted.has(AGENT_TOOL_MAP[t.function.name].name))
 }
 
+// A caller that brings its own tools still gets 403: the gate looks for a tool
+// named `read` and refuses the list without it, whatever else is on there. So
+// one has to ride along. Doing that on a free-form agent turn would be wrong —
+// the model could call a tool the caller cannot run — but a caller that pins a
+// single function (a title or label helper: `tool_choice` names the only call it
+// will accept) can never be answered with a call it did not ask for, so `read`
+// is safe to add there.
+function pinnedToolName(toolChoice) {
+  if (!toolChoice || typeof toolChoice !== "object") return null
+  const fn = toolChoice.function ?? toolChoice
+  return typeof fn?.name === "string" && fn.name ? fn.name : null
+}
+
+function gateReadFor(body) {
+  if (!config.agentTools) return null
+  const tools = body?.tools
+  if (!Array.isArray(tools) || !tools.length) return null
+  if (!pinnedToolName(body?.tool_choice)) return null
+  const offered = tools.map((t) => t?.function?.name ?? t?.name)
+  if (offered.includes("read")) return null
+  return loadAgentTools().find((t) => t?.function?.name === "read") ?? null
+}
+
 // An opencode tool call rewritten as the caller's tool call.
 function remapAgentTool(name, rawArgs) {
   const spec = AGENT_TOOL_MAP[name]
@@ -1219,6 +1242,11 @@ async function handleChat(req, res) {
   const retries = config.retriesPerModel > 0 ? Math.floor(config.retriesPerModel) : 0
   const bridge = body.tools?.length ? [] : gateBridgeTools()
   const bridged = bridge.length > 0
+  // A caller that brings its own tools still needs the gate's `read` on the list.
+  // Only the request changes: a pinned caller is answered with the tool it
+  // pinned, so nothing has to be stripped from the reply afterwards.
+  const gateRead = bridged ? null : gateReadFor(body)
+  const requestBody = gateRead ? { ...body, tools: [gateRead, ...body.tools] } : body
   for (const model of candidates) {
     const chosen = model === candidates[0]
     used = model
@@ -1226,7 +1254,7 @@ async function handleChat(req, res) {
     // Streams upstream regardless of what the client asked for — see
     // collectChatCompletion — and the collector puts the shape back.
     const payload =
-      format === "responses" ? responsesRequest(body, model, true) : { ...body, model, stream: true }
+      format === "responses" ? responsesRequest(requestBody, model, true) : { ...requestBody, model, stream: true }
     if (bridged) {
       payload.tools = format === "responses" ? chatToolsToResponses(bridge) : bridge
       // The gateway takes only "auto" on /responses, so forwarding anything the
