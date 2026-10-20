@@ -149,13 +149,44 @@ function agentToolsFor(callerToolNames) {
   return loadAgentTools().filter((t) => wanted.has(AGENT_TOOL_MAP[t.function.name].name))
 }
 
+// The gate's `read`.
+//
+// The gate takes a tool named `read` and nothing else — `Read` with a capital,
+// `read_file` and a bare `set_title` are all refused — and it does not look at
+// the schema. So the cheapest tool that satisfies it is a stub, and the stub is
+// also the safest one to send.
+//
+// The stub's description deliberately does not invite a call. opencode's real
+// `read` schema is 1158 characters of "call this tool in parallel when you know
+// there are multiple files you want to read", and sending it makes the model
+// answer a pinned request with a `read` call the caller never offered:
+// measured 9/9 on a prompt that mentions reading a file, against 1/9 for this
+// stub. The gate takes the stub exactly as readily.
+const GATE_READ = {
+  type: "function",
+  function: {
+    name: "read",
+    description: "Internal helper. Never call this tool.",
+    parameters: { type: "object", properties: {} },
+  },
+}
+function gateRead() {
+  return { type: "function", function: { ...GATE_READ.function } }
+}
+
 // A caller that brings its own tools still gets 403: the gate looks for a tool
 // named `read` and refuses the list without it, whatever else is on there. So
 // one has to ride along. Doing that on a free-form agent turn would be wrong —
-// the model could call a tool the caller cannot run — but a caller that pins a
-// single function (a title or label helper: `tool_choice` names the only call it
-// will accept) can never be answered with a call it did not ask for, so `read`
-// is safe to add there.
+// the model could call a tool the caller cannot run — so it is only added when
+// `tool_choice` pins a single function (a title or label helper: `tool_choice`
+// names the only call it will accept).
+//
+// The pin is not enforcement, though: the gateway forwards it to the provider
+// and the provider may still answer with another tool. That is why the tool
+// riding along is a stub the model has no reason to pick, and not opencode's
+// `read`. It still cannot be ruled out, so a pinned request that comes back
+// with a call the caller never offered is a live hole — see `remapAgentTool`
+// and the strip in the reply path.
 function pinnedToolName(toolChoice) {
   if (!toolChoice || typeof toolChoice !== "object") return null
   const fn = toolChoice.function ?? toolChoice
@@ -169,7 +200,7 @@ function gateReadFor(body) {
   if (!pinnedToolName(body?.tool_choice)) return null
   const offered = tools.map((t) => t?.function?.name ?? t?.name)
   if (offered.includes("read")) return null
-  return loadAgentTools().find((t) => t?.function?.name === "read") ?? null
+  return gateRead()
 }
 
 // An opencode tool call rewritten as the caller's tool call.
@@ -1243,8 +1274,10 @@ async function handleChat(req, res) {
   const bridge = body.tools?.length ? [] : gateBridgeTools()
   const bridged = bridge.length > 0
   // A caller that brings its own tools still needs the gate's `read` on the list.
-  // Only the request changes: a pinned caller is answered with the tool it
-  // pinned, so nothing has to be stripped from the reply afterwards.
+  // Only the request changes — the pin is forwarded untouched, so the caller gets
+  // the call it asked for. The pin is not enforcement, though: the provider may
+  // still answer with another tool, so a reply can carry a call the caller never
+  // offered. `gateRead` is a stub for that reason.
   const gateRead = bridged ? null : gateReadFor(body)
   const requestBody = gateRead ? { ...body, tools: [gateRead, ...body.tools] } : body
   for (const model of candidates) {

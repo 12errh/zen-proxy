@@ -3036,8 +3036,42 @@ describe("pinned tool calls on the OpenAI-shaped routes", () => {
     await zp.handleChat(req, res)
     assert.equal(res.state.status, 200, "the gate takes a pinned request that carries read")
     assert.deepEqual(sent.tools.map((t) => t.function.name), ["read", "set_title"], "read rides along, the caller's tool stays")
-    assert.deepEqual(sent.tools[0], zp.agentToolsFor(["Read"])[0], "the captured schema is used, not a stub")
+    assert.equal(
+      sent.tools[0].function.description,
+      "Internal helper. Never call this tool.",
+      "the injected read is a stub, not opencode's agentic schema",
+    )
+    assert.deepEqual(sent.tools[0].function.parameters, { type: "object", properties: {} }, "the stub carries no parameters")
     assert.deepEqual(sent.tool_choice, { type: "function", function: { name: "set_title" } }, "the pin is forwarded untouched")
+  })
+
+  test("the injected read is not opencode's captured schema", async () => {
+    // opencode's real `read` description invites the model to call it, and a
+    // model that answers a pinned request with a `read` call hands the caller a
+    // tool it never offered. The stub the proxy injects must stay a stub.
+    const m = "space-bunny-free"
+    pinnedCfg(m)
+    let sent = null
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          return carriesRead(sent) ? sseResponse(["ok"], "up") : gated()
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify(pinned(m)) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 200)
+    const captured = zp.loadAgentTools().find((t) => t.function.name === "read")
+    assert.ok(captured, "the captured manifest still carries opencode's read")
+    assert.notDeepEqual(sent.tools[0], captured, "the injected tool must not be opencode's schema")
+    assert.ok(
+      sent.tools[0].function.description.length < captured.function.description.length,
+      "the stub's description must be far shorter than opencode's",
+    )
   })
 
   test("a caller that offers its own read gets nothing added", async () => {
