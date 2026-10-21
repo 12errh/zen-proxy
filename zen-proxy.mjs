@@ -161,9 +161,9 @@ function agentToolsFor(callerToolNames) {
 // there are multiple files you want to read", and sending it makes the model
 // answer a pinned request with a `read` call the caller never offered. Measured
 // end to end against the live gateway, a prompt that mentions reading a file,
-// 12 calls each: opencode's schema answers 9 of 12 with a stray `read`, this
-// stub 3 of 12 (4 of 12 on a second run). The gate takes the stub exactly as
-// readily.
+// 12 calls per run: opencode's schema answers 9 of 12 with a stray `read` on
+// every run; this stub answers 3, 4 and 6 of 12 across three runs — less, but
+// not never. The gate takes the stub exactly as readily.
 function gateReadTool() {
   return {
     type: "function",
