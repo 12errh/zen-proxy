@@ -3877,3 +3877,72 @@ describe("the /v1/responses route speaks Responses", () => {
     assert.deepEqual(data.usage, { input_tokens: 2, output_tokens: 3, total_tokens: 5 })
   })
 })
+
+describe("upstream error bodies that cannot be parsed (measured: text/plain 4xx used to walk the whole chain)", () => {
+  beforeEach(() => {
+    zp.saveConfig({ fallbackModels: ["big-pickle", "space-bunny-free"], defaultModel: "", autoSyncIntervalMs: 0, cacheMs: 0, retriesPerModel: 0 })
+  })
+
+  test("text 400 surfaces verbatim instead of walking the fallback chain", async () => {
+    const calls = []
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          const sent = JSON.parse(opts.body)
+          calls.push(sent.model)
+          return new Response("boom", { status: 400, headers: { "content-type": "text/plain" } })
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: "big-pickle", messages: [] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 400)
+    assert.deepEqual(calls, ["big-pickle"], "a deterministic 400 needs exactly one upstream call")
+    const data = JSON.parse(res.body)
+    assert.equal(data.error.message, "upstream returned 400")
+  })
+
+  test("text 400 on /v1/messages keeps the anthropic error shape", async () => {
+    const calls = []
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          const sent = JSON.parse(opts.body)
+          calls.push(sent.model)
+          return new Response("boom", { status: 400, headers: { "content-type": "text/plain" } })
+        },
+      ],
+    ])
+    const req = mockReq({ url: "/v1/messages", _body: JSON.stringify({ model: "big-pickle", max_tokens: 8, messages: [{ role: "user", content: "hi" }] }) })
+    const res = mockRes()
+    await zp.handleMessages(req, res)
+    assert.equal(res.state.status, 400)
+    assert.deepEqual(calls, ["big-pickle"])
+    assert.equal(JSON.parse(res.body).error.type, "invalid_request_error")
+  })
+
+  test("text 5xx keeps walking the chain (status alone is enough)", async () => {
+    const calls = []
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          const sent = JSON.parse(opts.body)
+          calls.push(sent.model)
+          if (sent.model === "big-pickle") return new Response("down", { status: 500, headers: { "content-type": "text/plain" } })
+          return jsonResponse({ model: sent.model, choices: [{ message: { role: "assistant", content: "ok" } }] })
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: "big-pickle", messages: [] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 200)
+    assert.deepEqual(calls, ["big-pickle", "space-bunny-free"])
+    assert.equal(res.state.headers["x-zen-served-by"], "space-bunny-free")
+  })
+})
+

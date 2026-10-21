@@ -1379,7 +1379,12 @@ async function handleMessages(req, res) {
       try {
         lastErr = await upstreamRes.json()
       } catch {
-        lastErr = { error: { type: "api_error", message: `upstream returned ${upstreamRes.status}` } }
+        // The body could not be read as JSON, so there is nothing to match the
+        // "model is unavailable" vocabulary against — a bodyless/text 4xx is a
+        // deterministic client-visible error. Type it non-retryable: typing it
+        // upstream_error used to make both retry predicates fire and walk the
+        // whole fallback chain (~40 upstream calls) for e.g. a text/plain 400.
+        lastErr = { error: { type: "invalid_request_error", message: `upstream returned ${upstreamRes.status}` } }
       }
       lastStatus = upstreamRes.status
       const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
@@ -1585,7 +1590,10 @@ async function handleChat(req, res, responsesRoute = false) {
       try {
         lastErr = await upstreamRes.json()
       } catch {
-        lastErr = { error: { type: "upstream_error", message: `upstream returned ${upstreamRes.status}` } }
+        // Same as the /v1/messages path: an unparseable 4xx body is
+        // deterministic, so it must not read as retryable (see the longer note
+        // in handleMessages).
+        lastErr = { error: { type: "invalid_request_error", message: `upstream returned ${upstreamRes.status}` } }
       }
       lastStatus = upstreamRes.status
       const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
