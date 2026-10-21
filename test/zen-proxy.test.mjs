@@ -4010,4 +4010,138 @@ describe("a reply that dies in flight (measured: collect failures used to 502 wi
   })
 })
 
+describe("streams announce mid-flight failure (measured: every relay used to end silently)", () => {
+  const enc = new TextEncoder()
+  const chunk = (delta, extra = {}) =>
+    `data: ${JSON.stringify({ model: "upstream-model", choices: [{ index: 0, delta, finish_reason: null }, ...extra.choices ?? []] ?? [{ delta, finish_reason: null }] })}\n\n`
+
+  // Closes cleanly but never sends a finish chunk or [DONE] — hostile s-midcut.
+  const partialSse = () =>
+    new Response(chunk({ role: "assistant" }) + chunk({ content: "cut " }), { status: 200, headers: { "content-type": "text/event-stream" } })
+
+  // A reader that dies midstream (RST, abort) instead of closing cleanly.
+  const cutSse = () =>
+    new Response(
+      new ReadableStream({
+        start(c) {
+          c.enqueue(enc.encode(chunk({ role: "assistant" })))
+          c.enqueue(enc.encode(chunk({ content: "cut " })))
+          c.error(new Error("terminated"))
+        },
+      }),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    )
+
+  // finish_reason arrived, [DONE] did not — that is a complete reply.
+  const noendSse = () =>
+    new Response(
+      chunk({ role: "assistant" }) + chunk({ content: "noend" }) + chunk({}, { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    )
+
+  test("relayStream: clean close without finish or [DONE] ends with an in-band error", async () => {
+    const res = mockRes()
+    await zp.relayStream(mockReq(), res, partialSse(), "big-pickle")
+    await res.done
+    assert.equal(res.state.status, 200)
+    assert.ok(res.body.includes('"error"'), "error chunk emitted")
+    assert.ok(res.body.includes("mid-reply"))
+    assert.ok(res.body.endsWith("data: [DONE]\n\n"), "stream terminated by [DONE]")
+  })
+
+  test("relayStream: a reader that dies midstream also ends with the failure", async () => {
+    const res = mockRes()
+    await zp.relayStream(mockReq(), res, cutSse(), "big-pickle")
+    await res.done
+    assert.ok(res.body.includes("terminated"), `real message surfaced: ${res.body.slice(-120)}`)
+    assert.ok(res.body.includes("data: [DONE]\n\n"))
+  })
+
+  test("relayStream: finish without [DONE] is a complete reply, no error invented", async () => {
+    const res = mockRes()
+    await zp.relayStream(mockReq(), res, noendSse(), "big-pickle")
+    await res.done
+    assert.ok(!res.body.includes('"error"'), `no synthetic failure: ${res.body.slice(-160)}`)
+    assert.ok(!res.body.includes("[DONE]"), "no [DONE] was seen upstream, none is fabricated")
+    assert.ok(res.body.includes('"finish_reason":"stop"'))
+  })
+
+  test("relayAnthropicStream: chat chunks that stop without a finish end with an error event, not message_stop", async () => {
+    async function* chunks() {
+      yield chunk({ role: "assistant" })
+      yield chunk({ content: "cut " })
+    }
+    const res = mockRes()
+    await zp.relayAnthropicStream(mockReq(), res, chunks(), "big-pickle", "big-pickle")
+    await res.done
+    assert.ok(res.body.includes("event: error"), `error event present: ${res.body.slice(-120)}`)
+    assert.ok(!res.body.includes("message_stop"), "no fake completed message")
+    assert.ok(res.body.includes("content_block_delta"), "the text that did arrive is kept")
+  })
+
+  test("relayAnthropicStream: an upstream error chunk carries its real message in the error event", async () => {
+    async function* chunks() {
+      yield chunk({ content: "before " })
+      yield `data: ${JSON.stringify({ error: { type: "server_error", message: "midstream doom" } })}\n\n`
+    }
+    const res = mockRes()
+    await zp.relayAnthropicStream(mockReq(), res, chunks(), "big-pickle", "big-pickle")
+    await res.done
+    const evt = res.body.split("\n\n").find((b) => b.startsWith("event: error"))
+    assert.ok(evt, "error event emitted")
+    assert.ok(evt.includes("midstream doom"))
+    assert.ok(!res.body.includes("message_stop"))
+  })
+
+  test("relayResponsesStream: missing response.completed ends with an error chunk plus [DONE]", async () => {
+    const upstream = new Response(
+      `event: response.created\ndata: ${JSON.stringify({ type: "response.created", response: { object: "response" } })}\n\n` +
+        `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "partial" })}\n\n`,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    )
+    const res = mockRes()
+    await zp.relayResponsesStream(mockReq(), res, upstream, "big-pickle")
+    await res.done
+    assert.ok(res.body.includes('"error"'))
+    assert.ok(res.body.includes("data: [DONE]\n\n"))
+    assert.ok(!res.body.includes('"finish_reason":"stop"'), "no finish invented")
+  })
+
+  test("relayChatAsResponsesStream: un-finished chat stream ends with an error event, no response.completed", async () => {
+    const res = mockRes()
+    await zp.relayChatAsResponsesStream(mockReq(), res, partialSse(), "big-pickle")
+    await res.done
+    assert.ok(res.body.includes("event: error"))
+    assert.ok(!res.body.includes("response.completed"))
+  })
+
+  test("relayResponsesPassthrough: upstream cut ends with an error event after the forwarded prefix", async () => {
+    const upstream = new Response(
+      `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "partial" })}\n\n`,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    )
+    const res = mockRes()
+    await zp.relayResponsesPassthrough(mockReq(), res, upstream, "big-pickle")
+    await res.done
+    assert.ok(res.body.includes("response.output_text.delta"), "forwarded prefix kept")
+    assert.ok(res.body.includes("event: error"))
+  })
+
+  test("handleChat with a streaming client: a mid-cut upstream ends the SSE with the failure in-band", async () => {
+    zp.saveConfig({ fallbackModels: ["big-pickle"], defaultModel: "", autoSyncIntervalMs: 0, cacheMs: 0, retriesPerModel: 0 })
+    globalThis.fetch = routeFetch([["/chat/completions", () => cutSse()]])
+    const req = mockReq({ _body: JSON.stringify({ model: "big-pickle", messages: [], stream: true }) })
+    const res = mockRes()
+    const handled = zp.handleChat(req, res)
+    await res.done
+    await handled
+    assert.equal(res.state.status, 200)
+    assert.equal(res.state.headers["content-type"], "text/event-stream")
+    assert.ok(res.body.includes("data: "), "streamed prefix")
+    assert.ok(res.body.includes('"error"'), `ends with the failure: ${res.body.slice(-140)}`)
+    assert.ok(res.body.includes("data: [DONE]\n\n"))
+  })
+})
+
+
 
