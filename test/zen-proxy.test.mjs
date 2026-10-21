@@ -4180,5 +4180,35 @@ describe("anthropic tool_choice any (measured: it used to be dropped quietly)", 
   })
 })
 
+describe("small router tolerances (measured in the stress sweep)", () => {
+  beforeEach(() => {
+    zp.saveConfig({ fallbackModels: ["big-pickle"], defaultModel: "", autoSyncIntervalMs: 0, cacheMs: 0 })
+  })
+
+  test("HEAD /health replies 200 with no body", async () => {
+    globalThis.fetch = routeFetch([["/models", () => jsonResponse({ data: [{ id: "big-pickle" }] })]])
+    const res = mockRes()
+    await zp.router(mockReq({ method: "HEAD", url: "/health" }), res)
+    assert.equal(res.state.status, 200)
+    assert.equal(res.body, "", "HEAD carries no body")
+  })
+
+  test("a trailing slash on an inference route still routes", async () => {
+    globalThis.fetch = routeFetch([["/chat/completions", () => jsonResponse({ model: "big-pickle", choices: [{ message: { role: "assistant", content: "hi" } }] })]])
+    const res = mockRes()
+    await zp.router(mockReq({ url: "/v1/chat/completions/", _body: JSON.stringify({ model: "big-pickle", messages: [] }) }), res)
+    assert.equal(res.state.status, 200, `routed: ${res.state.status} ${res.body}`)
+  })
+
+  test("the root keeps its slash and doubled slashes stay 404", async () => {
+    const res = mockRes()
+    await zp.router(mockReq({ method: "GET", url: "/" }), res)
+    assert.equal(res.state.status, 200)
+    const res2 = mockRes()
+    await zp.router(mockReq({ url: "//v1//chat/completions/", _body: "{}" }), res2)
+    assert.equal(res2.state.status, 404)
+  })
+})
+
 
 

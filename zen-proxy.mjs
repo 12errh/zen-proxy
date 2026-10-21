@@ -3170,7 +3170,11 @@ async function handleCountTokens(req, res) {
 
 async function router(req, res) {
   const url = new URL(req.url, `http://${req.headers.host ?? "localhost"}`)
-  const p = url.pathname
+  // One trailing slash is tolerated on every route: SDKs and base URLs
+  // regularly produce "/v1/chat/completions/" and the exact match used to 404
+  // it with no hint about the cause. The root stays "/", doubled slashes stay
+  // a 404, and all-cases trimming is deliberate ("//v1//chat" is not ours).
+  const p = url.pathname !== "/" && url.pathname.endsWith("/") ? url.pathname.replace(/\/+$/, "") : url.pathname
 
   if (req.method === "GET" && (p === "/" || p === "/index.html" || p === "/ui")) {
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" })
@@ -3193,8 +3197,11 @@ async function router(req, res) {
       return json(res, 404, { error: "not found" })
     }
   }
-  if (req.method === "GET" && p === "/health") {
+  if ((req.method === "GET" || req.method === "HEAD") && p === "/health") {
     const cache = await fetchModels()
+    // Monitors (uptime pingers, container checks) probe with HEAD and inspect
+    // only the status line; a HEAD reply carries no body by definition.
+    if (req.method === "HEAD") return res.end()
     return json(res, 200, { ok: cache.ok, upstream: config.upstream })
   }
 
