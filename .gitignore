@@ -5,3 +5,8 @@ zen-proxy.json
 zen-proxy/
 *.log
 .DS_Store
+# local agent working files: tooling state, this checkout's own opencode
+# config, and implementation plans kept out of the repo
+.freebuff/
+opencode.json
+docs/compose/plans/
