@@ -10,3 +10,6 @@ zen-proxy/
 .freebuff/
 opencode.json
 docs/compose/plans/
+# local runbook for the Discord MCP server; holds the bot token and
+# invite details, so it must never leave this machine
+docs/discord-mcp-setup.md
