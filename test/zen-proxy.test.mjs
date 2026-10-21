@@ -3156,7 +3156,11 @@ describe("pinned tool calls on the OpenAI-shaped routes", () => {
     assert.deepEqual(sent.tools.map((t) => t.function.name), ["set_title"])
   })
 
-  test("the responses dialect gets read too, pin translated", async () => {
+  test("a responses-family model gets read too, pin translated", async () => {
+    // This is the Responses *upstream* format, reached through the chat route
+    // because the model lives on /responses. The /v1/responses route takes the
+    // same chat-shaped body — a real Responses body (input, not messages) is not
+    // what this route reads.
     const m = "gpt-5.5"
     pinnedCfg(m)
     zp.saveConfig({ responsesModels: ["gpt-5*"] })
