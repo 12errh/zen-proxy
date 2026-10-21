@@ -4143,5 +4143,42 @@ describe("streams announce mid-flight failure (measured: every relay used to end
   })
 })
 
+describe("anthropic tool_choice any (measured: it used to be dropped quietly)", () => {
+  test("anthropicToChatBody maps {type:any} to required, tool pins stay renamed", () => {
+    const any = zp.anthropicToChatBody({ tools: [{ name: "ls", input_schema: { type: "object" } }], tool_choice: { type: "any" }, messages: [] }, "m")
+    assert.equal(any.tool_choice, "required", "some call must happen upstream")
+    const pin = zp.anthropicToChatBody({ tools: [{ name: "ls", input_schema: { type: "object" } }], tool_choice: { type: "tool", name: "ls" }, messages: [] }, "m")
+    assert.deepEqual(pin.tool_choice, { type: "function", function: { name: "ls" } })
+  })
+
+  test("a /v1/messages turn with tool_choice any forwards required upstream", async () => {
+    zp.saveConfig({ fallbackModels: ["big-pickle"], defaultModel: "", autoSyncIntervalMs: 0, cacheMs: 0, agentTools: false })
+    let sent
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          return jsonResponse({ model: sent.model, choices: [{ message: { role: "assistant", content: "hi" } }] })
+        },
+      ],
+    ])
+    const req = mockReq({
+      url: "/v1/messages",
+      _body: JSON.stringify({
+        model: "big-pickle",
+        max_tokens: 16,
+        messages: [{ role: "user", content: "list the files" }],
+        tools: [{ name: "ls", description: "list", input_schema: { type: "object", properties: {} } }],
+        tool_choice: { type: "any" },
+      }),
+    })
+    const res = mockRes()
+    await zp.handleMessages(req, res)
+    assert.equal(res.state.status, 200)
+    assert.equal(sent.tool_choice, "required")
+  })
+})
+
 
 

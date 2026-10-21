@@ -675,6 +675,13 @@ function anthropicToChatBody(body, model) {
   // Anthropic's tool_choice and opencode's use the same vocabulary once renamed.
   if (typeof body?.tool_choice === "object" && body.tool_choice?.type === "tool") {
     payload.tool_choice = { type: "function", function: { name: body.tool_choice.name } }
+  } else if (typeof body?.tool_choice === "object" && body.tool_choice?.type === "any") {
+    // "any" means some call must happen; upstream has no object form for that
+    // and "required" is its exact match (measured: it used to be dropped and
+    // degrade into the model's default guess). pinnedToolName treats it as
+    // null, so this cannot read as a pin. Other object shapes stay dropped —
+    // forwarding an unknown dialect has never been measured as safe.
+    payload.tool_choice = "required"
   } else if (typeof body?.tool_choice === "string") {
     payload.tool_choice = body.tool_choice
   }
