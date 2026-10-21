@@ -2556,7 +2556,9 @@ describe("Anthropic Messages API layer", () => {
     const bridge = has.tools.filter((t) => ["read", "write"].includes(t.function.name)).map((t) => t.function.name)
     assert.deepEqual(bridge.sort(), ["read", "write"])
     const none = zp.anthropicToChatBody({ tools: [{ name: "TotallyUniqueTool" }], messages: [{ role: "user", content: "x" }] }, "m")
-    assert.deepEqual(none.tools.filter((t) => /^(read|write|edit|bash)$/.test(t.function.name)), [])
+    // No bridge manifest for names the caller lacks — but the gate's read stub
+    // rides on any tool-carrying caller without its own read (issue #20).
+    assert.deepEqual(none.tools.map((t) => t.function.name), ["read", "TotallyUniqueTool"])
   })
 
   test("the caller's own tools are still sent", () => {
@@ -3094,7 +3096,7 @@ describe("pinned tool calls on the OpenAI-shaped routes", () => {
     assert.deepEqual(sent.tools, [readStub, setName], "the caller's list is untouched, no duplicate")
   })
 
-  test("an unpinned caller keeps its tool list as sent", async () => {
+  test("an unpinned tool caller gets the gate's read riding along", async () => {
     const m = "space-bunny-free"
     pinnedCfg(m)
     let sent = null
@@ -3110,11 +3112,14 @@ describe("pinned tool calls on the OpenAI-shaped routes", () => {
     const req = mockReq({ _body: JSON.stringify({ model: m, messages: [{ role: "user", content: "title this" }], tools: [setName] }) })
     const res = mockRes()
     await zp.handleChat(req, res)
-    assert.equal(res.state.status, 403, "without a pin the model could call a tool the caller cannot run, so nothing is injected")
-    assert.deepEqual(sent.tools.map((t) => t.function.name), ["set_title"])
+    // Measured against the live gateway 2026-10-21 (issue #20): the gate
+    // refuses every model when the caller's tools lack a `read`, pin or no pin.
+    assert.equal(res.state.status, 200, "the stub satisfies the gate")
+    assert.deepEqual(sent.tools.map((t) => t.function.name), ["read", "set_title"])
+    assert.equal(sent.tools[0].function.description, "Internal helper. Never call this tool.")
   })
 
-  test("a string tool_choice is not a pin", async () => {
+  test("a string tool_choice is not a pin — the stub rides instead", async () => {
     const m = "space-bunny-free"
     pinnedCfg(m)
     let sent = null
@@ -3130,8 +3135,8 @@ describe("pinned tool calls on the OpenAI-shaped routes", () => {
     const req = mockReq({ _body: JSON.stringify(pinned(m, { tool_choice: "required" })) })
     const res = mockRes()
     await zp.handleChat(req, res)
-    assert.equal(res.state.status, 403)
-    assert.deepEqual(sent.tools.map((t) => t.function.name), ["set_title"])
+    assert.equal(res.state.status, 200, "the stub satisfies the gate")
+    assert.deepEqual(sent.tools.map((t) => t.function.name), ["read", "set_title"])
     assert.equal(sent.tool_choice, "required")
   })
 
@@ -3287,7 +3292,7 @@ describe("pinned tool calls on the Anthropic route", () => {
     assert.deepEqual(sent.tools.map((t) => t.function.name), ["read", "Read", "set_title"])
   })
 
-  test("an unpinned helper caller is still refused — nothing injected", async () => {
+  test("an unpinned helper caller also gets the stub (issue #20)", async () => {
     const m = "space-bunny-free"
     pinCfg(m)
     let sent = null
@@ -3303,8 +3308,8 @@ describe("pinned tool calls on the Anthropic route", () => {
     const req = mockReq({ url: "/v1/messages", _body: JSON.stringify(anthroBody(m, { tool_choice: { type: "auto" } })) })
     const res = mockRes()
     await zp.handleMessages(req, res)
-    assert.equal(res.state.status, 403, "without a pin the model could call a tool the caller cannot run")
-    assert.deepEqual(sent.tools.map((t) => t.function.name), ["set_title"])
+    assert.equal(res.state.status, 200, "tool_choice auto used to ride bare and eat a 403 per model")
+    assert.deepEqual(sent.tools.map((t) => t.function.name), ["read", "set_title"])
   })
 
   test("agentTools: false never injects on the Anthropic route", async () => {
@@ -3507,9 +3512,11 @@ describe("pinned replies on the OpenAI-shaped routes", () => {
     assert.ok(res.body.includes('\\"A\\"') && res.body.includes('\\"B\\"'), "both kept calls carry their full arguments")
   })
 
-  test("an unpinned reply with its own tools passes through unfiltered", async () => {
-    // The filter exists for the pinned contract only. A free-form agent turn
-    // gets whatever the model answers, stray calls included.
+  test("an unpinned reply drops the gate stub's call", async () => {
+    // The stub rides on every tool-carrying caller without a `read` (issue #20),
+    // and a reply may still call it — the model picked the "never call this"
+    // helper. That is a tool the caller never offered, so the stream loses the
+    // call and the tool_calls claim does not survive with nothing behind it.
     const m = "space-bunny-free"
     pinCfg(m)
     globalThis.fetch = routeFetch([
@@ -3518,8 +3525,11 @@ describe("pinned replies on the OpenAI-shaped routes", () => {
     const req = mockReq({ _body: JSON.stringify(pinnedBody(m, { tool_choice: "auto" })) })
     const res = mockRes()
     await zp.handleChat(req, res)
-    const body = JSON.parse(res.body)
-    assert.equal(body.choices[0].message.tool_calls[0].function.name, "read", "no pin, no filter")
+    await res.done
+    assert.equal(res.state.status, 200)
+    assert.ok(!res.body.includes('"name":"read"'), `the stub's call is dropped: ${res.body}`)
+    assert.ok(!res.body.includes("filePath"), "the stub's arguments never leak either")
+    assert.match(res.body, /"finish_reason":"stop"/, "no calls survive, so no tool_calls claim")
   })
 
   test("a responses-family pinned stream drops stray calls from its deltas", async () => {
@@ -4207,6 +4217,245 @@ describe("small router tolerances (measured in the stress sweep)", () => {
     const res2 = mockRes()
     await zp.router(mockReq({ url: "//v1//chat/completions/", _body: "{}" }), res2)
     assert.equal(res2.state.status, 404)
+  })
+})
+
+describe("the gate's read stub rides on un-pinned tool callers (issue #20)", () => {
+  const cfg = (m) =>
+    zp.saveConfig({ defaultModel: m, fallbackModels: [m], retriesPerModel: 0, retryBackoffMs: 1, autoSyncIntervalMs: 0, cacheMs: 0, agentTools: true })
+  const NONCE = {
+    type: "function",
+    function: { name: "client_nonce_lookup", description: "Get the actual unpredictable verification nonce", parameters: { type: "object", properties: {} } },
+  }
+  const auto = (model, extra = {}) => ({
+    model,
+    stream: false,
+    max_tokens: 100,
+    messages: [{ role: "user", content: "Call client_nonce_lookup and then repeat its result exactly." }],
+    tools: [NONCE],
+    tool_choice: "auto",
+    ...extra,
+  })
+  // The same caller in Anthropic shape — that is what /v1/messages receives.
+  const anthro = (model, extra = {}) => ({
+    model,
+    max_tokens: 64,
+    stream: false,
+    tools: [
+      {
+        name: "set_title",
+        description: "Set the conversation title",
+        input_schema: { type: "object", properties: { title: { type: "string" } }, required: ["title"] },
+      },
+    ],
+    tool_choice: { type: "tool", name: "set_title" },
+    messages: [{ role: "user", content: "title this conversation" }],
+    ...extra,
+  })
+  const stubCall = { id: "call_r", type: "function", function: { name: "read", arguments: "{}" } }
+  const nonceCall = { id: "call_n", type: "function", function: { name: "client_nonce_lookup", arguments: "{}" } }
+  const replyJson = (toolCalls) =>
+    jsonResponse({ model: "up", choices: [{ index: 0, message: { role: "assistant", content: null, tool_calls: toolCalls }, finish_reason: "tool_calls" }] })
+  // Name chunk first, argument chunks after it under the same index — that is
+  // how a streamed tool call actually arrives.
+  const toolSse = (calls) =>
+    new Response(
+      [
+        ...calls.flatMap((c) => [
+          { model: "up", choices: [{ index: 0, delta: { tool_calls: [{ index: c.index, id: `call_${c.index}`, type: "function", function: { name: c.name, arguments: "" } }] }, finish_reason: null }] },
+          ...c.args.map((a) => ({ model: "up", choices: [{ index: 0, delta: { tool_calls: [{ index: c.index, function: { arguments: a } }] }, finish_reason: null }] })),
+        ]),
+        { model: "up", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+      ]
+        .map((b) => `data: ${JSON.stringify(b)}\n\n`)
+        .join("") + "data: [DONE]\n\n",
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    )
+  const mixedArgs = () => [
+    { index: 0, name: "read", args: ['{"q": ', "7}"] },
+    { index: 1, name: "client_nonce_lookup", args: ["{}"] },
+  ]
+
+  test("a collected reply keeps the caller's call and loses the stub", async () => {
+    const m = "space-bunny-free"
+    cfg(m)
+    let sent = null
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          return replyJson([stubCall, nonceCall])
+        },
+      ],
+    ])
+    const res = mockRes()
+    await zp.handleChat(mockReq({ _body: JSON.stringify(auto(m)) }), res)
+    const body = JSON.parse(res.body)
+    assert.equal(res.state.status, 200)
+    assert.deepEqual(body.choices[0].message.tool_calls.map((t) => t.function.name), ["client_nonce_lookup"], "stray stub dropped, caller's call kept")
+    assert.equal(body.choices[0].finish_reason, "tool_calls", "a call survived, the claim stands")
+    assert.deepEqual(sent.tools.map((t) => t.function.name), ["read", "client_nonce_lookup"], "the wire carried the stub for the gate's sake")
+  })
+
+  test("a collected reply that got only the stub ends stop with no tool_calls", async () => {
+    const m = "space-bunny-free"
+    cfg(m)
+    globalThis.fetch = routeFetch([["/chat/completions", () => replyJson([stubCall])]])
+    const res = mockRes()
+    await zp.handleChat(mockReq({ _body: JSON.stringify(auto(m)) }), res)
+    const body = JSON.parse(res.body)
+    assert.equal(res.state.status, 200)
+    assert.equal(body.choices[0].message.tool_calls, undefined, "no call survives the filter")
+    assert.equal(body.choices[0].finish_reason, "stop", "an empty tool_calls claim would read like a bug")
+  })
+
+  test("a responses-family collected reply loses the stub's function_call", async () => {
+    const m = "gpt-5.5"
+    zp.saveConfig({ defaultModel: m, fallbackModels: [m], retriesPerModel: 0, retryBackoffMs: 1, autoSyncIntervalMs: 0, cacheMs: 0, agentTools: true, responsesModels: ["gpt-5*"] })
+    let sent = null
+    globalThis.fetch = routeFetch([
+      [
+        "/responses",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          return jsonResponse({
+            id: "resp_1",
+            object: "response",
+            status: "completed",
+            model: m,
+            output: [
+              { type: "function_call", call_id: "cr", name: "read", arguments: "{}" },
+              { type: "function_call", call_id: "cs", name: "client_nonce_lookup", arguments: "{}" },
+            ],
+          })
+        },
+      ],
+    ])
+    const body = {
+      model: m,
+      input: "Call client_nonce_lookup and then repeat its result exactly.",
+      stream: false,
+      tools: [{ type: "function", name: "client_nonce_lookup", description: "d", parameters: { type: "object", properties: {} } }],
+      tool_choice: "auto",
+    }
+    const req = mockReq({ url: "/v1/responses", _body: JSON.stringify(body) })
+    const res = mockRes()
+    await zp.handleChat(req, res, true)
+    const data = JSON.parse(res.body)
+    assert.equal(res.state.status, 200)
+    assert.deepEqual(data.output.map((o) => o.name), ["client_nonce_lookup"], "the stub's function_call is dropped")
+    assert.deepEqual(
+      (sent.tools ?? []).map((t) => t?.name ?? t?.function?.name),
+      ["read", "client_nonce_lookup"],
+      "the wire carried the stub for the gate's sake",
+    )
+  })
+
+  test("a streamed reply keeps the caller's call renumbered and loses the stub", async () => {
+    const m = "space-bunny-free"
+    cfg(m)
+    globalThis.fetch = routeFetch([["/chat/completions", () => toolSse(mixedArgs())]])
+    const res = mockRes()
+    const handled = zp.handleChat(mockReq({ _body: JSON.stringify(auto(m, { stream: true })) }), res)
+    await res.done
+    await handled
+    assert.equal(res.state.status, 200)
+    assert.ok(res.body.includes('"name":"client_nonce_lookup"'), "the caller's call streamed through")
+    assert.ok(!res.body.includes('"name":"read"'), `the stub's call is dropped: ${res.body}`)
+    assert.ok(!res.body.includes('"q"'), "the stub's argument chunks are dropped too")
+    assert.match(res.body, /"finish_reason":"tool_calls"/)
+    assert.ok(!res.body.includes('"index":1'), "the surviving call is renumbered into one run")
+  })
+
+  test("a streamed /v1/messages reply carries only the caller's tool_use", async () => {
+    const m = "space-bunny-free"
+    cfg(m)
+    let sent = null
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          return toolSse(mixedArgs())
+        },
+      ],
+    ])
+    const req = mockReq({ url: "/v1/messages", _body: JSON.stringify(anthro(m, { stream: true, tool_choice: { type: "auto" } })) })
+    const res = mockRes()
+    const handled = zp.handleMessages(req, res)
+    await res.done
+    await handled
+    assert.equal(res.state.status, 200)
+    assert.equal(res.state.headers["content-type"], "text/event-stream")
+    assert.ok(res.body.includes('"name":"client_nonce_lookup"'), "the caller's tool_use block survives")
+    assert.ok(!res.body.includes('"name":"read"'), `the stub never becomes a block: ${res.body}`)
+    assert.ok(!res.body.includes('"q"'), "no stub argument text either")
+    assert.match(res.body, /"stop_reason":"tool_use"/)
+    assert.deepEqual(sent.tools.map((t) => t.function.name), ["read", "set_title"], "the stub rode along on the translated request")
+  })
+
+  test("a caller that already declares read gets nothing injected", async () => {
+    const m = "space-bunny-free"
+    cfg(m)
+    let sent = null
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          return replyJson([nonceCall])
+        },
+      ],
+    ])
+    const own = { type: "function", function: { name: "read", description: "the caller's own file reader", parameters: { type: "object", properties: {} } } }
+    const req = mockReq({ _body: JSON.stringify(auto(m, { tools: [own, NONCE] })) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    const body = JSON.parse(res.body)
+    assert.equal(res.state.status, 200)
+    assert.deepEqual(sent.tools.map((t) => t.function.name), ["read", "client_nonce_lookup"], "the caller's list is untouched, no duplicate stub")
+    assert.equal(body.choices[0].message.tool_calls[0].function.name, "client_nonce_lookup")
+  })
+
+  test("relayResponsesStream: the gate stub's call is dropped from the deltas", async () => {
+    const sse =
+      `event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", item: { type: "function_call", call_id: "cr", id: "fc_r", name: "read" } })}\n\n` +
+      `event: response.function_call_arguments.delta\ndata: ${JSON.stringify({ type: "response.function_call_arguments.delta", item_id: "cr", delta: '{"q": 7}' })}\n\n` +
+      `event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", item: { type: "function_call", call_id: "cs", id: "fc_s", name: "client_nonce_lookup" } })}\n\n` +
+      `event: response.function_call_arguments.delta\ndata: ${JSON.stringify({ type: "response.function_call_arguments.delta", item_id: "cs", delta: "{}" })}\n\n` +
+      `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "resp_1", usage: { input_tokens: 3, output_tokens: 1 } } })}\n\n`
+    const upstream = new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } })
+    const res = mockRes()
+    await zp.relayResponsesStream(mockReq(), res, upstream, "up", false, null, "read")
+    await res.done
+    assert.ok(res.body.includes('"name":"client_nonce_lookup"'), "the caller's call kept")
+    assert.ok(!res.body.includes('"name":"read"'), `the stub's call is dropped: ${res.body}`)
+    assert.ok(!res.body.includes('"q"'), "the stub's arguments are dropped")
+    assert.match(res.body, /"finish_reason":"tool_calls"/)
+  })
+
+  test("relayChatAsResponsesStream: the gate stub's call never becomes an output item", async () => {
+    const res = mockRes()
+    await zp.relayChatAsResponsesStream(mockReq(), res, toolSse(mixedArgs()), "up", false, null, "read")
+    await res.done
+    assert.ok(res.body.includes('"name":"client_nonce_lookup"'), "the caller's item is emitted")
+    assert.ok(!res.body.includes('"name":"read"'), `the stub's item is dropped: ${res.body}`)
+    assert.ok(!res.body.includes('"q"'), "no stub arguments in the events either")
+    assert.ok(res.body.includes("response.completed"))
+  })
+
+  test("relayResponsesPassthrough: the gate stub's item is dropped whole", async () => {
+    const sse =
+      `event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", item: { type: "function_call", call_id: "cr", id: "fc_r", name: "read" } })}\n\n` +
+      `event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", item: { type: "function_call", call_id: "cs", id: "fc_s", name: "client_nonce_lookup" } })}\n\n` +
+      `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "resp_1", output: [] } })}\n\n`
+    const upstream = new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } })
+    const res = mockRes()
+    await zp.relayResponsesPassthrough(mockReq(), res, upstream, "up", false, null, "read")
+    await res.done
+    assert.ok(res.body.includes('"name":"client_nonce_lookup"'), "the caller's item passes through")
+    assert.ok(!res.body.includes('"name":"read"'), `the stub's item is dropped: ${res.body}`)
   })
 })
 

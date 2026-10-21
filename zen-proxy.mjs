@@ -177,18 +177,19 @@ function gateReadTool() {
 
 // A caller that brings its own tools still gets 403: the gate looks for a tool
 // named `read` and refuses the list without it, whatever else is on there. So
-// one has to ride along. Doing that on a free-form agent turn would be wrong —
-// the model could call a tool the caller cannot run — so it is only added when
-// `tool_choice` pins a single function (a title or label helper: `tool_choice`
-// names the only call it will accept).
+// one has to ride along on any tool-carrying caller that does not declare its
+// own `read` — `tool_choice: "auto"` included (measured 2026-10-21: every model
+// on the free chain answered one 403 per request with caller tools and no `read`,
+// and one 200 with the caller's tool the moment the stub rides; GitHub issue
+// #20 is that path).
 //
-// The pin is not enforcement, though: the gateway forwards it to the provider
-// and the provider may still answer with another tool. That is why the tool
-// riding along is a stub the model has no reason to pick, and not opencode's
-// `read` — and why the reply is filtered down to the pinned call:
-// `stripUnpinnedCalls` for collected replies, and per-index state in the
-// streaming relays, because a call's name arrives chunks apart from its
-// arguments.
+// The stub is not enforcement, though: the gateway forwards the request and the
+// model may still answer with another tool. A call to the stub itself would be
+// a tool the caller never offered, so the reply layer drops it:
+// `stripUnpinnedCalls` (with the stub's name) for collected replies, and the
+// same decision per index in the streaming relays, because a call's name
+// arrives chunks apart from its arguments. Pinned callers keep their stricter
+// filter: the reply only carries the pinned call.
 //
 // The same hole sat open on the Anthropic route: `/v1/messages` callers bring
 // their tools in Anthropic shape, `agentToolsFor()` matches nothing there (a
@@ -207,7 +208,6 @@ function gateReadFor(body) {
   if (!config.agentTools) return null
   const tools = body?.tools
   if (!Array.isArray(tools) || !tools.length) return null
-  if (!pinnedToolName(body?.tool_choice)) return null
   const offered = tools.map((t) => t?.function?.name ?? t?.name)
   if (offered.includes("read")) return null
   return gateReadTool()
@@ -663,12 +663,15 @@ function anthropicToChatBody(body, model) {
   // still take priority in the reply.
   const bridge = agentToolsFor((body?.tools ?? []).map((t) => t?.name))
   let all = bridge.length ? [...bridge, ...(tools ?? [])] : tools
-  // A pinned caller whose tools match nothing (a helper like `set_title`) would
-  // still be refused: the gate wants a tool named `read` and only looks at
-  // names. Same rule as the OpenAI-shaped routes — the pin is what makes adding
-  // one safe — so the stub rides along by name, no matter what shape the
-  // caller's tools arrive in. (Off in agentTools: false, everywhere.)
-  if (config.agentTools && pinnedToolName(body?.tool_choice) && !(all ?? []).some((t) => (t?.function?.name ?? t?.name) === "read")) {
+  // The gate wants a tool named `read` on the list by name alone. A pinned
+  // caller whose tools match nothing (a helper like `set_title`) needed the
+  // stub already; any other tool-carrying caller needs it too — measured
+  // 2026-10-21, one 403 per model on the free chain for a caller tool list
+  // without a `read`, and a clean 200 with it riding along (GitHub issue #20).
+  // Same rule as `gateReadFor` on the OpenAI-shaped routes; a model may still
+  // answer with the stub, and the un-invited call is dropped at the reply
+  // layer. (Off in agentTools: false, everywhere.)
+  if (tools?.length && config.agentTools && !(all ?? []).some((t) => (t?.function?.name ?? t?.name) === "read")) {
     all = [gateReadTool(), ...(all ?? [])]
   }
   if (all?.length) payload.tools = all
@@ -1312,7 +1315,12 @@ async function handleMessages(req, res) {
   const bridged = bridge.length > 0
   // A caller that pins a tool gets a reply that carries only that call: the
   // provider ignores the pin sometimes, and a stray call (the gate stub's
-  // `read` included) is a tool the caller cannot run.
+  // `read` included) is a tool the caller cannot run. Un-pinned tool callers
+  // still carry the stub on the translated request — the gate refuses any list
+  // without a `read` (same rule the chat path applies) — and the reply filter
+  // drops a stub call like any other un-invited one.
+  const gateRead = bridged ? null : gateReadFor(body)
+  const gateReadName = gateRead ? gateRead.function.name : null
   const pin = bridged ? null : pinnedToolName(body.tool_choice)
   for (const model of candidates) {
     const chosen = model === candidates[0]
@@ -1320,7 +1328,10 @@ async function handleMessages(req, res) {
     const format = modelFormat(model)
     // Upstream only ever sees streams (see collectChatCompletion); whether the
     // client asked for one decides how the reply is shaped, not what is sent.
-    const payload = format === "responses" ? responsesRequest(anthropicToChatBody(body, model), model, true) : { ...anthropicToChatBody(body, model), stream: true }
+    // The gate's read stub, when the caller needs one, rides inside the
+    // translated body (see anthropicToChatBody) — this must not inject again.
+    const chatShaped = anthropicToChatBody(body, model)
+    const payload = format === "responses" ? responsesRequest(chatShaped, model, true) : { ...chatShaped, stream: true }
     if (bridged) {
       payload.tools = format === "responses" ? chatToolsToResponses(bridge) : bridge
       // /responses takes only "auto"; the chat endpoint takes the pin.
@@ -1365,7 +1376,7 @@ async function handleMessages(req, res) {
           // the pump is done — measured as process-level "TypeError:
           // terminated" noise. Sink the promise; the log guard stays for real
           // surprises.
-          relayAnthropicStream(req, res, chunks, requested, model, bridged, pin).catch(() => {})
+          relayAnthropicStream(req, res, chunks, requested, model, bridged, pin, gateReadName).catch(() => {})
           res.on("finish", () => {
             recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
             recordObserved(model, true)
@@ -1374,7 +1385,7 @@ async function handleMessages(req, res) {
         }
         try {
           const content = format === "responses" ? await collectResponses(upstreamRes) : await collectChatCompletion(upstreamRes)
-          const shaped = stripToolCalls(format === "responses" ? responsesToChat(content, requested, model) : content, bridged)
+          const shaped = stripUnpinnedCalls(stripToolCalls(format === "responses" ? responsesToChat(content, requested, model) : content, bridged), pin, gateReadName)
           recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
           recordObserved(model, true)
           if (model !== requested) {
@@ -1484,13 +1495,13 @@ async function handleChat(req, res, responsesRoute = false) {
   const retries = config.retriesPerModel > 0 ? Math.floor(config.retriesPerModel) : 0
   const bridge = chatBody.tools?.length ? [] : gateBridgeTools()
   const bridged = bridge.length > 0
-  // A caller that brings its own tools still needs the gate's `read` on the list.
-  // Only the request changes — the pin is forwarded untouched, so the caller gets
-  // the call it asked for. The pin is not enforcement, though: the provider may
-  // still answer with another tool, so a reply can carry a call the caller never
-  // offered. That is why the tool riding along is a stub (see gateReadTool), and
-  // why the reply is filtered down to the pinned call.
+  // A caller that brings its own tools needs the gate's `read` on the list even
+  // when nothing is pinned (measured: one 403 per model without it). Only the
+  // request changes — `tool_choice` is forwarded untouched. A call to the stub
+  // itself is a call on a tool the caller never offered, so the reply carries
+  // the pinned call only when pinned, and never carries the stub's call.
   const gateRead = bridged ? null : gateReadFor(chatBody)
+  const gateReadName = gateRead ? gateRead.function.name : null
   const pin = bridged ? null : pinnedToolName(chatBody.tool_choice)
   const requestBody = gateRead ? { ...chatBody, tools: [gateRead, ...chatBody.tools] } : chatBody
   for (const model of candidates) {
@@ -1555,13 +1566,13 @@ async function handleChat(req, res, responsesRoute = false) {
           // client-visible failure, and undici's late socket rejections have
           // nowhere else to land (measured: 4 x "TypeError: terminated").
           if (responsesRequestShape && format === "responses") {
-            relayResponsesPassthrough(req, res, upstreamRes, requested, bridged, pin).catch(() => {})
+            relayResponsesPassthrough(req, res, upstreamRes, requested, bridged, pin, gateReadName).catch(() => {})
           } else if (responsesRequestShape) {
-            relayChatAsResponsesStream(req, res, upstreamRes, requested, bridged, pin).catch(() => {})
+            relayChatAsResponsesStream(req, res, upstreamRes, requested, bridged, pin, gateReadName).catch(() => {})
           } else if (format === "responses") {
-            relayResponsesStream(req, res, upstreamRes, requested, bridged, pin).catch(() => {})
+            relayResponsesStream(req, res, upstreamRes, requested, bridged, pin, gateReadName).catch(() => {})
           } else {
-            relayStream(req, res, upstreamRes, requested, bridged, pin).catch(() => {})
+            relayStream(req, res, upstreamRes, requested, bridged, pin, gateReadName).catch(() => {})
           }
           res.on("finish", () => { recordReq(req, `${requested}→${model}`, Date.now() - start, 200); recordObserved(model, true) })
           return
@@ -1582,18 +1593,19 @@ async function handleChat(req, res, responsesRoute = false) {
             if (responsesRequestShape) {
               content.model = requested
               if (pin) filterResponsesOutput(content, (i) => i?.name === pin)
+              else if (gateReadName) filterResponsesOutput(content, (i) => i?.name !== gateReadName)
               else if (bridged) filterResponsesOutput(content, null)
               if (model !== requested) content.zen_served_by = model
               return json(res, 200, content)
             }
-            return json(res, 200, stripUnpinnedCalls(stripToolCalls(responsesToChat(content, requested, model), bridged), pin))
+            return json(res, 200, stripUnpinnedCalls(stripToolCalls(responsesToChat(content, requested, model), bridged), pin, gateReadName))
           }
           if (model !== requested) {
             // Make the fallback visible to any client, not just JSON readers.
             res.setHeader?.("x-zen-served-by", model)
             res.setHeader?.("x-zen-fallback", "true")
           }
-          const shaped = stripUnpinnedCalls(stripToolCalls(content, bridged), pin)
+          const shaped = stripUnpinnedCalls(stripToolCalls(content, bridged), pin, gateReadName)
           if (responsesRequestShape) {
             return json(res, 200, chatToResponses(shaped, requested, model))
           }
@@ -1858,7 +1870,7 @@ function chatBlockError(block) {
   }
 }
 
-function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = false, pin = null) {
+function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = false, pin = null, gateName = null) {
   res.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
@@ -1870,7 +1882,7 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
   const id = `msg_${randomBytes(12).toString("hex")}`
   const emit = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`)
 
-  const st = { textOpen: false, thinkOpen: false, toolIndex: 0, blocks: new Map(), finish: "stop", finished: false, usage: null, dropped: new Set(), kept: false, nextBlock: 1 }
+  const st = { textOpen: false, thinkOpen: false, toolIndex: 0, blocks: new Map(), finish: "stop", finished: false, usage: null, dropped: new Set(), kept: false, callKept: false, nextBlock: 1 }
   emit("message_start", {
     message: {
       id,
@@ -1956,6 +1968,12 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
               // decision is made at the name chunk and remembered per index —
               // otherwise a strip would leak the dropped call's arguments.
               if (tc.function?.name) {
+                // The gate stub never reaches the caller: drop it by raw name
+                // before any agent-tool remapping could rename it.
+                if (!pin && gateName && tc.function.name === gateName) {
+                  st.dropped.add(tIndex)
+                  continue
+                }
                 const mapped = remapAgentTool(tc.function.name, "{}")
                 const resolved = mapped ? mapped.name : tc.function.name
                 if (pin && resolved !== pin) {
@@ -1963,6 +1981,7 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
                   continue
                 }
                 if (pin) st.kept = true
+                st.callKept = true
               } else if (st.dropped.has(tIndex)) {
                 continue
               }
@@ -2013,7 +2032,10 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
       const u = st.usage ?? {}
       // The model claimed a tool call but every call got filtered away: the
       // message ends without one, so it cannot claim tool_use.
-      const finish = pin && st.finish === "tool_calls" && !st.kept ? "stop" : st.finish
+      // A tool_calls claim that outlived its calls (pin kept nothing, or every
+      // call in a stub-riding turn was the dropped stub) must not survive.
+      const claimed = pin ? st.kept : gateName ? st.callKept : true
+      const finish = st.finish === "tool_calls" && !claimed ? "stop" : st.finish
       emit("message_delta", {
         delta: { stop_reason: STOP_REASON[finish] ?? "end_turn", stop_sequence: null },
         usage: { input_tokens: u.prompt_tokens ?? 0, output_tokens: u.completion_tokens ?? 0 },
@@ -2059,12 +2081,13 @@ function stripToolCalls(chunk, strip) {
 // here; streamed ones are filtered chunk by chunk in the relays, which carry
 // per-index state because a call's name arrives chunks apart from its
 // arguments.
-function stripUnpinnedCalls(content, pin) {
-  if (!pin || !content || typeof content !== "object") return content
+function stripUnpinnedCalls(content, pin, dropName = null) {
+  if ((!pin && !dropName) || !content || typeof content !== "object") return content
   for (const choice of content?.choices ?? []) {
     const body = choice?.message ?? choice?.delta
-    if (Array.isArray(body?.tool_calls)) {
-      const kept = body.tool_calls.filter((tc) => (tc?.function?.name ?? tc?.name) === pin)
+    if (Array.isArray(body?.tool_calls) && body.tool_calls.length) {
+      const keep = pin ? (tc) => (tc?.function?.name ?? tc?.name) === pin : (tc) => (tc?.function?.name ?? tc?.name) !== dropName
+      const kept = body.tool_calls.filter(keep)
       if (kept.length) body.tool_calls = kept
       else delete body.tool_calls
     }
@@ -2080,8 +2103,8 @@ function stripUnpinnedCalls(content, pin) {
 // call once and every argument chunk follows under the same index with
 // `name: null`, so the keep/drop decision has to outlive the block that first
 // saw the name. Kept calls are renumbered into one clean sequence.
-function pinStreamState(pin) {
-  return { pin, byChoice: new Map() }
+function pinStreamState(pin, dropName = null) {
+  return { pin, dropName, byChoice: new Map() }
 }
 
 function filterPinnedDelta(parsed, pinState) {
@@ -2098,12 +2121,22 @@ function filterPinnedDelta(parsed, pinState) {
       for (const tc of body.tool_calls) {
         const idx = tc?.index ?? 0
         if (tc?.function?.name) {
-          if (tc.function.name === pinState.pin) {
-            if (!s.renumber.has(idx)) s.renumber.set(idx, s.count++)
-            s.kept = true
-          } else {
+          if (pinState.pin) {
+            if (tc.function.name === pinState.pin) {
+              if (!s.renumber.has(idx)) s.renumber.set(idx, s.count++)
+              s.kept = true
+            } else {
+              s.dropped.add(idx)
+              continue
+            }
+          } else if (pinState.dropName && tc.function.name === pinState.dropName) {
+            // The gate stub riding on a free `tool_choice`: drop it by name and
+            // renumber whatever survives into one clean sequence.
             s.dropped.add(idx)
             continue
+          } else {
+            if (!s.renumber.has(idx)) s.renumber.set(idx, s.count++)
+            s.kept = true
           }
         } else if (s.dropped.has(idx)) {
           continue
@@ -2118,15 +2151,17 @@ function filterPinnedDelta(parsed, pinState) {
   }
 }
 
-function relayStream(req, res, upstreamRes, requested, strip = false, pin = null) {
+function relayStream(req, res, upstreamRes, requested, strip = false, pin = null, gateName = null) {
   res.writeHead(200, {
     "content-type": upstreamRes.headers.get("content-type") ?? "text/event-stream",
     "cache-control": "no-cache",
     connection: "keep-alive",
   })
   // One bookkeeping object per request: a pinned call's chunks span several SSE
-  // blocks, so the filter cannot see them one at a time.
-  const pinned = pin ? pinStreamState(pin) : null
+  // blocks, so the filter cannot see them one at a time. The gate stub's name
+  // when it rode along on a non-pinned turn keeps the same per-index bookkeeping
+  // for dropping that call.
+  const pinned = pin || gateName ? pinStreamState(pin, gateName) : null
   const reader = upstreamRes.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ""
@@ -2268,7 +2303,7 @@ async function probeModel(id, auth, session) {
 }
 
 // Stream a Responses SSE body back as chat.completion.chunk SSE.
-function relayResponsesStream(req, res, upstreamRes, requested, strip = false, pin = null) {
+function relayResponsesStream(req, res, upstreamRes, requested, strip = false, pin = null, gateName = null) {
   res.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
@@ -2333,8 +2368,12 @@ function relayResponsesStream(req, res, upstreamRes, requested, strip = false, p
                 ? "length"
                 : strip
                   ? "stop"
-                  : pin
-                    ? (state.kept ? "tool_calls" : "stop")
+                  : pin || gateName
+                    ? // A stub-riding or pinned turn keeps the tool_calls claim only
+                      // when a call survived the filter.
+                      state.kept
+                      ? "tool_calls"
+                      : "stop"
                     : state.tools.length
                       ? "tool_calls"
                       : "stop"
@@ -2347,17 +2386,25 @@ function relayResponsesStream(req, res, upstreamRes, requested, strip = false, p
           }
           for (let delta of responsesEventToDeltas(event, data, state)) {
             if (strip && delta.tool_calls) delete delta.tool_calls
-            else if (pin && Array.isArray(delta.tool_calls)) {
+            else if ((pin || gateName) && Array.isArray(delta.tool_calls)) {
               const kept = []
               for (const tc of delta.tool_calls) {
                 const idx = tc?.index ?? 0
                 if (tc?.function?.name) {
-                  if (tc.function.name === pin) {
-                    if (!state.renumber.has(idx)) state.renumber.set(idx, state.count++)
-                    state.kept = true
-                  } else {
+                  if (pin) {
+                    if (tc.function.name === pin) {
+                      if (!state.renumber.has(idx)) state.renumber.set(idx, state.count++)
+                      state.kept = true
+                    } else {
+                      state.dropped.add(idx)
+                      continue
+                    }
+                  } else if (gateName && tc.function.name === gateName) {
                     state.dropped.add(idx)
                     continue
+                  } else {
+                    if (!state.renumber.has(idx)) state.renumber.set(idx, state.count++)
+                    state.kept = true
                   }
                 } else if (state.dropped.has(idx)) continue
                 if (state.renumber.has(idx)) tc.index = state.renumber.get(idx)
@@ -2401,7 +2448,7 @@ function relayResponsesStream(req, res, upstreamRes, requested, strip = false, p
 // gateway itself emits for native /responses traffic, emitted live — the
 // callers here are agents, and buffering the stream would throw the latency
 // away.
-function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = false, pin = null) {
+function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = false, pin = null, gateName = null) {
   res.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
@@ -2467,6 +2514,10 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
           // call once, argument chunks follow under the same index nameless.
           if (tc.function?.name) {
             if (pin && tc.function.name !== pin) {
+              st.dropped.add(tIndex)
+              continue
+            }
+            if (!pin && gateName && tc.function.name === gateName) {
               st.dropped.add(tIndex)
               continue
             }
@@ -2547,7 +2598,7 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
 // native /responses one: upstream already speaks the same dialect, so this is
 // a passthrough that rewrites the model and drops calls the caller cannot run
 // (the bridge manifest's, and everything but the pinned one).
-function relayResponsesPassthrough(req, res, upstreamRes, requested, strip = false, pin = null) {
+function relayResponsesPassthrough(req, res, upstreamRes, requested, strip = false, pin = null, gateName = null) {
   res.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
@@ -2569,12 +2620,16 @@ function relayResponsesPassthrough(req, res, upstreamRes, requested, strip = fal
         dropped.add(callId)
         return false
       }
+      if (!pin && gateName && name === gateName) {
+        dropped.add(callId)
+        return false
+      }
       allowed.add(callId)
       return true
     }
     if (allowed.has(callId)) return true
     if (dropped.has(callId)) return false
-    return !(pin || strip)
+    return !(pin || strip || gateName)
   }
   const reader = upstreamRes.body.getReader()
   const decoder = new TextDecoder()
