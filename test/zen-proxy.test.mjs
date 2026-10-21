@@ -3946,3 +3946,68 @@ describe("upstream error bodies that cannot be parsed (measured: text/plain 4xx 
   })
 })
 
+describe("a reply that dies in flight (measured: collect failures used to 502 with the chain untried)", () => {
+  // Upstream answers 200 + SSE but never finishes: a mid-stream error chunk
+  // (d.error), a mid-body cut (RST), or a stream that simply stops. Nothing has
+  // reached the client when the collect fails, so the chain still applies.
+  beforeEach(() => {
+    zp.saveConfig({ fallbackModels: ["big-pickle", "space-bunny-free"], defaultModel: "", autoSyncIntervalMs: 0, cacheMs: 0, retriesPerModel: 0 })
+  })
+
+  // OK status, two usable chunks, then `data: {"error": ...}` and a close.
+  const dyingSse = (message = "midstream doom") =>
+    new Response(
+      [
+        `data: ${JSON.stringify({ model: "big-pickle", choices: [{ delta: { role: "assistant" } }] })}\n\n`,
+        `data: ${JSON.stringify({ model: "big-pickle", choices: [{ delta: { content: "before " } }] })}\n\n`,
+        `data: ${JSON.stringify({ error: { type: "server_error", message } })}\n\n`,
+      ].join(""),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    )
+
+  test("mid-stream error chunk falls through to the next model", async () => {
+    const calls = []
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          const sent = JSON.parse(opts.body)
+          calls.push(sent.model)
+          if (sent.model === "big-pickle") return dyingSse()
+          return jsonResponse({ model: sent.model, choices: [{ message: { role: "assistant", content: "hi" } }] })
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: "big-pickle", messages: [] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 200)
+    assert.deepEqual(calls, ["big-pickle", "space-bunny-free"])
+    assert.equal(res.state.headers["x-zen-served-by"], "space-bunny-free")
+  })
+
+  test("with no fallback left the real message reaches the client", async () => {
+    zp.saveConfig({ fallbackModels: ["big-pickle"], defaultModel: "", autoSyncIntervalMs: 0, cacheMs: 0, retriesPerModel: 0 })
+    globalThis.fetch = routeFetch([["/chat/completions", () => dyingSse("midstream doom")]])
+    const req = mockReq({ _body: JSON.stringify({ model: "big-pickle", messages: [] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 502)
+    assert.equal(JSON.parse(res.body).error.message, "midstream doom")
+  })
+
+  test("/v1/messages gets the anthropic error shape with the real message", async () => {
+    zp.saveConfig({ fallbackModels: ["big-pickle"], defaultModel: "", autoSyncIntervalMs: 0, cacheMs: 0, retriesPerModel: 0 })
+    globalThis.fetch = routeFetch([["/chat/completions", () => dyingSse("midstream doom")]])
+    const req = mockReq({ url: "/v1/messages", _body: JSON.stringify({ model: "big-pickle", max_tokens: 8, messages: [{ role: "user", content: "hi" }] }) })
+    const res = mockRes()
+    await zp.handleMessages(req, res)
+    assert.equal(res.state.status, 502)
+    const data = JSON.parse(res.body)
+    assert.equal(data.type, "error")
+    assert.equal(data.error.type, "api_error")
+    assert.equal(data.error.message, "midstream doom")
+  })
+})
+
+

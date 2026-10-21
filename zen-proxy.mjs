@@ -1370,9 +1370,17 @@ async function handleMessages(req, res) {
             res.setHeader?.("x-zen-fallback", "true")
           }
           return json(res, 200, chatToAnthropic(shaped, requested, model, pin))
-        } catch {
-          recordReq(req, requested, Date.now() - start, 502)
-          return json(res, 502, anthropicError(502, { error: { type: "api_error", message: "bad upstream response" } }).body)
+        } catch (err) {
+          // Upstream said OK but the reply never arrived whole (a mid-stream
+          // error chunk, a cut, a hang-abort). Nothing reached the client yet,
+          // so the chain can still save the request: fall through like any
+          // other upstream failure and keep the real message for the final
+          // surface — "bad upstream response" used to hide what actually
+          // happened (measured on the hostile gateway).
+          lastErr = { error: { type: "api_error", message: err?.message ? String(err.message) : "bad upstream response" } }
+          lastStatus = 502
+          recordObserved(model, false)
+          break
         }
       }
 
@@ -1581,9 +1589,15 @@ async function handleChat(req, res, responsesRoute = false) {
           recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
           recordObserved(model, true)
           return json(res, 200, shaped)
-        } catch {
-          recordReq(req, requested, Date.now() - start, 502)
-          return json(res, 502, { error: { type: "upstream_error", message: "bad upstream response" } })
+        } catch (err) {
+          // Same as the /v1/messages collective: an OK status with a reply that
+          // died in flight still has the whole chain available, and the plain
+          // request gets the real message instead of a flat "bad upstream
+          // response".
+          lastErr = { error: { type: "upstream_error", message: err?.message ? String(err.message) : "bad upstream response" } }
+          lastStatus = 502
+          recordObserved(model, false)
+          break
         }
       }
 
