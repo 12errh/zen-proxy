@@ -185,7 +185,10 @@ function gateReadTool() {
 // The pin is not enforcement, though: the gateway forwards it to the provider
 // and the provider may still answer with another tool. That is why the tool
 // riding along is a stub the model has no reason to pick, and not opencode's
-// `read`.
+// `read` — and why the reply is filtered down to the pinned call:
+// `stripUnpinnedCalls` for collected replies, and per-index state in the
+// streaming relays, because a call's name arrives chunks apart from its
+// arguments.
 //
 // The same hole sat open on the Anthropic route: `/v1/messages` callers bring
 // their tools in Anthropic shape, `agentToolsFor()` matches nothing there (a
@@ -1304,8 +1307,10 @@ async function handleChat(req, res) {
   // Only the request changes — the pin is forwarded untouched, so the caller gets
   // the call it asked for. The pin is not enforcement, though: the provider may
   // still answer with another tool, so a reply can carry a call the caller never
-  // offered. That is why the tool riding along is a stub (see gateReadTool).
+  // offered. That is why the tool riding along is a stub (see gateReadTool), and
+  // why the reply is filtered down to the pinned call.
   const gateRead = bridged ? null : gateReadFor(body)
+  const pin = bridged ? null : pinnedToolName(body.tool_choice)
   const requestBody = gateRead ? { ...body, tools: [gateRead, ...body.tools] } : body
   for (const model of candidates) {
     const chosen = model === candidates[0]
@@ -1352,9 +1357,9 @@ async function handleChat(req, res) {
             res.setHeader?.("x-zen-fallback", "true")
           }
           if (format === "responses") {
-            relayResponsesStream(req, res, upstreamRes, requested, bridged)
+            relayResponsesStream(req, res, upstreamRes, requested, bridged, pin)
           } else {
-            relayStream(req, res, upstreamRes, requested, bridged)
+            relayStream(req, res, upstreamRes, requested, bridged, pin)
           }
           res.on("finish", () => { recordReq(req, `${requested}→${model}`, Date.now() - start, 200); recordObserved(model, true) })
           return
@@ -1368,7 +1373,7 @@ async function handleChat(req, res) {
               res.setHeader?.("x-zen-served-by", model)
               res.setHeader?.("x-zen-fallback", "true")
             }
-            return json(res, 200, stripToolCalls(responsesToChat(content, requested, model), bridged))
+            return json(res, 200, stripUnpinnedCalls(stripToolCalls(responsesToChat(content, requested, model), bridged), pin))
           }
           if (model !== requested) {
             // Make the fallback visible to any client, not just JSON readers.
@@ -1378,7 +1383,7 @@ async function handleChat(req, res) {
           if (content && typeof content === "object") {
             content.model = requested
             if (model !== requested) content.zen_served_by = model
-            stripToolCalls(content, bridged)
+            stripUnpinnedCalls(stripToolCalls(content, bridged), pin)
           }
           recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
           recordObserved(model, true)
@@ -1756,12 +1761,82 @@ function stripToolCalls(chunk, strip) {
   return chunk
 }
 
-function relayStream(req, res, upstreamRes, requested, strip = false) {
+// The pin is not enforcement: the provider may answer a pinned request with a
+// call the caller never offered — the gate stub's `read` included, measured 3-6
+// of 12 against the live gateway on a prompt that mentions reading a file. A
+// pinned reply keeps the pinned call and nothing else; anything else is a tool
+// the pinned-caller contract never allowed. Collected replies are trimmed
+// here; streamed ones are filtered chunk by chunk in the relays, which carry
+// per-index state because a call's name arrives chunks apart from its
+// arguments.
+function stripUnpinnedCalls(content, pin) {
+  if (!pin || !content || typeof content !== "object") return content
+  for (const choice of content?.choices ?? []) {
+    const body = choice?.message ?? choice?.delta
+    if (Array.isArray(body?.tool_calls)) {
+      const kept = body.tool_calls.filter((tc) => (tc?.function?.name ?? tc?.name) === pin)
+      if (kept.length) body.tool_calls = kept
+      else delete body.tool_calls
+    }
+    // No call survived and the model still claimed `tool_calls`: an empty
+    // claim reads like a bug to every client, not like an answer.
+    if (choice?.finish_reason === "tool_calls" && !body?.tool_calls?.length) choice.finish_reason = "stop"
+  }
+  return content
+}
+
+// Bookkeeping carried from one SSE block to the next by the streamed pinned
+// filter. `tool_calls` chunks are tied together by `index`: the name names the
+// call once and every argument chunk follows under the same index with
+// `name: null`, so the keep/drop decision has to outlive the block that first
+// saw the name. Kept calls are renumbered into one clean sequence.
+function pinStreamState(pin) {
+  return { pin, byChoice: new Map() }
+}
+
+function filterPinnedDelta(parsed, pinState) {
+  for (const choice of parsed?.choices ?? []) {
+    const key = choice?.index ?? 0
+    let s = pinState.byChoice.get(key)
+    if (!s) {
+      s = { dropped: new Set(), kept: false, count: 0, renumber: new Map() }
+      pinState.byChoice.set(key, s)
+    }
+    const body = choice?.delta ?? choice?.message
+    if (Array.isArray(body?.tool_calls) && body.tool_calls.length) {
+      const kept = []
+      for (const tc of body.tool_calls) {
+        const idx = tc?.index ?? 0
+        if (tc?.function?.name) {
+          if (tc.function.name === pinState.pin) {
+            if (!s.renumber.has(idx)) s.renumber.set(idx, s.count++)
+            s.kept = true
+          } else {
+            s.dropped.add(idx)
+            continue
+          }
+        } else if (s.dropped.has(idx)) {
+          continue
+        }
+        if (s.renumber.has(idx)) tc.index = s.renumber.get(idx)
+        kept.push(tc)
+      }
+      if (kept.length) body.tool_calls = kept
+      else delete body.tool_calls
+    }
+    if (choice?.finish_reason === "tool_calls" && !s.kept) choice.finish_reason = "stop"
+  }
+}
+
+function relayStream(req, res, upstreamRes, requested, strip = false, pin = null) {
   res.writeHead(200, {
     "content-type": upstreamRes.headers.get("content-type") ?? "text/event-stream",
     "cache-control": "no-cache",
     connection: "keep-alive",
   })
+  // One bookkeeping object per request: a pinned call's chunks span several SSE
+  // blocks, so the filter cannot see them one at a time.
+  const pinned = pin ? pinStreamState(pin) : null
   const reader = upstreamRes.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ""
@@ -1790,7 +1865,7 @@ function relayStream(req, res, upstreamRes, requested, strip = false) {
         while ((idx = buffer.indexOf("\n\n")) !== -1) {
           const block = buffer.slice(0, idx)
           buffer = buffer.slice(idx + 2)
-          const out = rewriteSSE(block, requested, strip)
+          const out = rewriteSSE(block, requested, strip, pinned)
           if (out) res.write(out)
         }
       }
@@ -1883,7 +1958,7 @@ async function probeModel(id, auth, session) {
 }
 
 // Stream a Responses SSE body back as chat.completion.chunk SSE.
-function relayResponsesStream(req, res, upstreamRes, requested, strip = false) {
+function relayResponsesStream(req, res, upstreamRes, requested, strip = false, pin = null) {
   res.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
@@ -1892,7 +1967,9 @@ function relayResponsesStream(req, res, upstreamRes, requested, strip = false) {
   const id = `chatcmpl-${randomBytes(12).toString("hex")}`
   const created = Math.floor(Date.now() / 1000)
   const base = { id, object: "chat.completion.chunk", created, model: requested }
-  const state = { tools: [], usage: null, finish: "stop" }
+  // The pinned filter spans blocks like every other one: a call's name and its
+  // argument chunks arrive in separate events under the same call id.
+  const state = { tools: [], usage: null, finish: "stop", dropped: new Set(), kept: false, count: 0, renumber: new Map() }
   const reader = upstreamRes.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ""
@@ -1936,18 +2013,48 @@ function relayResponsesStream(req, res, upstreamRes, requested, strip = false) {
           }
           if (data?.response?.usage) state.usage = data.response.usage
           if (data?.type === "response.completed" || data?.type === "response.incomplete") {
-            state.finish = data.type === "response.incomplete" ? "length" : state.tools.length ? "tool_calls" : "stop"
+            // `strip` (the tool-less bridge) and the pinned filter both swallow
+            // calls: a finish that claims tool_calls must not outlive them.
+            state.finish =
+              data.type === "response.incomplete"
+                ? "length"
+                : strip
+                  ? "stop"
+                  : pin
+                    ? (state.kept ? "tool_calls" : "stop")
+                    : state.tools.length
+                      ? "tool_calls"
+                      : "stop"
             continue
           }
           if (data?.type === "error" || data?.error) continue
-          for (const delta of responsesEventToDeltas(event, data, state)) {
+          for (let delta of responsesEventToDeltas(event, data, state)) {
             if (strip && delta.tool_calls) delete delta.tool_calls
+            else if (pin && Array.isArray(delta.tool_calls)) {
+              const kept = []
+              for (const tc of delta.tool_calls) {
+                const idx = tc?.index ?? 0
+                if (tc?.function?.name) {
+                  if (tc.function.name === pin) {
+                    if (!state.renumber.has(idx)) state.renumber.set(idx, state.count++)
+                    state.kept = true
+                  } else {
+                    state.dropped.add(idx)
+                    continue
+                  }
+                } else if (state.dropped.has(idx)) continue
+                if (state.renumber.has(idx)) tc.index = state.renumber.get(idx)
+                kept.push(tc)
+              }
+              if (kept.length) delta.tool_calls = kept
+              else delete delta.tool_calls
+            }
             if (Object.keys(delta).length === 0) continue
             send([{ index: 0, delta, finish_reason: null }])
           }
         }
       }
-      send([{ index: 0, delta: {}, finish_reason: strip ? "stop" : state.finish }], state.usage ? { usage: usageToChat(state.usage) } : {})
+      send([{ index: 0, delta: {}, finish_reason: state.finish }], state.usage ? { usage: usageToChat(state.usage) } : {})
       res.write("data: [DONE]\n\n")
       res.end()
     } catch {
@@ -1959,7 +2066,7 @@ function relayResponsesStream(req, res, upstreamRes, requested, strip = false) {
   return pump()
 }
 
-function rewriteSSE(block, requested, strip = false) {
+function rewriteSSE(block, requested, strip = false, pinState = null) {
   if (!block.trim()) return null
   const lines = block.split("\n")
   const out = []
@@ -1974,6 +2081,7 @@ function rewriteSSE(block, requested, strip = false) {
         const parsed = JSON.parse(payload)
         if (parsed && typeof parsed === "object" && "model" in parsed) parsed.model = requested
         stripToolCalls(parsed, strip)
+        if (pinState) filterPinnedDelta(parsed, pinState)
         out.push(`data: ${JSON.stringify(parsed)}`)
       } catch {
         out.push(line)
@@ -2635,6 +2743,8 @@ export {
   AGENT_PREAMBLE_TEXT,
   relayStream,
   rewriteSSE,
+  stripUnpinnedCalls,
+  filterPinnedDelta,
   fetchModels,
   handleModels,
   handleApiConfig,
