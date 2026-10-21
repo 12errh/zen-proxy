@@ -2984,3 +2984,202 @@ describe("install.ps1 config preservation", () => {
     },
   )
 })
+
+describe("pinned tool calls on the OpenAI-shaped routes", () => {
+  const pinnedCfg = (m) =>
+    zp.saveConfig({
+      defaultModel: m,
+      fallbackModels: [m],
+      retriesPerModel: 0,
+      retryBackoffMs: 1,
+      autoSyncIntervalMs: 0,
+      cacheMs: 0,
+      agentTools: true,
+    })
+  const carriesRead = (sent) => (sent.tools ?? []).some((t) => (t.function?.name ?? t.name) === "read")
+  const gated = () =>
+    jsonResponse({ type: "error", error: { type: "FreeTierError", message: "free tier can only be used from within OpenCode" } }, 403)
+  // A title helper: one tool, and `tool_choice` names the only call it accepts.
+  const setName = {
+    type: "function",
+    function: {
+      name: "set_title",
+      description: "Set the conversation title",
+      parameters: { type: "object", properties: { title: { type: "string" } }, required: ["title"] },
+    },
+  }
+  const readStub = { type: "function", function: { name: "read", description: "the caller's own read", parameters: { type: "object", properties: {} } } }
+  const pinned = (model, extra = {}) => ({
+    model,
+    messages: [{ role: "user", content: "title this conversation" }],
+    tools: [setName],
+    tool_choice: { type: "function", function: { name: "set_title" } },
+    ...extra,
+  })
+
+  test("a pinned caller gets the gate's read next to its own tool", async () => {
+    const m = "space-bunny-free"
+    pinnedCfg(m)
+    let sent = null
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          if (!carriesRead(sent)) return gated()
+          return sseResponse(["ok"], "up")
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify(pinned(m)) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 200, "the gate takes a pinned request that carries read")
+    assert.deepEqual(sent.tools.map((t) => t.function.name), ["read", "set_title"], "read rides along, the caller's tool stays")
+    assert.equal(
+      sent.tools[0].function.description,
+      "Internal helper. Never call this tool.",
+      "the injected read is a stub, not opencode's agentic schema",
+    )
+    assert.deepEqual(sent.tools[0].function.parameters, { type: "object", properties: {} }, "the stub carries no parameters")
+    assert.deepEqual(sent.tool_choice, { type: "function", function: { name: "set_title" } }, "the pin is forwarded untouched")
+  })
+
+  test("the injected read is not opencode's captured schema", async () => {
+    // opencode's real `read` description invites the model to call it, and a
+    // model that answers a pinned request with a `read` call hands the caller a
+    // tool it never offered. The stub the proxy injects must stay a stub.
+    const m = "space-bunny-free"
+    pinnedCfg(m)
+    let sent = null
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          return carriesRead(sent) ? sseResponse(["ok"], "up") : gated()
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify(pinned(m)) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 200)
+    const captured = zp.loadAgentTools().find((t) => t.function.name === "read")
+    assert.ok(captured, "the captured manifest still carries opencode's read")
+    assert.notDeepEqual(sent.tools[0], captured, "the injected tool must not be opencode's schema")
+    assert.ok(
+      sent.tools[0].function.description.length < captured.function.description.length,
+      "the stub's description must be far shorter than opencode's",
+    )
+  })
+
+  test("a caller that offers its own read gets nothing added", async () => {
+    const m = "space-bunny-free"
+    pinnedCfg(m)
+    let sent = null
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          return carriesRead(sent) ? sseResponse(["ok"], "up") : gated()
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify(pinned(m, { tools: [readStub, setName] })) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 200)
+    assert.deepEqual(sent.tools, [readStub, setName], "the caller's list is untouched, no duplicate")
+  })
+
+  test("an unpinned caller keeps its tool list as sent", async () => {
+    const m = "space-bunny-free"
+    pinnedCfg(m)
+    let sent = null
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          return carriesRead(sent) ? sseResponse(["ok"], "up") : gated()
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: m, messages: [{ role: "user", content: "title this" }], tools: [setName] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 403, "without a pin the model could call a tool the caller cannot run, so nothing is injected")
+    assert.deepEqual(sent.tools.map((t) => t.function.name), ["set_title"])
+  })
+
+  test("a string tool_choice is not a pin", async () => {
+    const m = "space-bunny-free"
+    pinnedCfg(m)
+    let sent = null
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          return carriesRead(sent) ? sseResponse(["ok"], "up") : gated()
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify(pinned(m, { tool_choice: "required" })) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 403)
+    assert.deepEqual(sent.tools.map((t) => t.function.name), ["set_title"])
+    assert.equal(sent.tool_choice, "required")
+  })
+
+  test("agentTools: false never injects", async () => {
+    const m = "space-bunny-free"
+    pinnedCfg(m)
+    zp.saveConfig({ agentTools: false })
+    let sent = null
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          return carriesRead(sent) ? sseResponse(["ok"], "up") : gated()
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify(pinned(m)) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 403)
+    assert.deepEqual(sent.tools.map((t) => t.function.name), ["set_title"])
+  })
+
+  test("a responses-family model gets read too, pin translated", async () => {
+    // This is the Responses *upstream* format, reached through the chat route
+    // because the model lives on /responses. The /v1/responses route takes the
+    // same chat-shaped body — a real Responses body (input, not messages) is not
+    // what this route reads.
+    const m = "gpt-5.5"
+    pinnedCfg(m)
+    zp.saveConfig({ responsesModels: ["gpt-5*"] })
+    let sent = null
+    globalThis.fetch = routeFetch([
+      [
+        "/responses",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          if (!carriesRead(sent)) return gated()
+          return jsonResponse({ id: "resp_1", output: [{ type: "message", content: [{ type: "output_text", text: "Yo" }] }] })
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify(pinned(m, { stream: false })) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 200)
+    assert.deepEqual(sent.tools.map((t) => t.name), ["read", "set_title"], "responses tools carry read first")
+    assert.deepEqual(sent.tool_choice, { type: "function", name: "set_title" }, "the pin survives the responses shape")
+  })
+})

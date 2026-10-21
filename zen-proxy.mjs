@@ -149,6 +149,66 @@ function agentToolsFor(callerToolNames) {
   return loadAgentTools().filter((t) => wanted.has(AGENT_TOOL_MAP[t.function.name].name))
 }
 
+// The gate's `read`.
+//
+// The gate takes a tool named `read` and nothing else — `Read` with a capital,
+// `read_file` and a bare `set_title` are all refused — and it does not look at
+// the schema. So the cheapest thing that satisfies it is a stub, and the stub is
+// also the safest one to send.
+//
+// The stub's description deliberately does not invite a call. opencode's real
+// `read` schema is 1158 characters of "call this tool in parallel when you know
+// there are multiple files you want to read", and sending it makes the model
+// answer a pinned request with a `read` call the caller never offered. Measured
+// end to end against the live gateway, a prompt that mentions reading a file,
+// 12 calls each: opencode's schema answers 9 of 12 with a stray `read`, this
+// stub 3 of 12 (4 of 12 on a second run). The gate takes the stub exactly as
+// readily.
+function gateReadTool() {
+  return {
+    type: "function",
+    function: {
+      name: "read",
+      description: "Internal helper. Never call this tool.",
+      parameters: { type: "object", properties: {} },
+    },
+  }
+}
+
+// A caller that brings its own tools still gets 403: the gate looks for a tool
+// named `read` and refuses the list without it, whatever else is on there. So
+// one has to ride along. Doing that on a free-form agent turn would be wrong —
+// the model could call a tool the caller cannot run — so it is only added when
+// `tool_choice` pins a single function (a title or label helper: `tool_choice`
+// names the only call it will accept).
+//
+// The pin is not enforcement, though: the gateway forwards it to the provider
+// and the provider may still answer with another tool. That is why the tool
+// riding along is a stub the model has no reason to pick, and not opencode's
+// `read`.
+//
+// It still cannot be ruled out. A pinned reply can carry a call the caller
+// never offered, and nothing strips it: `stripToolCalls` only runs for the
+// tool-less bridge, where the caller offered no tool at all. Closing that hole
+// needs a strip in the reply path that keeps the pinned call and drops the
+// rest — a separate change, because the streaming path has no state to tell
+// one call's chunks from another's.
+function pinnedToolName(toolChoice) {
+  if (!toolChoice || typeof toolChoice !== "object") return null
+  const fn = toolChoice.function ?? toolChoice
+  return typeof fn?.name === "string" && fn.name ? fn.name : null
+}
+
+function gateReadFor(body) {
+  if (!config.agentTools) return null
+  const tools = body?.tools
+  if (!Array.isArray(tools) || !tools.length) return null
+  if (!pinnedToolName(body?.tool_choice)) return null
+  const offered = tools.map((t) => t?.function?.name ?? t?.name)
+  if (offered.includes("read")) return null
+  return gateReadTool()
+}
+
 // An opencode tool call rewritten as the caller's tool call.
 function remapAgentTool(name, rawArgs) {
   const spec = AGENT_TOOL_MAP[name]
@@ -1219,6 +1279,13 @@ async function handleChat(req, res) {
   const retries = config.retriesPerModel > 0 ? Math.floor(config.retriesPerModel) : 0
   const bridge = body.tools?.length ? [] : gateBridgeTools()
   const bridged = bridge.length > 0
+  // A caller that brings its own tools still needs the gate's `read` on the list.
+  // Only the request changes — the pin is forwarded untouched, so the caller gets
+  // the call it asked for. The pin is not enforcement, though: the provider may
+  // still answer with another tool, so a reply can carry a call the caller never
+  // offered. That is why the tool riding along is a stub (see gateReadTool).
+  const gateRead = bridged ? null : gateReadFor(body)
+  const requestBody = gateRead ? { ...body, tools: [gateRead, ...body.tools] } : body
   for (const model of candidates) {
     const chosen = model === candidates[0]
     used = model
@@ -1226,7 +1293,7 @@ async function handleChat(req, res) {
     // Streams upstream regardless of what the client asked for — see
     // collectChatCompletion — and the collector puts the shape back.
     const payload =
-      format === "responses" ? responsesRequest(body, model, true) : { ...body, model, stream: true }
+      format === "responses" ? responsesRequest(requestBody, model, true) : { ...requestBody, model, stream: true }
     if (bridged) {
       payload.tools = format === "responses" ? chatToolsToResponses(bridge) : bridge
       // The gateway takes only "auto" on /responses, so forwarding anything the
