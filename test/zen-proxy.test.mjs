@@ -3158,9 +3158,9 @@ describe("pinned tool calls on the OpenAI-shaped routes", () => {
 
   test("a responses-family model gets read too, pin translated", async () => {
     // This is the Responses *upstream* format, reached through the chat route
-    // because the model lives on /responses. The /v1/responses route takes the
-    // same chat-shaped body — a real Responses body (input, not messages) is not
-    // what this route reads.
+    // because the model lives on /responses. The chat-shaped body still talks
+    // chat; a real Responses body on the /responses route leg now travels as
+    // Responses (see "the /v1/responses route speaks Responses").
     const m = "gpt-5.5"
     pinnedCfg(m)
     zp.saveConfig({ responsesModels: ["gpt-5*"] })
@@ -3545,5 +3545,335 @@ describe("pinned replies on the OpenAI-shaped routes", () => {
     assert.ok(!res.body.includes("filePath"), `a stray responses-family call leaked: ${res.body}`)
     assert.ok(res.body.includes('"name":"set_title"') && res.body.includes('"id":"cs"'))
     assert.match(res.body, /"finish_reason":"tool_calls"/)
+  })
+})
+
+describe("the /v1/responses route speaks Responses", () => {
+  const cfg = (extra = {}) =>
+    zp.saveConfig({ defaultModel: "big-pickle", fallbackModels: ["big-pickle"], retriesPerModel: 0, retryBackoffMs: 1, autoSyncIntervalMs: 0, cacheMs: 0, agentTools: true, responsesModels: ["gpt-5*"], ...extra })
+  const responsesBody = (model, input, extra = {}) => ({ model, input, ...extra })
+  const chatSse = (text, usage) =>
+    new Response(
+      [
+        { model: "up", choices: [{ delta: { content: text } }] },
+        { model: "up", choices: [{ delta: {} }], usage },
+      ]
+        .map((b) => `data: ${JSON.stringify(b)}\n\n`)
+        .join("") + "data: [DONE]\n\n",
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    )
+
+  test("a real Responses body is accepted and answered in Responses shape", async () => {
+    cfg()
+    let sent = null
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          return chatSse("Hello there, friend!")
+        },
+      ],
+    ])
+    const req = mockReq({ url: "/v1/responses", _body: JSON.stringify(responsesBody("big-pickle", "Say hello in three words.")) })
+    const res = mockRes()
+    await zp.handleChat(req, res, true)
+    assert.equal(res.state.status, 200, `this exact body used to die with a bare 400: ${res.body}`)
+    assert.deepEqual(sent.messages, [{ role: "user", content: "Say hello in three words." }], "the input became the message")
+    const data = JSON.parse(res.body)
+    assert.equal(data.object, "response")
+    assert.equal(data.status, "completed")
+    assert.equal(data.model, "big-pickle")
+    assert.equal(data.output[0].type, "message")
+    assert.equal(data.output[0].content[0].type, "output_text")
+    assert.equal(data.output[0].content[0].text, "Hello there, friend!")
+  })
+
+  test("input item lists become chat messages, instructions become the system message", async () => {
+    cfg()
+    let sent = null
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          return chatSse("ok")
+        },
+      ],
+    ])
+    const input = [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "check the file" }] },
+      { type: "reasoning", summary: [{ text: "internal state nobody can replay" }] },
+      { type: "function_call", call_id: "call_1", name: "read", arguments: '{"filePath":"/x"}' },
+      { type: "function_call_output", call_id: "call_1", output: "contents" },
+    ]
+    const req = mockReq({ url: "/v1/responses", _body: JSON.stringify(responsesBody("big-pickle", input, { instructions: "be brief" })) })
+    const res = mockRes()
+    await zp.handleChat(req, res, true)
+    assert.equal(res.state.status, 200)
+    assert.deepEqual(sent.messages[0], { role: "system", content: "be brief" })
+    assert.deepEqual(sent.messages[1], { role: "user", content: [{ type: "text", text: "check the file" }] })
+    assert.deepEqual(sent.messages[2].tool_calls, [{ id: "call_1", type: "function", function: { name: "read", arguments: '{"filePath":"/x"}' } }])
+    assert.deepEqual(sent.messages[3], { role: "tool", tool_call_id: "call_1", content: "contents" })
+  })
+
+  test("Responses tools ride the pinned-caller rule on both families", async () => {
+    cfg()
+    let sent = null
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          return chatSse("ok")
+        },
+      ],
+    ])
+    const body = responsesBody("big-pickle", "title this", {
+      tools: [{ type: "function", name: "set_title", description: "d", parameters: { type: "object", properties: { title: { type: "string" } } } }],
+      tool_choice: { type: "function", name: "set_title" },
+    })
+    const req = mockReq({ url: "/v1/responses", _body: JSON.stringify(body) })
+    const res = mockRes()
+    await zp.handleChat(req, res, true)
+    assert.equal(res.state.status, 200)
+    // The gate's read comes along by name, the caller's tool stays, the pin is
+    // carried in chat vocabulary for the chat-family endpoint.
+    assert.deepEqual(sent.tools.map((t) => t.function.name), ["read", "set_title"])
+    assert.deepEqual(sent.tool_choice, { type: "function", function: { name: "set_title" } })
+  })
+
+  test("a native /responses model gets the input untranslated", async () => {
+    // The translation must not round-trip a Responses client through chat and
+    // lose the input before it leaves: on a responses-family model the items
+    // go out as items.
+    cfg({ defaultModel: "gpt-5.5", fallbackModels: ["gpt-5.5"] })
+    let sent = null
+    globalThis.fetch = routeFetch([
+      [
+        "/responses",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          return jsonResponse({
+            id: "resp_up",
+            object: "response",
+            status: "completed",
+            model: "upstream-model",
+            output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "yo" }] }],
+            usage: { input_tokens: 3, output_tokens: 1, total_tokens: 4 },
+          })
+        },
+      ],
+    ])
+    const input = [{ type: "message", role: "user", content: [{ type: "input_image", url: "data:image/png;base64,xx" }, { type: "input_text", text: "what is this" }] }]
+    const req = mockReq({ url: "/v1/responses", _body: JSON.stringify(responsesBody("gpt-5.5", input)) })
+    const res = mockRes()
+    await zp.handleChat(req, res, true)
+    assert.equal(res.state.status, 200)
+    assert.deepEqual(sent.input, input, "the items travel as items, not as a chat round-trip")
+    const data = JSON.parse(res.body)
+    assert.equal(data.object, "response")
+    assert.equal(data.model, "gpt-5.5", "the client asked for this model, not the one upstream names")
+    assert.deepEqual(data.output, [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "yo" }] }])
+  })
+
+  test("streaming a chat-family model emits a live Responses SSE", async () => {
+    cfg()
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        () =>
+          chatSse("Hel", { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 }),
+      ],
+    ])
+    const req = mockReq({ url: "/v1/responses", _body: JSON.stringify(responsesBody("big-pickle", "Say hi", { stream: true })) })
+    const res = mockRes()
+    await zp.handleChat(req, res, true)
+    await res.done
+    assert.equal(res.state.status, 200)
+    const types = [...res.body.matchAll(/event: ([a-z_.]+)/g)].map((m) => m[1])
+    assert.ok(types[0] === "response.created")
+    assert.ok(types.includes("response.output_text.delta"))
+    assert.ok(types.includes("response.output_text.done"))
+    assert.ok(types.includes("response.completed"))
+    assert.equal(types[types.length - 1], "response.completed", "Responses SSE ends on completed, not [DONE]")
+    assert.ok(!res.body.includes("[DONE]"))
+    const completed = JSON.parse(res.body.match(/event: response\.completed\ndata: (.*)\n/)[1])
+    assert.equal(completed.response.status, "completed")
+    assert.equal(completed.response.output[0].content[0].text, "Hel")
+    assert.deepEqual(completed.response.usage, { input_tokens: 3, output_tokens: 1, total_tokens: 4 })
+  })
+
+  test("streaming a chat-family model that answers with the pinned call", async () => {
+    cfg()
+    const calleeSse = new Response(
+      [
+        { model: "up", choices: [{ delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "set_title", arguments: "" } }] } }] },
+        { model: "up", choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '{"title": ' } }] } }] },
+        { model: "up", choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '"Hosted"}' } }] } }] },
+        { model: "up", choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+      ]
+        .map((b) => `data: ${JSON.stringify(b)}\n\n`)
+        .join("") + "data: [DONE]\n\n",
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    )
+    globalThis.fetch = routeFetch([["/chat/completions", () => calleeSse]])
+    const body = responsesBody("big-pickle", "title this", {
+      stream: true,
+      tools: [{ type: "function", name: "set_title", description: "d", parameters: { type: "object", properties: { title: { type: "string" } } } }],
+      tool_choice: { type: "function", name: "set_title" },
+    })
+    const req = mockReq({ url: "/v1/responses", _body: JSON.stringify(body) })
+    const res = mockRes()
+    await zp.handleChat(req, res, true)
+    await res.done
+    assert.equal(res.state.status, 200)
+    assert.ok(res.body.includes('"type":"function_call"'))
+    assert.match(res.body, /"name":"set_title"/)
+    assert.match(res.body, /"arguments":"\{\\"title\\": \\"Hosted\\"\}"/, "the pinned call's arguments arrive whole")
+  })
+
+  test("streaming a native /responses model passes its SSE through, rewritten", async () => {
+    cfg({ defaultModel: "gpt-5.5", fallbackModels: ["gpt-5.5"] })
+    const sse =
+      `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "he" })}\n\n` +
+      `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "resp_x", object: "response", model: "upstream-model", output: [] } })}\n\n`
+    globalThis.fetch = routeFetch([
+      ["/responses", () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } })],
+    ])
+    const req = mockReq({ url: "/v1/responses", _body: JSON.stringify(responsesBody("gpt-5.5", "hi", { stream: true })) })
+    const res = mockRes()
+    await zp.handleChat(req, res, true)
+    await res.done
+    assert.equal(res.state.status, 200)
+    assert.match(res.body, /event: response\.output_text\.delta/)
+    assert.match(res.body, /"delta":"he"/)
+    assert.ok(!res.body.includes('"model":"upstream-model"'), "the served model id is rewritten")
+    assert.ok(res.body.includes('"object":"response"'))
+  })
+
+  test("the bridged manifest never leaks into a Responses stream", async () => {
+    // A tool-less client on /responses gets opencode's manifest for the gate;
+    // whatever the model answers with a manifest tool call cannot reach the
+    // caller, same as on the chat-shaped leg.
+    cfg({ defaultModel: "gpt-5.5", fallbackModels: ["gpt-5.5"] })
+    let sent = null
+    const sse =
+      `event: response.created\ndata: ${JSON.stringify({ type: "response.created", response: { object: "response", model: "upstream-model" } })}\n\n` +
+      `event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", item: { type: "function_call", call_id: "call_9", id: "fc_9", name: "read" } })}\n\n` +
+      `event: response.function_call_arguments.delta\ndata: ${JSON.stringify({ type: "response.function_call_arguments.delta", item_id: "call_9", delta: '{"filePath": "/e"}' })}\n\n` +
+      `event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", item: { type: "function_call", call_id: "call_9", id: "fc_9", name: "read", arguments: '{"filePath": "/e"}' } })}\n\n` +
+      `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { object: "response", model: "upstream-model", output: [{ type: "function_call", call_id: "call_9", name: "read", arguments: '{"filePath": "/e"}' }, { type: "message", role: "assistant", content: [{ type: "output_text", text: "done" }] }] } })}\n\n`
+    globalThis.fetch = routeFetch([
+      [
+        "/responses",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } })
+        },
+      ],
+    ])
+    const req = mockReq({ url: "/v1/responses", _body: JSON.stringify(responsesBody("gpt-5.5", "summarize", { stream: true })) })
+    const res = mockRes()
+    await zp.handleChat(req, res, true)
+    await res.done
+    assert.equal(res.state.status, 200)
+    assert.equal(sent.tool_choice, undefined, "the bridge takes auto on /responses upstream")
+    assert.ok(sent.tools.some((t) => t.name === "read"), "the gate took the manifest")
+    assert.ok(!res.body.includes("filePath"), `a bridge call leaked into the stream: ${res.body}`)
+    const completed = JSON.parse(res.body.match(/event: response\.completed\ndata: (.*)\n/)[1])
+    assert.deepEqual(
+      completed.response.output.filter((i) => i?.type === "function_call"),
+      [],
+      "the completed object carries no manifest call",
+    )
+  })
+
+  test("a pinned Responses stream keeps only the pinned call", async () => {
+    cfg({ defaultModel: "gpt-5.5", fallbackModels: ["gpt-5.5"] })
+    const sse =
+      `event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", item: { type: "function_call", call_id: "call_r", id: "fc_r", name: "read" } })}\n\n` +
+      `event: response.function_call_arguments.delta\ndata: ${JSON.stringify({ type: "response.function_call_arguments.delta", item_id: "call_r", delta: '{"filePath": "/e"}' })}\n\n` +
+      `event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", item: { type: "function_call", call_id: "call_s", id: "fc_s", name: "set_title" } })}\n\n` +
+      `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { object: "response", model: "upstream-model", output: [{ type: "function_call", call_id: "call_r", name: "read", arguments: '{"filePath": "/e"}' }, { type: "function_call", call_id: "call_s", name: "set_title", arguments: '{"title":"hi"}' }] } })}\n\n`
+    globalThis.fetch = routeFetch([
+      ["/responses", () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } })],
+    ])
+    const body = responsesBody("gpt-5.5", "title this", {
+      stream: true,
+      tools: [{ type: "function", name: "set_title", description: "d", parameters: { type: "object", properties: { title: { type: "string" } } } }],
+      tool_choice: { type: "function", name: "set_title" },
+    })
+    const req = mockReq({ url: "/v1/responses", _body: JSON.stringify(body) })
+    const res = mockRes()
+    await zp.handleChat(req, res, true)
+    await res.done
+    assert.equal(res.state.status, 200)
+    assert.ok(!res.body.includes("filePath"), `a stray call leaked into a pinned Responses stream: ${res.body}`)
+    assert.ok(res.body.includes('"call_id":"call_s"') || res.body.includes('call_s'))
+    const completed = JSON.parse(res.body.match(/event: response\.completed\ndata: (.*)\n/)[1])
+    assert.deepEqual(
+      completed.response.output.map((i) => i?.name),
+      ["set_title"],
+    )
+  })
+
+  test("a chat-shaped body on /v1/responses keeps its chat reply", async () => {
+    // Compatibility: everything that works today keeps working.
+    cfg()
+    let sent = null
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          return chatSse("Hello there, friend!")
+        },
+      ],
+    ])
+    const req = mockReq({ url: "/v1/responses", _body: JSON.stringify({ model: "big-pickle", messages: [{ role: "user", content: "Say hello in three words." }] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res, true)
+    assert.equal(res.state.status, 200)
+    assert.equal(JSON.parse(res.body).object, "chat.completion")
+    assert.deepEqual(sent.messages, [{ role: "user", content: "Say hello in three words." }])
+  })
+
+  test("unit: responsesInputToMessages handles string, items and reasoning", () => {
+    assert.deepEqual(zp.responsesInputToMessages("hello"), [{ role: "user", content: "hello" }])
+    assert.deepEqual(zp.responsesInputToMessages(undefined), [])
+    const out = zp.responsesInputToMessages([
+      { type: "message", role: "assistant", content: "hi" },
+      { type: "reasoning", summary: [] },
+      { type: "function_call", call_id: "c1", name: "ls", arguments: "{}" },
+      { type: "function_call_output", call_id: "c1", output: "a.txt" },
+    ])
+    assert.deepEqual(out, [
+      { role: "assistant", content: "hi" },
+      { role: "assistant", content: "", tool_calls: [{ id: "c1", type: "function", function: { name: "ls", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "c1", content: "a.txt" },
+    ])
+  })
+
+  test("unit: chatToResponses shapes a completion back into a begin response", () => {
+    const data = zp.chatToResponses(
+      {
+        id: "chatcmpl_1",
+        object: "chat.completion",
+        created: 123,
+        choices: [{ index: 0, finish_reason: "tool_calls", message: { role: "assistant", content: "looking", tool_calls: [{ id: "call_9", type: "function", function: { name: "read", arguments: '{"p":1}' } }] } }],
+        usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 },
+      },
+      "big-pickle",
+    )
+    assert.equal(data.id, "resp_chatcmpl_1")
+    assert.equal(data.object, "response")
+    assert.equal(data.status, "completed")
+    assert.equal(data.model, "big-pickle")
+    assert.deepEqual(data.output, [
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "looking", annotations: [] }] },
+      { type: "function_call", id: "call_9", call_id: "call_9", name: "read", arguments: '{"p":1}' },
+    ])
+    assert.deepEqual(data.usage, { input_tokens: 2, output_tokens: 3, total_tokens: 5 })
   })
 })

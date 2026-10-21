@@ -896,6 +896,154 @@ function responsesToChat(data, requested, servedBy) {
   }
 }
 
+// Responses input -> chat.completions `messages`. A real Responses body
+// carries `input`, not `messages`: a string, or the item list the Responses
+// spec uses — message items (with input_text/input_image parts),
+// function_call items and their function_call_output results. Reasoning items
+// are skipped: they carry provider-side state no chat upstream can use, the
+// same way a chat caller re-sends the transcript without them.
+function responsesInputToMessages(input) {
+  if (typeof input === "string") return input ? [{ role: "user", content: input }] : []
+  if (!Array.isArray(input)) return input == null ? [] : [{ role: "user", content: textOf(input) }]
+  const messages = []
+  for (const item of input) {
+    if (item?.type === "message" || (item?.type == null && (item?.role ?? item?.content))) {
+      const role = item?.role ?? "user"
+      const content = item?.content
+      if (typeof content === "string") {
+        if (content) messages.push({ role, content })
+      } else if (Array.isArray(content)) {
+        const parts = []
+        for (const p of content) {
+          if (typeof p === "string") { if (p) parts.push({ type: "text", text: p }) }
+          else if ((p?.type === "input_text" || p?.type === "text") && p.text) parts.push({ type: "text", text: p.text })
+          else if (p?.type === "input_image" && (p.image_url ?? p.url)) parts.push({ type: "image_url", image_url: p.image_url ?? p.url })
+        }
+        if (parts.length) messages.push({ role, content: parts })
+      }
+      continue
+    }
+    if (item?.type === "function_call") {
+      messages.push({
+        role: "assistant",
+        content: "",
+        tool_calls: [
+          {
+            id: item?.call_id ?? item?.id ?? "call_0",
+            type: "function",
+            function: { name: item?.name ?? "unknown", arguments: typeof item?.arguments === "string" ? item.arguments : JSON.stringify(item.arguments ?? {}) },
+          },
+        ],
+      })
+      continue
+    }
+    if (item?.type === "function_call_output") {
+      messages.push({ role: "tool", tool_call_id: item?.call_id ?? item?.id ?? "call_0", content: item?.output ?? " " })
+      continue
+    }
+    // reasoning, error and anything else unknown has no chat counterpart to
+    // preserve; walk past it.
+  }
+  return messages.length ? messages : [{ role: "user", content: "" }]
+}
+
+// Responses input as an item array: a string becomes the user message the
+// real Responses API would have carried as an item. Used where a Responses
+// body reaches a responses-family upstream and its items must not pass through
+// a chat round-trip.
+function responsesInputItemArray(input) {
+  if (typeof input === "string") return input ? [{ type: "message", role: "user", content: input }] : []
+  if (Array.isArray(input)) return input
+  return input == null ? [] : [{ type: "message", role: "user", content: textOf(input) }]
+}
+
+// A Responses request body -> the chat-shaped body the request loop already
+// understands. Only the fields that have a chat counterpart travel;
+// `instructions` becomes the system message, Responses tools (flat) become
+// chat tools (nested), `max_output_tokens` maps onto both token keys.
+function responsesInputToChatBody(body) {
+  const chat = { model: body?.model }
+  const messages = responsesInputToMessages(body.input)
+  const sys = typeof body.instructions === "string" && body.instructions ? [{ role: "system", content: body.instructions }] : []
+  chat.messages = sys.length ? [...sys, ...messages] : messages
+  if (body.stream != null) chat.stream = !!body.stream
+  if (body.temperature != null) chat.temperature = body.temperature
+  if (body.top_p != null) chat.top_p = body.top_p
+  const mt = Number(body.max_output_tokens ?? body.max_tokens)
+  if (Number.isFinite(mt) && mt > 0) {
+    chat.max_tokens = Math.floor(mt)
+    chat.max_completion_tokens = Math.floor(mt)
+  }
+  if (body.parallel_tool_calls != null) chat.parallel_tool_calls = body.parallel_tool_calls
+  if (Array.isArray(body.tools) && body.tools.length) {
+    const tools = []
+    for (const t of body.tools) {
+      const name = t?.name ?? t?.function?.name
+      if (!name) continue
+      if (t?.type === "function" && t?.function) {
+        tools.push(t)
+        continue
+      }
+      tools.push({
+        type: "function",
+        function: { name, ...(t?.description ? { description: t.description } : {}), parameters: t?.parameters ?? { type: "object", properties: {} } },
+      })
+    }
+    if (tools.length) chat.tools = tools
+  }
+  const tc = body.tool_choice
+  if (typeof tc === "string") chat.tool_choice = tc
+  else if (tc && typeof tc === "object" && (tc.type === "function" || tc.name)) {
+    chat.tool_choice = { type: "function", function: { name: tc.function?.name ?? tc.name } }
+  }
+  return chat
+}
+
+// The inverse of responsesToChat: a collected chat.completion shaped back into
+// a Responses response object, for a Responses-shaped caller whose model lives
+// on /chat/completions.
+function chatToResponses(content, requested, servedBy) {
+  const msg = content?.choices?.[0]?.message ?? {}
+  const output = []
+  if (msg.reasoning_content) output.push({ type: "reasoning", summary: [{ text: msg.reasoning_content }] })
+  const text = typeof msg.content === "string" ? msg.content : textOf(msg.content)
+  if (text) output.push({ type: "message", role: "assistant", content: [{ type: "output_text", text, annotations: [] }] })
+  for (const tc of msg.tool_calls ?? []) {
+    output.push({
+      type: "function_call",
+      id: tc?.id ?? `fc_${randomBytes(8).toString("hex")}`,
+      call_id: tc?.id ?? "call_0",
+      name: tc?.function?.name ?? tc?.name ?? "unknown",
+      arguments: typeof tc?.function?.arguments === "string" ? tc.function.arguments : JSON.stringify(tc?.function?.arguments ?? {}),
+    })
+  }
+  const u = content?.usage ?? {}
+  return {
+    id: content?.id ? `resp_${content.id.replace(/^resp_/, "")}` : `resp_${randomBytes(12).toString("hex")}`,
+    object: "response",
+    created_at: content?.created ?? Math.floor(Date.now() / 1000),
+    status: "completed",
+    model: requested,
+    ...output.length ? { output } : { output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "", annotations: [] }] }] },
+    usage: {
+      input_tokens: u.prompt_tokens ?? 0,
+      output_tokens: u.completion_tokens ?? 0,
+      total_tokens: u.total_tokens ?? (u.prompt_tokens ?? 0) + (u.completion_tokens ?? 0),
+    },
+    ...(servedBy && servedBy !== requested ? { zen_served_by: servedBy } : {}),
+  }
+}
+
+// Filter the output items of a collected Responses object: bridge calls the
+// caller never offered are removed entirely, a pinned call keeps only its own
+// `name`. Everything that is not a function_call stays.
+function filterResponsesOutput(data, callOk = null) {
+  if (!data || !Array.isArray(data.output)) return data
+  const output = data.output.filter((item) => (item?.type === "function_call" ? callOk !== null && callOk(item) : true))
+  if (output.length !== data.output.length) data.output = output
+  return data
+}
+
 // Responses SSE event -> chat.completion.chunk deltas.
 function responsesEventToDeltas(event, data, state) {
   const type = event || data?.type || ""
@@ -1269,7 +1417,7 @@ async function handleMessages(req, res) {
   res.end(JSON.stringify(e.body))
 }
 
-async function handleChat(req, res) {
+async function handleChat(req, res, responsesRoute = false) {
   const start = Date.now()
   let body
   try {
@@ -1285,14 +1433,22 @@ async function handleChat(req, res) {
     return json(res, 400, { error: { type: "invalid_request_error", message: "invalid JSON body" } })
   }
 
-  const { requested, candidates } = resolveModel(body.model)
-  const isStream = !!body.stream
+  // A Responses body carries `input`, not `messages` — and only the /responses
+  // leg reads one. Translate it up front; the loop keeps thinking in chat, and
+  // exactly those requests get their reply back in Responses format. A
+  // chat-shaped body on the same leg keeps today's chat reply, and a
+  // chat-shaped body on the chat leg is unchanged.
+  const responsesRequestShape =
+    responsesRoute && body.messages === undefined && body.input !== undefined
+  const chatBody = responsesRequestShape ? responsesInputToChatBody(body) : body
+
+  const { requested, candidates } = resolveModel(chatBody.model)
+  const isStream = !!chatBody.stream
   const auth = authForUpstream(req)
   if (!auth) {
     recordReq(req, requested, Date.now() - start, 401)
     return json(res, 401, { error: { type: "invalid_request_error", message: "invalid proxy key" } })
   }
-
   let lastErr = null
   let lastStatus = 502
   let firstErr = null
@@ -1301,7 +1457,7 @@ async function handleChat(req, res) {
   // The model the client chose is tried first; transient failures are retried
   // against that same model before the chain moves on.
   const retries = config.retriesPerModel > 0 ? Math.floor(config.retriesPerModel) : 0
-  const bridge = body.tools?.length ? [] : gateBridgeTools()
+  const bridge = chatBody.tools?.length ? [] : gateBridgeTools()
   const bridged = bridge.length > 0
   // A caller that brings its own tools still needs the gate's `read` on the list.
   // Only the request changes — the pin is forwarded untouched, so the caller gets
@@ -1309,9 +1465,9 @@ async function handleChat(req, res) {
   // still answer with another tool, so a reply can carry a call the caller never
   // offered. That is why the tool riding along is a stub (see gateReadTool), and
   // why the reply is filtered down to the pinned call.
-  const gateRead = bridged ? null : gateReadFor(body)
-  const pin = bridged ? null : pinnedToolName(body.tool_choice)
-  const requestBody = gateRead ? { ...body, tools: [gateRead, ...body.tools] } : body
+  const gateRead = bridged ? null : gateReadFor(chatBody)
+  const pin = bridged ? null : pinnedToolName(chatBody.tool_choice)
+  const requestBody = gateRead ? { ...chatBody, tools: [gateRead, ...chatBody.tools] } : chatBody
   for (const model of candidates) {
     const chosen = model === candidates[0]
     used = model
@@ -1320,6 +1476,18 @@ async function handleChat(req, res) {
     // collectChatCompletion — and the collector puts the shape back.
     const payload =
       format === "responses" ? responsesRequest(requestBody, model, true) : { ...requestBody, model, stream: true }
+    // A Responses body that reaches a responses-family model keeps its input
+    // verbatim: the chat round-trip above preserves mostly everything, but
+    // content parts do not survive it losslessly — an input_image next to
+    // input_text comes back flattened to the text alone, measured. What a
+    // /responses caller sent is exactly what upstream wants, so it goes as-is,
+    // with `instructions` taking the system slot the translated flow gives it.
+    if (responsesRequestShape && format === "responses") {
+      payload.input =
+        typeof body.instructions === "string" && body.instructions
+          ? [{ type: "message", role: "system", content: body.instructions }, ...responsesInputItemArray(body.input)]
+          : responsesInputItemArray(body.input)
+    }
     if (bridged) {
       payload.tools = format === "responses" ? chatToolsToResponses(bridge) : bridge
       // The gateway takes only "auto" on /responses, so forwarding anything the
@@ -1356,7 +1524,13 @@ async function handleChat(req, res) {
             res.setHeader?.("x-zen-served-by", model)
             res.setHeader?.("x-zen-fallback", "true")
           }
-          if (format === "responses") {
+          // A Responses-shaped request gets a Responses-shaped stream, whichever
+          // endpoint family upstream actually served it on.
+          if (responsesRequestShape && format === "responses") {
+            relayResponsesPassthrough(req, res, upstreamRes, requested, bridged, pin)
+          } else if (responsesRequestShape) {
+            relayChatAsResponsesStream(req, res, upstreamRes, requested, bridged, pin)
+          } else if (format === "responses") {
             relayResponsesStream(req, res, upstreamRes, requested, bridged, pin)
           } else {
             relayStream(req, res, upstreamRes, requested, bridged, pin)
@@ -1373,6 +1547,17 @@ async function handleChat(req, res) {
               res.setHeader?.("x-zen-served-by", model)
               res.setHeader?.("x-zen-fallback", "true")
             }
+            // The reply answers in the dialect the request arrived in. A
+            // Responses request keeps the upstream object whole — a chat
+            // round-trip would rebuild it lossily — and only gets the model
+            // rewritten and the calls it cannot run dropped.
+            if (responsesRequestShape) {
+              content.model = requested
+              if (pin) filterResponsesOutput(content, (i) => i?.name === pin)
+              else if (bridged) filterResponsesOutput(content, null)
+              if (model !== requested) content.zen_served_by = model
+              return json(res, 200, content)
+            }
             return json(res, 200, stripUnpinnedCalls(stripToolCalls(responsesToChat(content, requested, model), bridged), pin))
           }
           if (model !== requested) {
@@ -1380,14 +1565,17 @@ async function handleChat(req, res) {
             res.setHeader?.("x-zen-served-by", model)
             res.setHeader?.("x-zen-fallback", "true")
           }
-          if (content && typeof content === "object") {
-            content.model = requested
-            if (model !== requested) content.zen_served_by = model
-            stripUnpinnedCalls(stripToolCalls(content, bridged), pin)
+          const shaped = stripUnpinnedCalls(stripToolCalls(content, bridged), pin)
+          if (responsesRequestShape) {
+            return json(res, 200, chatToResponses(shaped, requested, model))
+          }
+          if (shaped && typeof shaped === "object") {
+            shaped.model = requested
+            if (model !== requested) shaped.zen_served_by = model
           }
           recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
           recordObserved(model, true)
-          return json(res, 200, content)
+          return json(res, 200, shaped)
         } catch {
           recordReq(req, requested, Date.now() - start, 502)
           return json(res, 502, { error: { type: "upstream_error", message: "bad upstream response" } })
@@ -2066,6 +2254,244 @@ function relayResponsesStream(req, res, upstreamRes, requested, strip = false, p
   return pump()
 }
 
+// chat.completions SSE -> Responses SSE, for a Responses-shaped caller whose
+// model lives on /chat/completions. Event dialect mirrors what the upstream
+// gateway itself emits for native /responses traffic, emitted live — the
+// callers here are agents, and buffering the stream would throw the latency
+// away.
+function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = false, pin = null) {
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+  })
+  const id = `resp_${randomBytes(12).toString("hex")}`
+  const created = Math.floor(Date.now() / 1000)
+  const evt = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`)
+  evt("response.created", { response: { id, object: "response", created_at: created, status: "in_progress", model: requested, output: [] } })
+
+  // Output items are created lazily at their first delta, so a reply with no
+  // text or no calls produces no empty items. Reasoning deltas are delivered
+  // as reasoning_text events live, without item framing of their own — the
+  // same as the upstream relay emits them.
+  const items = []
+  const st = {
+    message: null, // { index, text } — opened at the first content delta
+    calls: new Map(), // chat index -> { index, id, callId, name, args }
+    usage: null,
+    dropped: new Set(), // pinned-filter: chat indices that name a stray call
+  }
+
+  const pump = async () => {
+    try {
+      for await (const chunk of sseChunks(upstreamRes)) {
+        let raw = ""
+        for (const line of chunk.split("\n")) if (line.startsWith("data:")) raw = line.slice(5).trim()
+        if (!raw || raw === "[DONE]") continue
+        let d
+        try {
+          d = JSON.parse(raw)
+        } catch {
+          continue
+        }
+        if (d?.error) throw new Error(d.error.message ?? "upstream stream error")
+        if (d?.usage) st.usage = d.usage
+        const choice = d?.choices?.[0]
+        if (!choice) continue
+        const delta = choice.delta ?? {}
+        if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
+          evt("response.reasoning_text.delta", { delta: delta.reasoning_content })
+        }
+        if (typeof delta.content === "string" && delta.content) {
+          if (!st.message) {
+            const index = items.length
+            const item = { type: "message", role: "assistant", content: [] }
+            items.push(item)
+            st.message = { index, text: "" }
+            evt("response.output_item.added", { output_index: index, item: { ...item, status: "in_progress" } })
+            evt("response.content_part.added", { output_index: index, content_index: 0, part: { type: "output_text", text: "", annotations: [] } })
+          }
+          st.message.text += delta.content
+          evt("response.output_text.delta", { output_index: st.message.index, content_index: 0, delta: delta.content })
+        }
+        // Responses replies put tool calls after the message as sibling output
+        // items, not interleaved into the message's content parts — so each
+        // call opens its own item the first time its (renumbered) chunk shows.
+        for (const tc of strip ? [] : delta.tool_calls ?? []) {
+          const tIndex = tc.index ?? 0
+          // Same per-index contract the other relays carry: the name names the
+          // call once, argument chunks follow under the same index nameless.
+          if (tc.function?.name) {
+            if (pin && tc.function.name !== pin) {
+              st.dropped.add(tIndex)
+              continue
+            }
+          } else if (st.dropped.has(tIndex)) {
+            continue
+          }
+          if (!st.calls.has(tIndex)) {
+            const index = items.length
+            const item = { type: "function_call", id: `fc_${randomBytes(8).toString("hex")}`, call_id: tc.id ?? `call_${index}`, name: tc.function?.name ?? "unknown", arguments: "" }
+            const entry = { index, item, args: "" }
+            st.calls.set(tIndex, entry)
+            items.push(item)
+            evt("response.output_item.added", { output_index: index, item: { ...item, status: "in_progress" } })
+          }
+          const entry = st.calls.get(tIndex)
+          if (tc.function?.arguments) {
+            entry.args += tc.function.arguments
+            evt("response.function_call_arguments.delta", { item_id: entry.item.id, output_index: entry.index, delta: tc.function.arguments })
+          }
+        }
+      }
+      // Stream complete: close what was opened in output order, then completed.
+      const output = items.map((item) => {
+        if (item.type === "message") {
+          item.id = `msg_${id}`
+          item.status = "completed"
+          item.content = [{ type: "output_text", text: st.message?.text ?? "", annotations: [] }]
+        }
+        if (item.type === "function_call") {
+          const entry = [...st.calls.values()].find((e) => e.item === item)
+          item.status = "completed"
+          item.arguments = entry?.args ?? item.arguments
+        }
+        return item
+      })
+      if (st.message) evt("response.output_text.done", { output_index: st.message.index, content_index: 0, text: st.message.text })
+      for (const entry of st.calls.values()) {
+        evt("response.function_call_arguments.done", { item_id: entry.id, output_index: entry.index, arguments: entry.args })
+      }
+      items.forEach((item, i) => {
+        evt("response.output_item.done", { output_index: i, item })
+      })
+      evt("response.completed", {
+        response: {
+          id,
+          object: "response",
+          created_at: created,
+          status: "completed",
+          model: requested,
+          output,
+          usage: {
+            input_tokens: st.usage?.prompt_tokens ?? 0,
+            output_tokens: st.usage?.completion_tokens ?? 0,
+            total_tokens: st.usage?.total_tokens ?? (st.usage?.prompt_tokens ?? 0) + (st.usage?.completion_tokens ?? 0),
+          },
+        },
+      })
+      res.end()
+    } catch {
+      res.end()
+    }
+  }
+  return pump()
+}
+
+// Responses SSE -> client, for a Responses-shaped caller whose model is a
+// native /responses one: upstream already speaks the same dialect, so this is
+// a passthrough that rewrites the model and drops calls the caller cannot run
+// (the bridge manifest's, and everything but the pinned one).
+function relayResponsesPassthrough(req, res, upstreamRes, requested, strip = false, pin = null) {
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+  })
+  const dropped = new Set()
+  const allowed = new Set()
+  // One decision rule for every shape a call can arrive in: the added item
+  // carries the name, the later chunks reference it by id.
+  const decide = (item) => {
+    const callId = item?.item_id ?? item?.call_id ?? item?.id
+    const name = item?.name
+    if (name) {
+      if (strip) {
+        dropped.add(callId)
+        return false
+      }
+      if (pin && name !== pin) {
+        dropped.add(callId)
+        return false
+      }
+      allowed.add(callId)
+      return true
+    }
+    if (allowed.has(callId)) return true
+    if (dropped.has(callId)) return false
+    return !(pin || strip)
+  }
+  const reader = upstreamRes.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  const ctrl = new AbortController()
+  const onAbort = () => ctrl.abort()
+  if (req.signal?.addEventListener) req.signal.addEventListener("abort", onAbort)
+  const timer = setTimeout(() => ctrl.abort(), config.timeoutMs)
+  ctrl.signal.addEventListener("abort", () => {
+    reader.cancel().catch(() => {})
+  })
+  const cleanup = () => {
+    clearTimeout(timer)
+    if (req.signal?.removeEventListener) req.signal.removeEventListener("abort", onAbort)
+  }
+  const parseBlock = (block) => {
+    let event = ""
+    let raw = ""
+    for (const line of block.split("\n")) {
+      if (line.startsWith("event:")) event = line.slice(6).trim()
+      else if (line.startsWith("data:")) raw = line.slice(5).trim()
+    }
+    if (!raw || raw === "[DONE]") return null
+    try {
+      return JSON.parse(raw)
+    } catch {
+      return null
+    }
+  }
+  const pump = async () => {
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        let idx
+        while ((idx = buffer.indexOf("\n\n")) !== -1) {
+          const block = buffer.slice(0, idx)
+          buffer = buffer.slice(idx + 2)
+          if (!block.trim()) continue
+          const data = parseBlock(block)
+          if (!data) continue
+          if (data?.response?.model && typeof data.response.model === "string") data.response.model = requested
+          const type = data?.type ?? ""
+          if (type === "response.output_item.added" || type === "response.output_item.done") {
+            if (data.item?.type === "function_call" && !decide(data.item)) continue
+          } else if (type.startsWith("response.function_call_arguments")) {
+            const callId = data.item_id ?? data.call_id
+            if (strip || dropped.has(callId)) continue
+          } else if ((type === "response.completed" || type === "response.incomplete") && Array.isArray(data.response?.output)) {
+            data.response.output = data.response.output.filter((item) => (item?.type === "function_call" ? decide(item) : true))
+          }
+          res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`)
+        }
+      }
+      if (buffer.trim()) {
+        const data = parseBlock(buffer)
+        if (data) {
+          if (data?.response?.model && typeof data.response.model === "string") data.response.model = requested
+          res.write(`event: ${data?.type ?? ""}\ndata: ${JSON.stringify(data)}\n\n`)
+        }
+      }
+      res.end()
+    } catch {
+      res.end()
+    } finally {
+      cleanup()
+    }
+  }
+  return pump()
+}
+
 function rewriteSSE(block, requested, strip = false, pinState = null) {
   if (!block.trim()) return null
   const lines = block.split("\n")
@@ -2625,8 +3051,7 @@ async function router(req, res) {
   if (req.method === "GET" && (p === "/v1/models" || p === "/models")) return handleModels(req, res)
   const isInference = p === "/v1/chat/completions" || p === "/chat/completions" || p === "/v1/responses" || p === "/responses"
   const isMessages = p === "/v1/messages" || p === "/messages"
-  if (req.method === "POST" && (isInference || isMessages)) {
-    // Throttle only the inference endpoints — the dashboard, /health and the
+  if (req.method === "POST" && (isInference || isMessages)) {    // Throttle only the inference endpoints — the dashboard, /health and the
     // admin API must never be locked out by a client's burst.
     const rl = rateLimitFor(req)
     if (rl.limited) {
@@ -2639,7 +3064,7 @@ async function router(req, res) {
         ),
       )
     }
-    return isMessages ? handleMessages(req, res) : handleChat(req, res)
+    return isMessages ? handleMessages(req, res) : handleChat(req, res, p === "/v1/responses" || p === "/responses")
   }
   if (req.method === "POST" && (p === "/v1/messages/count_tokens" || p === "/messages/count_tokens")) {
     return handleCountTokens(req, res)
@@ -2720,6 +3145,9 @@ export {
   usageToChat,
   chatMessagesToInput,
   chatToolsToResponses,
+  responsesInputToMessages,
+  responsesInputToChatBody,
+  chatToResponses,
   rateLimitFor,
   probeAuthHeader,
   authForUpstream,

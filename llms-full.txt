@@ -156,6 +156,12 @@ If `zen-claude` reports `command not found`, check the symlink exists before bla
 
 The free tier accepts an Anthropic request only when it also carries opencode's own tool manifest. Claude Code's system prompt is passed through untouched — it is never edited or replaced — but the proxy attaches opencode's built-in tools next to the caller's, limited to those the caller has a counterpart for, and renames resulting calls (`read`→`Read`, `filePath`→`file_path`, …) so the caller runs the tool it knows. Disable with `agentTools: false`.
 
+The same gate applies to callers that bring **only their own tools** and pin one with `tool_choice` (`{"type":"tool","name":…}`): the gate wants a tool literally named `read`, and a helper like `set_title` matches nothing, so the proxy adds a stub `read` riding along whenever a pinned request's list lacks one — and a pinned reply is filtered back down to the pinned call, streaming included (a stray call's argument chunks are dropped with it, because a call's name arrives chunks apart from its arguments). When every call got filtered away the reply ends `end_turn`/`stop` instead of claiming a tool call that does not exist. Unpinned replies are never filtered.
+
+## Responses API
+
+`POST /v1/responses` reads either dialect, decided by the body, and answers in the same one: a body that speaks Responses (`input`, flat tools, `tool_choice: {"type":"function","name":…}`, `max_output_tokens`, optional `instructions`) is translated — on chat-family models via chat completions, and reply items are rebuilt in Responses shape (`message` items with `output_text`, `function_call` items, `reasoning`); a chat-shaped `messages` body is answered with a `chat.completion` as before. Streaming emits the gateway's own Responses SSE (`response.created` → `output_item.added` / `output_text.delta` / `function_call_arguments.delta` → `response.completed`, no `[DONE]`); on responses-family models the upstream stream passes through with the model id rewritten. The free-tier bridge and pinned-call rules apply here identically: a tool-less body gets opencode's manifest and every manifest call is stripped from the reply, and a pinned request keeps only the pinned call. Reasoning items in the request are skipped (their provider state has no chat counterpart).
+
 ## configuration
 
 Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded when edited — the dashboard writes it too). Env vars can override at startup.
@@ -196,7 +202,7 @@ Anonymous `public` access rides opencode's shared free pool (per-IP quota, somet
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/v1/chat/completions` | Chat completions (stream + non-stream) |
-| `POST` | `/v1/responses` | Responses passthrough |
+| `POST` | `/v1/responses` | Responses API in either dialect — Responses bodies on the route get Responses replies, chat bodies keep chat replies; bridge and pinned filters apply |
 | `GET` | `/v1/models` | Allowed models (cached) |
 | `GET` | `/health` | Health check |
 | `GET` | `/` | Dashboard |
