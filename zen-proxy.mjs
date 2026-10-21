@@ -187,12 +187,13 @@ function gateReadTool() {
 // riding along is a stub the model has no reason to pick, and not opencode's
 // `read`.
 //
-// It still cannot be ruled out. A pinned reply can carry a call the caller
-// never offered, and nothing strips it: `stripToolCalls` only runs for the
-// tool-less bridge, where the caller offered no tool at all. Closing that hole
-// needs a strip in the reply path that keeps the pinned call and drops the
-// rest — a separate change, because the streaming path has no state to tell
-// one call's chunks from another's.
+// The same hole sat open on the Anthropic route: `/v1/messages` callers bring
+// their tools in Anthropic shape, `agentToolsFor()` matches nothing there (a
+// caller whose only tool is a helper like `set_title` has no `Read` to map to),
+// and the reply path would have handed a stray call over under a renamed name.
+// So `anthropicToChatBody()` applies the same rule — pin ⇒ stub rides along —
+// and the pinned reply is filtered both ways: `chatToAnthropic()` keeps only
+// the pinned call, and `relayAnthropicStream()` does the same live.
 function pinnedToolName(toolChoice) {
   if (!toolChoice || typeof toolChoice !== "object") return null
   const fn = toolChoice.function ?? toolChoice
@@ -658,7 +659,15 @@ function anthropicToChatBody(body, model) {
   // rejects the request outright; the caller's prompt and tools are untouched and
   // still take priority in the reply.
   const bridge = agentToolsFor((body?.tools ?? []).map((t) => t?.name))
-  const all = bridge.length ? [...bridge, ...(tools ?? [])] : tools
+  let all = bridge.length ? [...bridge, ...(tools ?? [])] : tools
+  // A pinned caller whose tools match nothing (a helper like `set_title`) would
+  // still be refused: the gate wants a tool named `read` and only looks at
+  // names. Same rule as the OpenAI-shaped routes — the pin is what makes adding
+  // one safe — so the stub rides along by name, no matter what shape the
+  // caller's tools arrive in. (Off in agentTools: false, everywhere.)
+  if (config.agentTools && pinnedToolName(body?.tool_choice) && !(all ?? []).some((t) => (t?.function?.name ?? t?.name) === "read")) {
+    all = [gateReadTool(), ...(all ?? [])]
+  }
   if (all?.length) payload.tools = all
   // Anthropic's tool_choice and opencode's use the same vocabulary once renamed.
   if (typeof body?.tool_choice === "object" && body.tool_choice?.type === "tool") {
@@ -682,7 +691,7 @@ function parseToolArgs(args) {
 
 const STOP_REASON = { stop: "end_turn", length: "max_tokens", tool_calls: "tool_use", function_call: "tool_use", content_filter: "end_turn" }
 
-function chatToAnthropic(content, requested, servedBy) {
+function chatToAnthropic(content, requested, servedBy, pin = null) {
   const msg = content?.choices?.[0]?.message ?? {}
   const blocks = []
   if (msg.reasoning_content) blocks.push({ type: "thinking", thinking: msg.reasoning_content, signature: "" })
@@ -692,22 +701,30 @@ function chatToAnthropic(content, requested, servedBy) {
     // A call to an opencode bridge tool comes back under opencode's name; give
     // the caller back the tool it actually offered.
     const mapped = remapAgentTool(tc?.function?.name ?? tc?.name, tc?.function?.arguments ?? tc?.arguments)
+    const name = mapped ? mapped.name : (tc?.function?.name ?? tc?.name ?? "unknown")
+    // The pin is not enforcement: the provider may answer a pinned request with
+    // a call the caller never offered (the injected stub `read` included). A
+    // pinned reply keeps the pinned call and nothing else.
+    if (pin && name !== pin) continue
     blocks.push({
       type: "tool_use",
       id: tc?.id ?? `toolu_${randomBytes(8).toString("hex")}`,
-      name: mapped ? mapped.name : (tc?.function?.name ?? tc?.name ?? "unknown"),
+      name,
       input: parseToolArgs(mapped ? mapped.args : (tc?.function?.arguments ?? tc?.arguments)),
     })
   }
   if (!blocks.length) blocks.push({ type: "text", text: "" })
   const u = content?.usage ?? {}
+  // Every call got filtered away and the model still claimed `tool_calls`: the
+  // message has no call left to answer, so it cannot end as tool_use.
+  const stop = STOP_REASON[content?.choices?.[0]?.finish_reason] ?? "end_turn"
   return {
     id: content?.id ?? `msg_${randomBytes(12).toString("hex")}`,
     type: "message",
     role: "assistant",
     model: requested,
     content: blocks,
-    stop_reason: STOP_REASON[content?.choices?.[0]?.finish_reason] ?? "end_turn",
+    stop_reason: stop === "tool_use" && !blocks.some((b) => b.type === "tool_use") ? "end_turn" : stop,
     stop_sequence: null,
     usage: { input_tokens: u.prompt_tokens ?? 0, output_tokens: u.completion_tokens ?? 0 },
     ...(servedBy && servedBy !== requested ? { zen_served_by: servedBy } : {}),
@@ -1135,6 +1152,10 @@ async function handleMessages(req, res) {
   // the gate answers 403 for every model and the request walks the chain.
   const bridge = (body?.tools ?? []).length ? [] : gateBridgeTools()
   const bridged = bridge.length > 0
+  // A caller that pins a tool gets a reply that carries only that call: the
+  // provider ignores the pin sometimes, and a stray call (the gate stub's
+  // `read` included) is a tool the caller cannot run.
+  const pin = bridged ? null : pinnedToolName(body.tool_choice)
   for (const model of candidates) {
     const chosen = model === candidates[0]
     used = model
@@ -1181,7 +1202,7 @@ async function handleMessages(req, res) {
       if (upstreamRes.ok) {
         if (isStream) {
           const chunks = format === "responses" ? responsesChunksAsChat(upstreamRes) : sseChunks(upstreamRes)
-          relayAnthropicStream(req, res, chunks, requested, model, bridged)
+          relayAnthropicStream(req, res, chunks, requested, model, bridged, pin)
           res.on("finish", () => {
             recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
             recordObserved(model, true)
@@ -1197,7 +1218,7 @@ async function handleMessages(req, res) {
             res.setHeader?.("x-zen-served-by", model)
             res.setHeader?.("x-zen-fallback", "true")
           }
-          return json(res, 200, chatToAnthropic(shaped, requested, model))
+          return json(res, 200, chatToAnthropic(shaped, requested, model, pin))
         } catch {
           recordReq(req, requested, Date.now() - start, 502)
           return json(res, 502, anthropicError(502, { error: { type: "api_error", message: "bad upstream response" } }).body)
@@ -1565,7 +1586,7 @@ async function* responsesChunksAsChat(upstreamRes) {
 // then message_delta carrying stop_reason and usage, then message_stop. Tool
 // arguments arrive as input_json_delta, so they are buffered until the block ends
 // rather than being re-parsed per chunk.
-function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = false) {
+function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = false, pin = null) {
   res.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
@@ -1577,7 +1598,7 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
   const id = `msg_${randomBytes(12).toString("hex")}`
   const emit = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`)
 
-  const st = { textOpen: false, thinkOpen: false, toolIndex: 0, blocks: new Map(), finish: "stop", usage: null }
+  const st = { textOpen: false, thinkOpen: false, toolIndex: 0, blocks: new Map(), finish: "stop", usage: null, dropped: new Set(), kept: false, nextBlock: 1 }
   emit("message_start", {
     message: {
       id,
@@ -1653,18 +1674,36 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
               closeThink()
               closeText()
               const tIndex = tc.index ?? 0
+              // A call's name arrives in its first chunk; argument chunks for it
+              // follow under the same index with `name: null`. So the keep/drop
+              // decision is made at the name chunk and remembered per index —
+              // otherwise a strip would leak the dropped call's arguments.
+              if (tc.function?.name) {
+                const mapped = remapAgentTool(tc.function.name, "{}")
+                const resolved = mapped ? mapped.name : tc.function.name
+                if (pin && resolved !== pin) {
+                  st.dropped.add(tIndex)
+                  continue
+                }
+                if (pin) st.kept = true
+              } else if (st.dropped.has(tIndex)) {
+                continue
+              }
+              // Renumbered blocks only when filtering — the plain path keeps the
+              // upstream index so a caller never sees a numbering change.
+              const blockIndex = st.blocks.has(tIndex) ? st.blocks.get(tIndex).index : pin ? st.nextBlock++ : tIndex + 1
               if (!st.blocks.has(tIndex)) {
                 const rawName = tc.function?.name ?? "unknown"
                 const mapped = remapAgentTool(rawName, "{}")
                 st.blocks.set(tIndex, {
-                  index: tIndex + 1,
+                  index: blockIndex,
                   id: tc.id ?? `toolu_${randomBytes(8).toString("hex")}`,
                   raw: rawName,
                   name: mapped ? mapped.name : rawName,
                   args: "",
                 })
                 emit("content_block_start", {
-                  index: tIndex + 1,
+                  index: blockIndex,
                   content_block: { type: "tool_use", id: st.blocks.get(tIndex).id, name: st.blocks.get(tIndex).name, input: {} },
                 })
               }
@@ -1684,8 +1723,11 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
         emit("content_block_stop", { index: t.index })
       }
       const u = st.usage ?? {}
+      // The model claimed a tool call but every call got filtered away: the
+      // message ends without one, so it cannot claim tool_use.
+      const finish = pin && st.finish === "tool_calls" && !st.kept ? "stop" : st.finish
       emit("message_delta", {
-        delta: { stop_reason: STOP_REASON[st.finish] ?? "end_turn", stop_sequence: null },
+        delta: { stop_reason: STOP_REASON[finish] ?? "end_turn", stop_sequence: null },
         usage: { input_tokens: u.prompt_tokens ?? 0, output_tokens: u.completion_tokens ?? 0 },
       })
       emit("message_stop", {})
