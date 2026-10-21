@@ -118,6 +118,10 @@ zen-proxy sits in front of that gateway and identifies your agent as a real sess
 For `/v1/messages` specifically, the gateway also requires OpenCode's own tool manifest, so zen-proxy attaches those tools alongside Claude Code's and renames the resulting calls back. **Claude Code's system prompt is passed through untouched.**
 
 The OpenAI-shaped routes get no name mapping, so they are handled differently: a request carrying **no tools at all** — an agent's own internal call, like summarization or title generation — is given OpenCode's own tool manifest so it passes the gate, exactly as opencode sends it on every call. The gateway does not honour `tool_choice: "none"` — it answers a plain summarization prompt with real `read` calls — so any tool call is stripped from the reply instead, on both OpenAI-shaped routes.
+
+A request that brings **its own tools** and pins one of them with `tool_choice` — a forced-tool helper, like a title or label call — needs the same `read` in the list, or the gateway refuses the whole request. The proxy adds a **stub** named `read` for exactly those calls: the gate looks at the tool's name and nothing else, and the pin is what makes it safe to add one, because a caller that pins a function cannot be asked for anything else. Your tool list and your pin are forwarded untouched.
+
+The pin is not enforcement, though — the gateway hands it to the provider, and the provider may still answer with a call you never offered. The stub is deliberately a stub for that reason: OpenCode's own `read` schema invites the model to call it, and a pinned helper that comes back with a stray `read` is a tool your client cannot run.
 </details>
 
 <details>
