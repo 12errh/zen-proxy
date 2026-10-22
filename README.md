@@ -235,12 +235,12 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc      # permanent
 ```
 </details>
 
-*The demo video up top was built using the [brag](https://hyperframes.dev) skill.*
-
 ---
 
 <p align="center">
   <sub>💬 <a href="https://discord.gg/Dw5Ctrtuw">Join the Discord</a> — install help, troubleshooting, and which free model is fast right now.</sub>
+  <br />
+  <sub>The demo video up top was built using the brag skill.</sub>
 </p>
 
 <p align="center">
