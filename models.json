@@ -1,11 +1,10 @@
 {
-  "updatedAt": "2026-10-21T21:42:26.053Z",
+  "updatedAt": "2026-10-22T04:44:09.441Z",
   "upstream": "https://opencode.ai/inference/v1",
   "models": [
     "mimo-v2.6-flash-free",
     "big-pickle",
     "nemotron-3.5-lightning-free",
-    "longcat-2.5-preview-free",
     "deepseek-v4.1-flash-free",
     "nemotron-3.5-super-vl-free",
     "glm-5.3-flash-free",
