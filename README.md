@@ -21,6 +21,15 @@
   </a>
 </p>
 
+<p align="center">
+  <img src="assets/brag-demo.gif" alt="zen-proxy in 25 seconds: install → run the proxy → zen-claude → point any OpenAI-compatible agent at it" width="860" />
+  <br />
+  <sub>
+    The full walkthrough with sound: <a href="assets/brag-demo.mp4">assets/brag-demo.mp4</a>
+    &nbsp;·&nbsp; rendered with <a href="https://hyperframes.dev">HyperFrames</a> /brag
+  </sub>
+</p>
+
 ---
 
 ## Start here
@@ -226,6 +235,14 @@ export PATH="$HOME/.local/bin:$PATH"                          # this terminal
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc      # permanent
 ```
 </details>
+
+## Credits
+
+Thanks to the tools behind the demo up top:
+
+- **[HyperFrames](https://hyperframes.dev)** and its **/brag** skill — HTML rendered to video, frame by frame; the GIF, MP4 and poster above came out of one render. Framey says hi. 🎬
+- **[ende.app](https://ende.app/en)** — *Happy Beats / Business Moves*, the music bed.
+- **[Kenney.nl](https://kenney.nl)** — CC0 interface and impact sounds.
 
 ---
 
