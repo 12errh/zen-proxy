@@ -7,6 +7,7 @@ import path from "node:path"
 import { execFile, execFileSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { promisify } from "node:util"
+import { createHash } from "node:crypto"
 
 // Must be set before importing the module (CONFIG_PATH is computed at load).
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "zen-proxy-test-"))
@@ -341,6 +342,76 @@ describe("session injection", () => {
     const h = zp.zenHeaders(mockReq({ headers: { "x-opencode-session": "ses_fromclient01" } }), "Bearer public")
     assert.equal(h["x-opencode-session"], "ses_fromclient01")
     assert.equal(h["x-opencode-session-id"], "ses_fromclient01")
+  })
+})
+
+describe("identityFor", () => {
+  // Fixed wall clock well before real Date.now() so explicit-`now` mints in
+  // these tests cannot collide with the pool entries other tests mint at real
+  // time, and the stamp inside genSessionId stays a plausible past timestamp.
+  const T0 = 1_900_000_000_000
+
+  test("an identity pair is minted together per caller bucket", () => {
+    const ua = { "user-agent": "my-agent/1.2 X-Lib/9" }
+    const first = zp.identityFor(mockReq({ remoteAddress: "3.3.3.3", headers: ua }), T0)
+    const repeat = zp.identityFor(mockReq({ remoteAddress: "3.3.3.3", headers: ua }), T0 + 60_000)
+    assert.equal(first.session, repeat.session, "same bucket → same session inside the TTL")
+    assert.equal(first.project, repeat.project, "same bucket → same project inside the TTL")
+    assert.match(first.project, /^[0-9a-f]{40}$/, "project is a 40-hex, CLI-shaped hash")
+    assert.ok(first.injected, "a minted pair is flagged injected")
+  })
+
+  test("different agents on one machine split; version bumps do not", () => {
+    const sess = (ua) => zp.identityFor(mockReq({ remoteAddress: "3.4.4.4", headers: { "user-agent": ua } }), T0)
+    const one = sess("opencode/1.2.0 zen-bridge")
+    const bumped = sess("opencode/1.12.99 zen-bridge")
+    assert.equal(one.session, bumped.session, "UA versions normalize away")
+    assert.equal(one.project, bumped.project, "same caller keeps its whole pair across releases")
+    const stranger = sess("curl-tests/4.0")
+    assert.notEqual(stranger.session, one.session, "another agent family is another caller")
+    assert.notEqual(stranger.project, one.project)
+  })
+
+  test("after the TTL both halves rotate together", () => {
+    const req = mockReq({ remoteAddress: "5.5.6.6", headers: { "user-agent": "ttl-check/1" } })
+    const first = zp.identityFor(req, T0)
+    const later = zp.identityFor(req, T0 + zp.SESSION_MAX_AGE_MS + 1)
+    assert.ok(later.injected)
+    assert.notEqual(later.session, first.session, "session rotates at the TTL")
+    assert.notEqual(later.project, first.project, "project rotates with it — one pair, one client story")
+  })
+
+  test("a caller-supplied session passes through untouched, project follows policy", () => {
+    const id = zp.identityFor(mockReq({ headers: { "x-opencode-session": "ses_caller000001" } }))
+    assert.equal(id.session, "ses_caller000001")
+    assert.ok(!id.injected, "caller's own session is not flagged injected")
+    const staticHash = createHash("sha1").update(`directory:${process.cwd()}`).digest("hex")
+    assert.equal(id.project, staticHash, "legacy project derivation stands in for a real client")
+    const pinned = zp.identityFor(mockReq({ headers: { "x-opencode-session": "ses_caller000002", "x-opencode-project": "p_caller" } }))
+    assert.equal(pinned.project, "p_caller", "a caller that carries its own project keeps it")
+  })
+
+  test("config.projectHash pins the project while the session rotates", () => {
+    zp.saveConfig({ projectHash: "f".repeat(40) })
+    const req = mockReq({ remoteAddress: "7.7.8.8", headers: { "user-agent": "pin-check/1" } })
+    const first = zp.identityFor(req, T0)
+    assert.equal(first.project, "f".repeat(40))
+    const later = zp.identityFor(req, T0 + zp.SESSION_MAX_AGE_MS + 1)
+    assert.notEqual(later.session, first.session, "session still rotates on schedule")
+    assert.equal(later.project, "f".repeat(40), "the configured pin holds across rotations")
+  })
+
+  test("zenHeaders sends the minted session and project as one pair", () => {
+    zp.saveConfig({ projectHash: "" })
+    const req = mockReq({ remoteAddress: "9.10.10.10", headers: { "user-agent": "zen-headers/1" } })
+    const h = zp.zenHeaders(req, "Bearer public")
+    const id = zp.identityFor(req, Date.now())
+    assert.equal(h["x-opencode-session"], id.session)
+    assert.equal(h["x-opencode-project"], id.project, "the pair travels as one identity, not a lone static hash")
+    const caller = mockReq({ headers: { "x-opencode-session": "ses_caller000003", "x-opencode-project": "proj_caller" } })
+    const hc = zp.zenHeaders(caller, "Bearer public")
+    assert.equal(hc["x-opencode-session"], "ses_caller000003")
+    assert.equal(hc["x-opencode-project"], "proj_caller", "a caller's full pair is forwarded verbatim")
   })
 })
 

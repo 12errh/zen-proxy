@@ -497,7 +497,6 @@ const SESSION_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqr
 // A session stays valid as long as its embedded timestamp is recent. Re-mint on a
 // schedule so a proxy left running for days does not start failing on a stale ID.
 const SESSION_MAX_AGE_MS = 30 * 60_000
-const sessionPool = new Map()
 let sessionClock = { ms: 0, ctr: 0 }
 function genSessionId(now = Date.now()) {
   if (now !== sessionClock.ms) {
@@ -512,19 +511,78 @@ function genSessionId(now = Date.now()) {
   return { value: "ses_" + hex + tail, at: now }
 }
 function sessionFor(req) {
-  const incoming = req?.headers?.["x-opencode-session"]
-  if (typeof incoming === "string" && incoming.trim()) return { value: incoming.trim(), injected: false }
-  const key = req ? (ipOmit(clientIp(req)) ? "local" : clientIp(req)) : "server"
-  let hit = sessionPool.get(key)
-  if (!hit || Date.now() - hit.at > SESSION_MAX_AGE_MS) {
-    hit = genSessionId()
-    sessionPool.set(key, hit)
+  const identity = identityFor(req)
+  return { value: identity.session, injected: identity.injected }
+}
+// One identity pair per caller bucket, minted together and rotated together:
+// a session id and its project hash describe the same "one CLI conversation in
+// one project directory" to upstream, so they must never be split across
+// mints. Runtimes differ here only in what the caller already carries: a
+// caller-supplied session (a real OpenCode client riding the proxy) is passed
+// through untouched, and a configured `projectHash` pins the project half
+// while sessions keep rotating on the usual schedule.
+const IDENTITY_POOL_MAX = 2000
+function identityBucketKey(req) {
+  const ip = req ? (ipOmit(clientIp(req)) ? "local" : clientIp(req)) : "server"
+  return `${ip}\n${uaFingerprint(req)}`
+}
+// The caller's user-agent reduces to a stable family: versions change with
+// every CLI release (and must not fragment an identity), but two different
+// agents on one machine still land in different buckets.
+function uaFingerprint(req) {
+  const ua = String(req?.headers?.["user-agent"] ?? "").trim().toLowerCase()
+  if (!ua) return "anon"
+  return `${ua.replace(/v?\d[\w.+-]*/g, "v").replace(/\s+/g, " ").slice(0, 80)}`
+}
+// The project half mirrors the CLI derivation for a one-off workspace:
+// sha1("directory:<path>") with an unpredictable path, so the value is
+// indistinguishable on the wire from a real client's stale project hash.
+function genProjectHash() {
+  return createHash("sha1").update(`directory:${randomBytes(18).toString("hex")}`).digest("hex")
+}
+const identityPool = new Map()
+function mintedIdentity(req, now) {
+  const key = identityBucketKey(req)
+  const hit = identityPool.get(key)
+  if (hit && now - hit.at < SESSION_MAX_AGE_MS) return hit
+  const fresh = { ...genSessionId(now), project: genProjectHash() }
+  identityPool.set(key, fresh)
+  while (identityPool.size > IDENTITY_POOL_MAX) {
+    let oldest = null
+    let oldestAt = Infinity
+    for (const [k, v] of identityPool) {
+      if (v.at < oldestAt) {
+        oldest = k
+        oldestAt = v.at
+      }
+    }
+    if (oldest == null) break
+    identityPool.delete(oldest)
   }
-  return { value: hit.value, injected: true }
+  return fresh
+}
+function identityFor(req, now = Date.now()) {
+  const incoming = req?.headers?.["x-opencode-session"]
+  if (typeof incoming === "string" && incoming.trim()) {
+    const callerProject = req?.headers?.["x-opencode-project"]
+    return {
+      session: incoming.trim(),
+      injected: false,
+      project:
+        typeof callerProject === "string" && callerProject.trim()
+          ? callerProject.trim()
+          : config.projectHash || projectHash(),
+    }
+  }
+  if (config.projectHash) {
+    return { session: mintedIdentity(req, now).value, injected: true, project: config.projectHash }
+  }
+  const minted = mintedIdentity(req, now)
+  return { session: minted.value, injected: true, project: minted.project }
 }
 function sessionHeader(req) {
   if (!config.injectSession) return undefined
-  return sessionFor(req).value
+  return identityFor(req).session
 }
 
 function parseRetryAfter(v) {
@@ -1261,18 +1319,20 @@ function zenHeaders(req, auth) {
     authorization: auth,
     "user-agent": config.ua,
   }
-  const sess = sessionFor(req)
+  const identity = identityFor(req)
   // Send both session headers whenever we are allowed to supply one. A client
   // that brings its own session keeps it; we just mirror it into the second
   // header so the pair upstream expects is always complete.
-  if (!sess.injected || config.injectSession) {
-    for (const h of SESSION_HEADERS) headers[h] = sess.value
+  if (!identity.injected || config.injectSession) {
+    for (const h of SESSION_HEADERS) headers[h] = identity.session
     // v2 parity: the affinity pair echoes the same value under two more names.
-    headers["x-session-affinity"] = sess.value
-    headers["x-session-id"] = sess.value
+    headers["x-session-affinity"] = identity.session
+    headers["x-session-id"] = identity.session
   }
   headers["x-opencode-client"] = config.clientName
-  headers["x-opencode-project"] = projectHash()
+  // The project half of the same pair: a caller that supplied a project gets
+  // it forwarded verbatim below; the minted pair keeps session and project one.
+  headers["x-opencode-project"] = identity.project
   if (config.tracing) for (const [k, v] of Object.entries(traceHeaders())) headers[k] = v
   const ip = clientIp(req)
   if (!ipOmit(ip)) headers["x-real-ip"] = ip
@@ -2447,8 +2507,12 @@ function agentProbePayload(id, format) {
 
 // One-shot liveness probe for a model, using the endpoint family that model
 // actually lives on. Returns the raw Response so sync can classify it.
-async function probeModel(id, auth, session) {
+async function probeModel(id, auth) {
   const format = modelFormat(id)
+  // Probes carry one complete identity pair so the gate sees a single
+  // consistent client, not a session that shares a project with nothing.
+  const identity = identityFor(null)
+  const session = config.injectSession ? identity.session : undefined
   const headers = {
     "content-type": "application/json",
     accept: "application/json, text/event-stream",
@@ -2456,7 +2520,7 @@ async function probeModel(id, auth, session) {
     "user-agent": config.ua,
     // v2 wire parity — the gate reads more than the session pair.
     "x-opencode-client": config.clientName,
-    "x-opencode-project": projectHash(),
+    "x-opencode-project": identity.project,
   }
   if (session) {
     for (const h of SESSION_HEADERS) headers[h] = session
@@ -3012,7 +3076,7 @@ async function syncModels() {
       while (idx < candidates.length) {
         const id = candidates[idx++]
         try {
-          const r = await probeModel(id, auth, sessionHeader())
+          const r = await probeModel(id, auth)
           let bodyErr = ""
           try {
             const j = await r.json()
@@ -3363,8 +3427,16 @@ async function handleTest(req, res) {
           authorization: auth,
           "user-agent": config.ua,
         }
-        const sess = sessionHeader(req)
-        if (sess) for (const name of SESSION_HEADERS) h[name] = sess
+        const identity = identityFor(req)
+        // Same identity pair the request path sends, so TEST reports what a
+        // real client with these headers would see (v2 parity, project included).
+        if (!identity.injected || config.injectSession) {
+          for (const name of SESSION_HEADERS) h[name] = identity.session
+          h["x-session-affinity"] = identity.session
+          h["x-session-id"] = identity.session
+        }
+        h["x-opencode-client"] = config.clientName
+        h["x-opencode-project"] = identity.project
         const ip = req.socket.remoteAddress ?? ""
         if (!ipOmit(ip)) h["x-real-ip"] = ip
         return h
@@ -3646,8 +3718,10 @@ export {
   transientUpstream,
   maxBodyBytes,
   toBool,
+  identityFor,
   sessionFor,
   sessionHeader,
+  SESSION_MAX_AGE_MS,
   MAX_BODY,
   VALID_MODEL_ID,
 }
