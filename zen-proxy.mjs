@@ -1425,14 +1425,17 @@ async function handleMessages(req, res) {
       if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs))
       delayMs = 0
       let upstreamRes
+      const wall = isStream ? headersWall() : null
       try {
         upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
           method: "POST",
           headers: zenHeaders(req, auth),
           body: JSON.stringify(payload),
-          signal: isStream ? req.signal : AbortSignal.timeout(config.timeoutMs),
+          signal: isStream ? wall.signal : AbortSignal.timeout(config.timeoutMs),
         })
+        if (wall) wall.release()
       } catch (err) {
+        if (wall) wall.release()
         lastErr = { error: { type: "api_error", message: err.message } }
         lastStatus = 502
         if (attempt < retries) {
@@ -1645,14 +1648,17 @@ async function handleChat(req, res, responsesRoute = false) {
       if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs))
       delayMs = 0
       let upstreamRes
+      const wall = isStream ? headersWall() : null
       try {
         upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
           method: "POST",
           headers: zenHeaders(req, auth),
           body: JSON.stringify(payload),
-          signal: isStream ? req.signal : AbortSignal.timeout(config.timeoutMs),
+          signal: isStream ? wall.signal : AbortSignal.timeout(config.timeoutMs),
         })
+        if (wall) wall.release()
       } catch (err) {
+        if (wall) wall.release()
         lastErr = { error: { type: "upstream_error", message: err.message } }
         lastStatus = 502
         if (attempt < retries) {
@@ -1979,6 +1985,28 @@ function chatBlockError(block) {
   }
 }
 
+// Stream relays need walls that no runtime disagrees with. req.signal is
+// undefined on node 18+ and current bun (1.3.14) — a stream's upstream fetch
+// then ran with NO abort handling, so a dead upstream stalled the caller's
+// connection forever (measured: non-stream requests, covered by their
+// AbortSignal.timeout, kept working) — while some bun builds expose that
+// signal and abort it on the server's own idle clock, making a live stream
+// die with "The operation was aborted." (measured report). So every stream
+// upstream fetch gets a wall the handler owns: a headers-wall timer that
+// aborts if upstream never answers at all, and after the headers land, the
+// pump's own wall covers body silence. Aborts carry their honest reason text
+// instead of a runtime abort message. The response socket is deliberately
+// NOT watched here: node emits res "close" early for otherwise healthy
+// requests (measured mid-flight at ~0.5s with a live client on this proxy's
+// flow), so any socket-derived kill would abort live streams.
+function headersWall(timeoutMs = config.timeoutMs) {
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => {
+    ctrl.abort(new Error(`upstream never responded within ${timeoutMs}ms (headers wall)`))
+  }, timeoutMs)
+  return { signal: ctrl.signal, release() { clearTimeout(timer) } }
+}
+
 function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = false, pin = null, keepable = null) {
   res.writeHead(200, {
     "content-type": "text/event-stream",
@@ -2019,13 +2047,15 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
   }
 
   const ctrl = new AbortController()
-  const onAbort = () => ctrl.abort()
-  if (req.signal?.addEventListener) req.signal.addEventListener("abort", onAbort)
-  const timer = setTimeout(() => ctrl.abort(), config.timeoutMs)
-  const cleanup = () => {
-    clearTimeout(timer)
-    if (req.signal?.removeEventListener) req.signal.removeEventListener("abort", onAbort)
-  }
+  let stalled = false
+  // Canceling the chunks generator makes the loop below end cleanly and reach
+  // the same mid-reply handling, where the stall is named for what it is.
+  ctrl.signal.addEventListener("abort", () => { chunks.return?.()?.catch?.(() => {}) })
+  const timer = setTimeout(() => {
+    stalled = true
+    ctrl.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
+  }, config.timeoutMs)
+  const cleanup = () => clearTimeout(timer)
 
   const pump = async () => {
     try {
@@ -2123,10 +2153,11 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
         // The upstream stream closed without a finish chunk or [DONE]: claiming
         // message_stop would present a truncated reply as a completed turn
         // (measured: hostile mid-cut). Anthropic carries mid-stream failure as
-        // an `error` event — emit it, close nothing further, stop.
+        // an `error` event — emit it, close nothing further, stop. A wall abort
+        // cancelled the generator into done — name the stall for what it is.
         closeThink()
         closeText()
-        emit("error", { error: { type: "api_error", message: "upstream stream ended mid-reply" } })
+        emit("error", { error: { type: "api_error", message: stalled ? "upstream stalled past the relay wall" : "upstream stream ended mid-reply" } })
         res.end()
         return
       }
@@ -2155,7 +2186,7 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
       res.write("data: [DONE]\n\n")
       res.end()
     } catch (err) {
-      if (!req.signal?.aborted) {
+      if (!req.signal?.aborted && !res.writableEnded) {
         closeThink()
         closeText()
         // The 200 is already on the wire; Anthropic's mid-stream failure event
@@ -2287,21 +2318,20 @@ function relayStream(req, res, upstreamRes, requested, strip = false, pin = null
   let sawFinish = false
   let upstreamErr = null
   const ctrl = new AbortController()
-  const onAbort = () => ctrl.abort()
-  if (req.signal?.addEventListener) req.signal.addEventListener("abort", onAbort)
-  const timer = setTimeout(() => ctrl.abort(), config.timeoutMs)
+  let stalled = false
   ctrl.signal.addEventListener("abort", () => {
     reader.cancel().catch(() => {})
   })
-  const cleanup = () => {
-    clearTimeout(timer)
-    if (req.signal?.removeEventListener) req.signal.removeEventListener("abort", onAbort)
-  }
+  const timer = setTimeout(() => {
+    stalled = true
+    ctrl.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
+  }, config.timeoutMs)
+  const cleanup = () => clearTimeout(timer)
   const midReplyError = (message) => {
     // The 200 line is already on the wire — an in-band error chunk plus the
     // [DONE] sentinel is the only honest ending left. SDKs raise on error
     // chunks instead of returning a silent half-turn.
-    if (!req.signal?.aborted) {
+    if (!req.signal?.aborted && !res.writableEnded) {
       res.write(`data: ${JSON.stringify({ error: { type: "upstream_error", message } })}\n\n`)
       res.write("data: [DONE]\n\n")
     }
@@ -2315,8 +2345,9 @@ function relayStream(req, res, upstreamRes, requested, strip = false, pin = null
           if (buffer.trim()) res.write(buffer)
           // Upstream closed without delivering a finish chunk or [DONE]: the
           // reply died in flight, and a silent end reads like a successful
-          // empty turn (measured against a hostile mid-cut).
-          if (!sawFinish) midReplyError(upstreamErr ?? "upstream stream ended mid-reply")
+          // empty turn (measured against a hostile mid-cut). A wall abort
+          // cancels the reader into done — name the stall for what it is.
+          if (!sawFinish) midReplyError(upstreamErr ?? (stalled ? "upstream stalled past the relay wall" : "upstream stream ended mid-reply"))
           else res.end()
           return
         }
@@ -2467,16 +2498,15 @@ function relayResponsesStream(req, res, upstreamRes, requested, strip = false, p
   const decoder = new TextDecoder()
   let buffer = ""
   const ctrl = new AbortController()
-  const onAbort = () => ctrl.abort()
-  if (req.signal?.addEventListener) req.signal.addEventListener("abort", onAbort)
-  const timer = setTimeout(() => ctrl.abort(), config.timeoutMs)
+  let stalled = false
   ctrl.signal.addEventListener("abort", () => {
     reader.cancel().catch(() => {})
   })
-  const cleanup = () => {
-    clearTimeout(timer)
-    if (req.signal?.removeEventListener) req.signal.removeEventListener("abort", onAbort)
-  }
+  const timer = setTimeout(() => {
+    stalled = true
+    ctrl.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
+  }, config.timeoutMs)
+  const cleanup = () => clearTimeout(timer)
   const send = (choices, extra) =>
     res.write(`data: ${JSON.stringify({ ...base, choices, ...(extra ?? {}) })}\n\n`)
 
@@ -2570,14 +2600,14 @@ function relayResponsesStream(req, res, upstreamRes, requested, strip = false, p
       } else {
         // Upstream never declared completion: end with the failure instead of
         // a finish_reason the model never reached (measured: hostile mid-cut).
-        if (!req.signal?.aborted) {
-          res.write(`data: ${JSON.stringify({ error: { type: "upstream_error", message: upstreamErr ?? "upstream stream ended mid-reply" } })}\n\n`)
+        if (!req.signal?.aborted && !res.writableEnded) {
+          res.write(`data: ${JSON.stringify({ error: { type: "upstream_error", message: upstreamErr ?? (stalled ? "upstream stalled past the relay wall" : "upstream stream ended mid-reply") } })}\n\n`)
           res.write("data: [DONE]\n\n")
         }
       }
       res.end()
     } catch (err) {
-      if (!req.signal?.aborted) {
+      if (!req.signal?.aborted && !res.writableEnded) {
         res.write(`data: ${JSON.stringify({ error: { type: "upstream_error", message: upstreamErr ?? err?.message ?? "upstream stream ended mid-reply" } })}\n\n`)
         res.write("data: [DONE]\n\n")
       }
@@ -2618,9 +2648,22 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
     dropped: new Set(), // pinned-filter: chat indices that name a stray call
   }
 
+  // Same relay wall as the pumps that hold their own reader: unlike them this
+  // one had NO timer, so a dead upstream stalled the stream forever. Cancelling
+  // the generator ends the loop cleanly into the mid-reply handling below.
+  const chunksIter = sseChunks(upstreamRes)
+  const wall = new AbortController()
+  let stalled = false
+  wall.signal.addEventListener("abort", () => { chunksIter.return?.()?.catch?.(() => {}) })
+  const wallTimer = setTimeout(() => {
+    stalled = true
+    wall.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
+  }, config.timeoutMs)
+  const cleanup = () => clearTimeout(wallTimer)
+
   const pump = async () => {
     try {
-      for await (const chunk of sseChunks(upstreamRes)) {
+      for await (const chunk of chunksIter) {
         if (chatBlockTerminal(chunk)) st.finished = true
         let raw = ""
         for (const line of chunk.split("\n")) if (line.startsWith("data:")) raw = line.slice(5).trim()
@@ -2691,7 +2734,7 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
         // mid-cut): emitting response.completed would tell the caller a turn
         // ended that upstream never finished. The Responses dialect carries
         // mid-stream failure as an `error` event.
-        if (!req.signal?.aborted) evt("error", { error: { type: "api_error", message: "upstream stream ended mid-reply" } })
+        if (!req.signal?.aborted && !res.writableEnded) evt("error", { error: { type: "api_error", message: stalled ? "upstream stalled past the relay wall" : "upstream stream ended mid-reply" } })
         res.end()
         return
       }
@@ -2783,16 +2826,15 @@ function relayResponsesPassthrough(req, res, upstreamRes, requested, strip = fal
   let sawFinish = false
   let upstreamErr = null
   const ctrl = new AbortController()
-  const onAbort = () => ctrl.abort()
-  if (req.signal?.addEventListener) req.signal.addEventListener("abort", onAbort)
-  const timer = setTimeout(() => ctrl.abort(), config.timeoutMs)
+  let stalled = false
   ctrl.signal.addEventListener("abort", () => {
     reader.cancel().catch(() => {})
   })
-  const cleanup = () => {
-    clearTimeout(timer)
-    if (req.signal?.removeEventListener) req.signal.removeEventListener("abort", onAbort)
-  }
+  const timer = setTimeout(() => {
+    stalled = true
+    ctrl.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
+  }, config.timeoutMs)
+  const cleanup = () => clearTimeout(timer)
   const parseBlock = (block) => {
     let event = ""
     let raw = ""
@@ -2849,12 +2891,12 @@ function relayResponsesPassthrough(req, res, upstreamRes, requested, strip = fal
       // No completion event ever arrived: the stream died mid-reply (measured
       // against a hostile cut). The Responses dialect says failure as an
       // `error` event; silence reads like a successful partial turn.
-      if (!sawFinish && !req.signal?.aborted) {
-        res.write(`event: error\ndata: ${JSON.stringify({ type: "error", code: "upstream_error", message: upstreamErr ?? "upstream stream ended mid-reply" })}\n\n`)
+      if (!sawFinish && !req.signal?.aborted && !res.writableEnded) {
+        res.write(`event: error\ndata: ${JSON.stringify({ type: "error", code: "upstream_error", message: upstreamErr ?? (stalled ? "upstream stalled past the relay wall" : "upstream stream ended mid-reply") })}\n\n`)
       }
       res.end()
     } catch (err) {
-      if (!req.signal?.aborted) {
+      if (!req.signal?.aborted && !res.writableEnded) {
         res.write(`event: error\ndata: ${JSON.stringify({ type: "error", code: "upstream_error", message: upstreamErr ?? err?.message ?? "upstream stream ended mid-reply" })}\n\n`)
       }
       res.end()
@@ -3583,6 +3625,7 @@ export {
   relayResponsesStream,
   relayChatAsResponsesStream,
   relayResponsesPassthrough,
+  headersWall,
   rewriteSSE,
   stripUnpinnedCalls,
   filterPinnedDelta,

@@ -2058,6 +2058,60 @@ describe("stream timeout", () => {
       new Promise((_, rej) => setTimeout(() => rej(new Error("stream did not close within 3s")), 3000)),
     ])
     assert.equal(res.state.status, 200)
+    // The wall is explained, not blamed on a runtime abort gibberish (old
+    // message was whatever the environment's default AbortError text is —
+    // under bun that spawns the confusing "The operation was aborted.").
+    assert.match(res.body, /upstream stalled past the relay wall/)
+    assert.match(res.body, /data: \[DONE\]/)
+    assert.doesNotMatch(res.body, /aborted|The operation was aborted/)
+  })
+
+  test("the headers wall aborts a stream whose upstream never answers, honestly", async () => {
+    const m = zp.config.fallbackModels[0]
+    // The old stream path passed `req.signal` (undefined on node and current
+    // bun) — nothing could abort a pending upstream fetch, so a dead upstream
+    // hung the caller's connection forever. The headers wall is the fix.
+    // The stub mirrors undici: it rejects when its signal aborts.
+    globalThis.fetch = (_url, opts) => {
+      return new Promise((_, reject) => {
+        opts.signal?.addEventListener("abort", () => reject(opts.signal.reason), { once: true })
+      })
+    }
+    zp.saveConfig({ timeoutMs: 50 })
+    const req = mockReq({ _body: JSON.stringify({ model: m, messages: [], stream: true }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    await Promise.race([
+      res.done,
+      new Promise((_, rej) => setTimeout(() => rej(new Error("stream did not close within 3s")), 3000)),
+    ])
+    assert.equal(res.state.status, 502)
+    assert.match(res.body, /upstream never responded within 50ms/)
+    assert.doesNotMatch(res.body, /The operation was aborted/)
+  })
+
+  test("the headers wall is released when upstream answers, so healthy streams are safe", async () => {
+    const m = zp.config.fallbackModels[0]
+    const good = new Response('data: {"id":"1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}\n\n' + 'data: {"id":"1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n' + "data: [DONE]\n\n", {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    })
+    zp.saveConfig({ timeoutMs: 50 })
+    globalThis.fetch = routeFetch([
+      ["/chat/completions",
+        async () => {
+          // Answer slower than the wall would fire if it were left armed.
+          await new Promise((r) => setTimeout(r, 200))
+          return good
+        },
+      ],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: m, messages: [], stream: true }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    await Promise.race([res.done, new Promise((_, rej) => setTimeout(() => rej(new Error("no reply within 5s")), 5000))])
+    assert.equal(res.state.status, 200)
+    assert.match(res.body, /"content":"ok"/)
   })
 })
 
