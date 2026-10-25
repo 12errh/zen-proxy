@@ -35,6 +35,9 @@ after(() => {
 
 const MODEL_ID_RE = /^[A-Za-z0-9._:@+/%-]+$/
 const DEFAULT_MODEL = zp.config.defaultModel || zp.config.fallbackModels[0] || ""
+// The v2 gate's own tool list, in wire order — what merges ahead of any caller
+// tools everywhere the manifest rides.
+const manifestNames = () => zp.loadAgentTools().map((t) => t.function.name)
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url))
 // Git Bash (Windows) mangles backslash paths; forward slashes work everywhere
 const toPosix = (p) => p.replace(/\\/g, "/")
@@ -435,7 +438,7 @@ describe("auto-UA tracking", () => {
       ["registry.npmjs.org/opencode-ai/latest", jsonResponse({ version: "9.9.9" })],
     ])
     await zp.refreshUA(true)
-    assert.equal(zp.config.ua, "opencode/9.9.9", "UA must track the latest opencode version")
+    assert.equal(zp.config.ua, "opencode/latest/9.9.9/cli", "UA must track the latest opencode version in the v2 CLI format")
   })
 
   test("refreshUA leaves custom User-Agents untouched", async () => {
@@ -618,7 +621,11 @@ describe("sync prunes unsupported models", () => {
     assert.equal(s.gated.length, 0, "nothing is written off as gate-blocked")
     assert.ok(seen.length >= 2 && seen.every((b) => b.stream === true), "every probe streams")
     assert.ok(seen.every((b) => b.tools?.length > 0), "every probe carries the tool manifest")
-    assert.ok(seen.every((b) => b.tool_choice === "none"), "ping replies stay plain text, not tool calls")
+    assert.ok(
+      seen.every((b) => typeof b.messages?.[0]?.content === "string" && b.messages[0].content.startsWith("You are an AI agent running in OpenCode")),
+      "every probe rides the harness preamble — a generic system text is refused",
+    )
+    assert.ok(seen.every((b) => !("tool_choice" in b)), "probes force no tool_choice — the pinned ask keeps the answer text")
   })
 
   test("responses-format models get an agent-shaped probe on /responses", async () => {
@@ -643,8 +650,13 @@ describe("sync prunes unsupported models", () => {
     const s = await zp.syncModels()
     assert.ok(s.working.includes("muse-spark-1.3-contributor-free"), "reported working")
     assert.equal(sentBody.stream, true, "responses probe streams too")
+    assert.ok(sentBody.instructions?.startsWith("You are an AI agent running in OpenCode"), "the harness preamble rides as instructions")
     assert.ok(sentBody.tools?.length > 0, "responses probe carries converted tools")
-    assert.equal(sentBody.input, "ping")
+    assert.deepEqual(
+      sentBody.input,
+      [{ role: "user", content: [{ type: "input_text", text: "Reply with exactly OK1 and nothing else." }] }],
+      "the input is a real ask, not a bare ping",
+    )
     assert.ok(!("tool_choice" in sentBody), "responses payload stays in responses dialect")
   })
 })
@@ -839,7 +851,11 @@ describe("auth visibility & key test", () => {
     assert.equal(sentAuth, "Bearer sk-custom-zen-key")
     assert.equal(sentBody.stream, true, "probe streams like a real client")
     assert.ok(sentBody.tools?.length > 0, "probe carries opencode's tool manifest")
-    assert.equal(sentBody.tool_choice, "none", "ping answers stay plain text")
+    assert.ok(
+      typeof sentBody.messages?.[0]?.content === "string" && sentBody.messages[0].content.startsWith("You are an AI agent running in OpenCode"),
+      "probe rides the harness preamble",
+    )
+    assert.ok(!("tool_choice" in sentBody), "the probe's ask is pinned in the text, not forced on the wire")
   })
 })
 
@@ -952,7 +968,10 @@ describe("responses API translation", () => {
     assert.equal(res.state.status, 200)
     assert.match(hitUrl, /\/responses$/)
     assert.equal(sentBody.model, "gpt-5.5")
-    assert.deepEqual(sentBody.input, [{ role: "user", content: "hi" }])
+    // The chat-shaped body gets the harness preamble injected into its system
+    // slot before the chat→responses conversion, so it travels as an item.
+    assert.match(sentBody.input[0].content, /^You are an AI agent running in OpenCode/)
+    assert.deepEqual(sentBody.input[1], { role: "user", content: "hi" })
     const data = JSON.parse(res.body)
     assert.equal(data.object, "chat.completion")
     assert.equal(data.model, "gpt-5.5")
@@ -2227,20 +2246,24 @@ console.log(loadConfig().upstream)`
     }
   }
 
-  test("defaults to the served /inference/v1 base", () => {
-    assert.equal(loadWith(null), "https://opencode.ai/inference/v1")
+  test("defaults to the served /inference/openai/v1 base", () => {
+    assert.equal(loadWith(null), "https://opencode.ai/inference/openai/v1")
   })
 
-  test("a legacy /zen/v1 config is migrated to /inference/v1", () => {
-    assert.equal(loadWith("https://opencode.ai/zen/v1"), "https://opencode.ai/inference/v1")
+  test("a legacy /zen/v1 config is migrated to /inference/openai/v1", () => {
+    assert.equal(loadWith("https://opencode.ai/zen/v1"), "https://opencode.ai/inference/openai/v1")
   })
 
   test("a legacy /zen config is migrated too", () => {
-    assert.equal(loadWith("https://opencode.ai/zen"), "https://opencode.ai/inference/v1")
+    assert.equal(loadWith("https://opencode.ai/zen"), "https://opencode.ai/inference/openai/v1")
+  })
+
+  test("a legacy /inference/v1 base is migrated to the v2 endpoint too", () => {
+    assert.equal(loadWith("https://opencode.ai/inference/v1"), "https://opencode.ai/inference/openai/v1")
   })
 
   test("a trailing slash does not defeat the migration", () => {
-    assert.equal(loadWith("https://opencode.ai/zen/v1/"), "https://opencode.ai/inference/v1")
+    assert.equal(loadWith("https://opencode.ai/zen/v1/"), "https://opencode.ai/inference/openai/v1")
   })
 
   test("an explicit non-legacy upstream is left alone", () => {
@@ -2549,16 +2572,17 @@ describe("Anthropic Messages API layer", () => {
     assert.match(res.body, /"model":"big-pickle"/, "client's model name preserved in the stream")
   })
 
-  test("opencode bridge tools are added only for tools the caller actually has", () => {
-    // The free tier only accepts a request carrying opencode's own tool manifest.
-    // Offering one the caller lacks would produce a tool call it cannot run.
+  test("the manifest rides in full ahead of the caller's tools", () => {
+    // The v2 gate takes opencode's whole manifest on every request. The
+    // caller's tools still ride after it — only an exact-name collision with a
+    // manifest name is deduped in favour of the gate's own schema.
     const has = zp.anthropicToChatBody({ tools: [{ name: "Read" }, { name: "Write" }], messages: [{ role: "user", content: "x" }] }, "m")
-    const bridge = has.tools.filter((t) => ["read", "write"].includes(t.function.name)).map((t) => t.function.name)
-    assert.deepEqual(bridge.sort(), ["read", "write"])
+    assert.deepEqual(has.tools.map((t) => t.function.name), [...manifestNames(), "Read", "Write"])
     const none = zp.anthropicToChatBody({ tools: [{ name: "TotallyUniqueTool" }], messages: [{ role: "user", content: "x" }] }, "m")
-    // No bridge manifest for names the caller lacks — but the gate's read stub
-    // rides on any tool-carrying caller without its own read (issue #20).
-    assert.deepEqual(none.tools.map((t) => t.function.name), ["read", "TotallyUniqueTool"])
+    assert.deepEqual(none.tools.map((t) => t.function.name), [...manifestNames(), "TotallyUniqueTool"])
+    // And it is opencode's real schema — no stub "never call this" helper.
+    const captured = zp.loadAgentTools().find((t) => t.function.name === "read")
+    assert.ok(none.tools.includes(captured), "the manifest's read rides whole, not a stub")
   })
 
   test("the caller's own tools are still sent", () => {
@@ -2619,11 +2643,12 @@ describe("opencode tool bridge", () => {
   // the way back to whatever the caller actually offered.
   test("agent-tools.json is a valid manifest of mapped tools", () => {
     const parsed = JSON.parse(fs.readFileSync(new URL("../agent-tools.json", import.meta.url), "utf8"))
-    assert.ok(Array.isArray(parsed.tools) && parsed.tools.length >= 4, "has tools")
-    for (const t of parsed.tools) {
+    // The loader accepts a bare array (the v2 capture shape) or {"tools":[…]}.
+    const tools = Array.isArray(parsed) ? parsed : parsed.tools
+    assert.ok(Array.isArray(tools) && tools.length >= 4, "has tools")
+    for (const t of tools) {
       assert.equal(t.type, "function")
       assert.ok(t.function.name)
-      assert.ok(zp.agentToolsFor([{ Read: 1 }[t.function.name] ? t.function.name.toUpperCase() : ""]) !== undefined || true)
     }
   })
 
@@ -2890,7 +2915,9 @@ describe("free tier gate on the chat path", () => {
       messages: [{ role: "user", content: "hi" }],
       tools: [{ type: "function", function: { name: "read", parameters: { type: "object" } } }],
     })
-    assert.deepEqual(seen[0].sent.tools.map((t) => t.function.name), ["read"], "caller's tools pass through")
+    // The manifest rides ahead of the caller's tools; the caller's `read`
+    // carries the same name as the manifest's, so it dedupes into it.
+    assert.deepEqual(seen[0].sent.tools.map((t) => t.function.name), manifestNames(), "manifest first, no duplicate caller read")
     assert.equal(seen[0].sent.tool_choice, undefined, "an agent turn must still be free to call tools")
   })
 
@@ -3019,7 +3046,7 @@ describe("pinned tool calls on the OpenAI-shaped routes", () => {
     ...extra,
   })
 
-  test("a pinned caller gets the gate's read next to its own tool", async () => {
+  test("a pinned caller gets the manifest ahead of its own tool", async () => {
     const m = "space-bunny-free"
     pinnedCfg(m)
     let sent = null
@@ -3036,21 +3063,21 @@ describe("pinned tool calls on the OpenAI-shaped routes", () => {
     const req = mockReq({ _body: JSON.stringify(pinned(m)) })
     const res = mockRes()
     await zp.handleChat(req, res)
-    assert.equal(res.state.status, 200, "the gate takes a pinned request that carries read")
-    assert.deepEqual(sent.tools.map((t) => t.function.name), ["read", "set_title"], "read rides along, the caller's tool stays")
-    assert.equal(
-      sent.tools[0].function.description,
-      "Internal helper. Never call this tool.",
-      "the injected read is a stub, not opencode's agentic schema",
+    assert.equal(res.state.status, 200, "the gate takes a pinned request that carries the manifest")
+    assert.deepEqual(sent.tools.map((t) => t.function.name), [...manifestNames(), "set_title"], "the manifest rides first, the caller's tool stays")
+    const captured = zp.loadAgentTools().find((t) => t.function.name === "read")
+    assert.deepEqual(
+      sent.tools.find((t) => t.function.name === "read"),
+      captured,
+      "the read on the list is opencode's captured schema, not a stub",
     )
-    assert.deepEqual(sent.tools[0].function.parameters, { type: "object", properties: {} }, "the stub carries no parameters")
     assert.deepEqual(sent.tool_choice, { type: "function", function: { name: "set_title" } }, "the pin is forwarded untouched")
   })
 
-  test("the injected read is not opencode's captured schema", async () => {
-    // opencode's real `read` description invites the model to call it, and a
-    // model that answers a pinned request with a `read` call hands the caller a
-    // tool it never offered. The stub the proxy injects must stay a stub.
+  test("the manifest's read rides whole — never a stub", async () => {
+    // A stub "never call this tool" helper used to be injected for the gate;
+    // since the v2 manifest the real schema rides, and its call is renamed back
+    // (or dropped) at the reply layer.
     const m = "space-bunny-free"
     pinnedCfg(m)
     let sent = null
@@ -3069,14 +3096,11 @@ describe("pinned tool calls on the OpenAI-shaped routes", () => {
     assert.equal(res.state.status, 200)
     const captured = zp.loadAgentTools().find((t) => t.function.name === "read")
     assert.ok(captured, "the captured manifest still carries opencode's read")
-    assert.notDeepEqual(sent.tools[0], captured, "the injected tool must not be opencode's schema")
-    assert.ok(
-      sent.tools[0].function.description.length < captured.function.description.length,
-      "the stub's description must be far shorter than opencode's",
-    )
+    const sentRead = sent.tools.find((t) => t.function.name === "read")
+    assert.deepEqual(sentRead, captured, "the sent read is opencode's schema verbatim")
   })
 
-  test("a caller that offers its own read gets nothing added", async () => {
+  test("a caller that offers its own read gets no duplicate", async () => {
     const m = "space-bunny-free"
     pinnedCfg(m)
     let sent = null
@@ -3093,10 +3117,15 @@ describe("pinned tool calls on the OpenAI-shaped routes", () => {
     const res = mockRes()
     await zp.handleChat(req, res)
     assert.equal(res.state.status, 200)
-    assert.deepEqual(sent.tools, [readStub, setName], "the caller's list is untouched, no duplicate")
+    assert.equal(sent.tools.filter((t) => t.function.name === "read").length, 1, "exactly one read on the list")
+    // The caller's read and the manifest's share a name; the manifest's is the
+    // one that survives the dedupe (and the reply layer handles its calls).
+    const captured = zp.loadAgentTools().find((t) => t.function.name === "read")
+    assert.deepEqual(sent.tools.find((t) => t.function.name === "read"), captured, "the caller's stub loses to the manifest's real read")
+    assert.ok(sent.tools.some((t) => t.function.name === "set_title"), "the caller's own tool stays")
   })
 
-  test("an unpinned tool caller gets the gate's read riding along", async () => {
+  test("an unpinned tool caller gets the manifest riding along", async () => {
     const m = "space-bunny-free"
     pinnedCfg(m)
     let sent = null
@@ -3112,14 +3141,15 @@ describe("pinned tool calls on the OpenAI-shaped routes", () => {
     const req = mockReq({ _body: JSON.stringify({ model: m, messages: [{ role: "user", content: "title this" }], tools: [setName] }) })
     const res = mockRes()
     await zp.handleChat(req, res)
-    // Measured against the live gateway 2026-10-21 (issue #20): the gate
-    // refuses every model when the caller's tools lack a `read`, pin or no pin.
-    assert.equal(res.state.status, 200, "the stub satisfies the gate")
-    assert.deepEqual(sent.tools.map((t) => t.function.name), ["read", "set_title"])
-    assert.equal(sent.tools[0].function.description, "Internal helper. Never call this tool.")
+    // Measured against the live gateway 2026-10-21 (issue #20) — a bare caller
+    // list was refused, and the v2 gate now wants the whole manifest.
+    assert.equal(res.state.status, 200, "the manifest satisfies the gate")
+    assert.deepEqual(sent.tools.map((t) => t.function.name), [...manifestNames(), "set_title"])
+    const captured = zp.loadAgentTools().find((t) => t.function.name === "read")
+    assert.deepEqual(sent.tools.find((t) => t.function.name === "read"), captured, "no stub rides — it is opencode's read")
   })
 
-  test("a string tool_choice is not a pin — the stub rides instead", async () => {
+  test("a string tool_choice is not a pin — the manifest rides instead", async () => {
     const m = "space-bunny-free"
     pinnedCfg(m)
     let sent = null
@@ -3135,8 +3165,8 @@ describe("pinned tool calls on the OpenAI-shaped routes", () => {
     const req = mockReq({ _body: JSON.stringify(pinned(m, { tool_choice: "required" })) })
     const res = mockRes()
     await zp.handleChat(req, res)
-    assert.equal(res.state.status, 200, "the stub satisfies the gate")
-    assert.deepEqual(sent.tools.map((t) => t.function.name), ["read", "set_title"])
+    assert.equal(res.state.status, 200, "the manifest satisfies the gate")
+    assert.deepEqual(sent.tools.map((t) => t.function.name), [...manifestNames(), "set_title"])
     assert.equal(sent.tool_choice, "required")
   })
 
@@ -3184,7 +3214,7 @@ describe("pinned tool calls on the OpenAI-shaped routes", () => {
     const res = mockRes()
     await zp.handleChat(req, res)
     assert.equal(res.state.status, 200)
-    assert.deepEqual(sent.tools.map((t) => t.name), ["read", "set_title"], "responses tools carry read first")
+    assert.deepEqual(sent.tools.map((t) => t.name), [...manifestNames(), "set_title"], "the manifest rides ahead of the caller's tool")
     assert.deepEqual(sent.tool_choice, { type: "function", name: "set_title" }, "the pin survives the responses shape")
   })
 })
@@ -3235,7 +3265,7 @@ describe("pinned tool calls on the Anthropic route", () => {
       { index: 1, name: "set_title", args: ['{"title": ', '"Hostname Check"}'] },
     ])
 
-  test("a pinned /v1/messages request carries the gate's read stub", async () => {
+  test("a pinned /v1/messages request carries the manifest", async () => {
     const m = "space-bunny-free"
     pinCfg(m)
     let sent = null
@@ -3252,20 +3282,20 @@ describe("pinned tool calls on the Anthropic route", () => {
     const req = mockReq({ url: "/v1/messages", _body: JSON.stringify(anthroBody(m)) })
     const res = mockRes()
     await zp.handleMessages(req, res)
-    assert.equal(res.state.status, 200, "the gate takes a pinned request that carries read")
-    assert.deepEqual(sent.tools.map((t) => t.function.name), ["read", "set_title"], "read rides along, the caller's tool stays")
-    assert.equal(
-      sent.tools[0].function.description,
-      "Internal helper. Never call this tool.",
-      "the injected read is a stub, not opencode's agentic schema",
+    assert.equal(res.state.status, 200, "the gate takes a pinned request that carries the manifest")
+    assert.deepEqual(sent.tools.map((t) => t.function.name), [...manifestNames(), "set_title"], "the manifest rides first, the caller's tool stays")
+    const captured = zp.loadAgentTools().find((t) => t.function.name === "read")
+    assert.deepEqual(
+      sent.tools.find((t) => t.function.name === "read"),
+      captured,
+      "the read on the list is opencode's captured schema, not a stub",
     )
-    assert.deepEqual(sent.tools[0].function.parameters, { type: "object", properties: {} }, "the stub carries no parameters")
     assert.deepEqual(sent.tool_choice, { type: "function", function: { name: "set_title" } }, "the pin is forwarded in chat vocabulary")
   })
 
-  test("the stub cannot double up with the bridge's own read", async () => {
-    // A caller that has a `Read` gets opencode's real `read` through
-    // agentToolsFor(); the pin must not add a second one.
+  test("the manifest's read does not double up with a caller's Read", async () => {
+    // `Read` and `read` do not collide by case, so a caller with a Read keeps
+    // it; the manifest supplies the lowercase read the gate needs, once.
     const m = "space-bunny-free"
     pinCfg(m)
     let sent = null
@@ -3289,10 +3319,10 @@ describe("pinned tool calls on the Anthropic route", () => {
     await zp.handleMessages(req, res)
     assert.equal(res.state.status, 200)
     assert.equal(sent.tools.filter((t) => t.function.name === "read").length, 1, "exactly one read on the list")
-    assert.deepEqual(sent.tools.map((t) => t.function.name), ["read", "Read", "set_title"])
+    assert.deepEqual(sent.tools.map((t) => t.function.name), [...manifestNames(), "Read", "set_title"])
   })
 
-  test("an unpinned helper caller also gets the stub (issue #20)", async () => {
+  test("an unpinned helper caller gets the manifest too (issue #20)", async () => {
     const m = "space-bunny-free"
     pinCfg(m)
     let sent = null
@@ -3309,7 +3339,7 @@ describe("pinned tool calls on the Anthropic route", () => {
     const res = mockRes()
     await zp.handleMessages(req, res)
     assert.equal(res.state.status, 200, "tool_choice auto used to ride bare and eat a 403 per model")
-    assert.deepEqual(sent.tools.map((t) => t.function.name), ["read", "set_title"])
+    assert.deepEqual(sent.tools.map((t) => t.function.name), [...manifestNames(), "set_title"])
   })
 
   test("agentTools: false never injects on the Anthropic route", async () => {
@@ -3589,7 +3619,9 @@ describe("the /v1/responses route speaks Responses", () => {
     const res = mockRes()
     await zp.handleChat(req, res, true)
     assert.equal(res.state.status, 200, `this exact body used to die with a bare 400: ${res.body}`)
-    assert.deepEqual(sent.messages, [{ role: "user", content: "Say hello in three words." }], "the input became the message")
+    // The gate's harness preamble rides as a system message ahead of the input.
+    assert.match(sent.messages[0].content, /^You are an AI agent running in OpenCode/)
+    assert.deepEqual(sent.messages[1], { role: "user", content: "Say hello in three words." }, "the input became the message")
     const data = JSON.parse(res.body)
     assert.equal(data.object, "response")
     assert.equal(data.status, "completed")
@@ -3621,7 +3653,10 @@ describe("the /v1/responses route speaks Responses", () => {
     const res = mockRes()
     await zp.handleChat(req, res, true)
     assert.equal(res.state.status, 200)
-    assert.deepEqual(sent.messages[0], { role: "system", content: "be brief" })
+    // The harness preamble is prepended to the caller's instructions; the
+    // caller's text follows it in the same system message.
+    assert.match(sent.messages[0].content, /^You are an AI agent running in OpenCode/)
+    assert.match(sent.messages[0].content, /be brief$/, "the caller's instructions follow the preamble")
     assert.deepEqual(sent.messages[1], { role: "user", content: [{ type: "text", text: "check the file" }] })
     assert.deepEqual(sent.messages[2].tool_calls, [{ id: "call_1", type: "function", function: { name: "read", arguments: '{"filePath":"/x"}' } }])
     assert.deepEqual(sent.messages[3], { role: "tool", tool_call_id: "call_1", content: "contents" })
@@ -3647,9 +3682,9 @@ describe("the /v1/responses route speaks Responses", () => {
     const res = mockRes()
     await zp.handleChat(req, res, true)
     assert.equal(res.state.status, 200)
-    // The gate's read comes along by name, the caller's tool stays, the pin is
-    // carried in chat vocabulary for the chat-family endpoint.
-    assert.deepEqual(sent.tools.map((t) => t.function.name), ["read", "set_title"])
+    // The manifest rides ahead of the caller's tool; the pin is carried in
+    // chat vocabulary for the chat-family endpoint.
+    assert.deepEqual(sent.tools.map((t) => t.function.name), [...manifestNames(), "set_title"])
     assert.deepEqual(sent.tool_choice, { type: "function", function: { name: "set_title" } })
   })
 
@@ -3680,7 +3715,11 @@ describe("the /v1/responses route speaks Responses", () => {
     const res = mockRes()
     await zp.handleChat(req, res, true)
     assert.equal(res.state.status, 200)
-    assert.deepEqual(sent.input, input, "the items travel as items, not as a chat round-trip")
+    // The caller's items travel as items — the harness preamble lands in the
+    // system slot the passthrough prepends, ahead of the caller's own.
+    const preamble = fs.readFileSync(new URL("../agent-preamble.txt", import.meta.url), "utf8")
+    assert.deepEqual(sent.input[0], { type: "message", role: "system", content: preamble }, "the preamble rides as the system item")
+    assert.deepEqual(sent.input[1], input[0], "the caller's items follow untranslated")
     const data = JSON.parse(res.body)
     assert.equal(data.object, "response")
     assert.equal(data.model, "gpt-5.5", "the client asked for this model, not the one upstream names")
@@ -3846,7 +3885,9 @@ describe("the /v1/responses route speaks Responses", () => {
     await zp.handleChat(req, res, true)
     assert.equal(res.state.status, 200)
     assert.equal(JSON.parse(res.body).object, "chat.completion")
-    assert.deepEqual(sent.messages, [{ role: "user", content: "Say hello in three words." }])
+    // The chat-shaped body gets the preamble injected into a system message.
+    assert.match(sent.messages[0].content, /^You are an AI agent running in OpenCode/)
+    assert.deepEqual(sent.messages[1], { role: "user", content: "Say hello in three words." })
   })
 
   test("unit: responsesInputToMessages handles string, items and reasoning", () => {
@@ -4220,13 +4261,17 @@ describe("small router tolerances (measured in the stress sweep)", () => {
   })
 })
 
-describe("the gate's read stub rides on un-pinned tool callers (issue #20)", () => {
+describe("manifest calls the caller cannot run are dropped from replies (issue #20)", () => {
   const cfg = (m) =>
     zp.saveConfig({ defaultModel: m, fallbackModels: [m], retriesPerModel: 0, retryBackoffMs: 1, autoSyncIntervalMs: 0, cacheMs: 0, agentTools: true })
   const NONCE = {
     type: "function",
     function: { name: "client_nonce_lookup", description: "Get the actual unpredictable verification nonce", parameters: { type: "object", properties: {} } },
   }
+  // The per-request keep rule `keepableFor` would build for this caller: it
+  // runs only its own nonce tool, so nothing the manifest rides or the
+  // provider invents is returnable to it.
+  const keepable = (name) => name === "client_nonce_lookup"
   const auto = (model, extra = {}) => ({
     model,
     stream: false,
@@ -4276,7 +4321,7 @@ describe("the gate's read stub rides on un-pinned tool callers (issue #20)", () 
     { index: 1, name: "client_nonce_lookup", args: ["{}"] },
   ]
 
-  test("a collected reply keeps the caller's call and loses the stub", async () => {
+  test("a collected reply keeps the caller's call and loses the unrunnable manifest calls", async () => {
     const m = "space-bunny-free"
     cfg(m)
     let sent = null
@@ -4293,12 +4338,12 @@ describe("the gate's read stub rides on un-pinned tool callers (issue #20)", () 
     await zp.handleChat(mockReq({ _body: JSON.stringify(auto(m)) }), res)
     const body = JSON.parse(res.body)
     assert.equal(res.state.status, 200)
-    assert.deepEqual(body.choices[0].message.tool_calls.map((t) => t.function.name), ["client_nonce_lookup"], "stray stub dropped, caller's call kept")
+    assert.deepEqual(body.choices[0].message.tool_calls.map((t) => t.function.name), ["client_nonce_lookup"], "unrunnable manifest call dropped, caller's call kept")
     assert.equal(body.choices[0].finish_reason, "tool_calls", "a call survived, the claim stands")
-    assert.deepEqual(sent.tools.map((t) => t.function.name), ["read", "client_nonce_lookup"], "the wire carried the stub for the gate's sake")
+    assert.deepEqual(sent.tools.map((t) => t.function.name), [...manifestNames(), "client_nonce_lookup"], "the wire carried the manifest for the gate's sake")
   })
 
-  test("a collected reply that got only the stub ends stop with no tool_calls", async () => {
+  test("a collected reply that got only an unrunnable call ends stop with no tool_calls", async () => {
     const m = "space-bunny-free"
     cfg(m)
     globalThis.fetch = routeFetch([["/chat/completions", () => replyJson([stubCall])]])
@@ -4344,11 +4389,11 @@ describe("the gate's read stub rides on un-pinned tool callers (issue #20)", () 
     await zp.handleChat(req, res, true)
     const data = JSON.parse(res.body)
     assert.equal(res.state.status, 200)
-    assert.deepEqual(data.output.map((o) => o.name), ["client_nonce_lookup"], "the stub's function_call is dropped")
+    assert.deepEqual(data.output.map((o) => o.name), ["client_nonce_lookup"], "the unrunnable manifest call is dropped")
     assert.deepEqual(
       (sent.tools ?? []).map((t) => t?.name ?? t?.function?.name),
-      ["read", "client_nonce_lookup"],
-      "the wire carried the stub for the gate's sake",
+      [...manifestNames(), "client_nonce_lookup"],
+      "the wire carried the manifest for the gate's sake",
     )
   })
 
@@ -4362,13 +4407,13 @@ describe("the gate's read stub rides on un-pinned tool callers (issue #20)", () 
     await handled
     assert.equal(res.state.status, 200)
     assert.ok(res.body.includes('"name":"client_nonce_lookup"'), "the caller's call streamed through")
-    assert.ok(!res.body.includes('"name":"read"'), `the stub's call is dropped: ${res.body}`)
-    assert.ok(!res.body.includes('"q"'), "the stub's argument chunks are dropped too")
+    assert.ok(!res.body.includes('"name":"read"'), `an unrunnable manifest call is dropped: ${res.body}`)
+    assert.ok(!res.body.includes('"q"'), "its argument chunks are dropped too")
     assert.match(res.body, /"finish_reason":"tool_calls"/)
     assert.ok(!res.body.includes('"index":1'), "the surviving call is renumbered into one run")
   })
 
-  test("a streamed /v1/messages reply carries only the caller's tool_use", async () => {
+  test("a streamed /v1/messages reply drops the manifest calls the caller cannot run", async () => {
     const m = "space-bunny-free"
     cfg(m)
     let sent = null
@@ -4388,14 +4433,18 @@ describe("the gate's read stub rides on un-pinned tool callers (issue #20)", () 
     await handled
     assert.equal(res.state.status, 200)
     assert.equal(res.state.headers["content-type"], "text/event-stream")
-    assert.ok(res.body.includes('"name":"client_nonce_lookup"'), "the caller's tool_use block survives")
-    assert.ok(!res.body.includes('"name":"read"'), `the stub never becomes a block: ${res.body}`)
-    assert.ok(!res.body.includes('"q"'), "no stub argument text either")
-    assert.match(res.body, /"stop_reason":"tool_use"/)
-    assert.deepEqual(sent.tools.map((t) => t.function.name), ["read", "set_title"], "the stub rode along on the translated request")
+    // Both streamed calls (read → Read, client_nonce_lookup) map to tools the
+    // caller — a set_title-only helper — has no equivalent for, so neither
+    // becomes a content block; the turn ends as a plain answer.
+    assert.ok(!res.body.includes('"name":"Read"'), `an unrunnable manifest call never becomes a block: ${res.body}`)
+    assert.ok(!res.body.includes('"name":"client_nonce_lookup"'), "the caller's-own-lookalike is dropped too")
+    assert.ok(!res.body.includes('"name":"read"'), "no raw manifest name either")
+    assert.ok(!res.body.includes('"q"'), "no stray argument text either")
+    assert.match(res.body, /"stop_reason":"end_turn"/)
+    assert.deepEqual(sent.tools.map((t) => t.function.name), [...manifestNames(), "set_title"], "the manifest rode along on the translated request")
   })
 
-  test("a caller that already declares read gets nothing injected", async () => {
+  test("a caller that already declares read gets deduped, not duplicated", async () => {
     const m = "space-bunny-free"
     cfg(m)
     let sent = null
@@ -4414,11 +4463,14 @@ describe("the gate's read stub rides on un-pinned tool callers (issue #20)", () 
     await zp.handleChat(req, res)
     const body = JSON.parse(res.body)
     assert.equal(res.state.status, 200)
-    assert.deepEqual(sent.tools.map((t) => t.function.name), ["read", "client_nonce_lookup"], "the caller's list is untouched, no duplicate stub")
+    // The caller's `read` and the manifest's `read` share a name; exactly one
+    // rides — the manifest's — and the caller's call still streams through.
+    assert.deepEqual(sent.tools.map((t) => t.function.name), manifestNames().concat(["client_nonce_lookup"]).filter((n, i, a) => a.indexOf(n) === i))
+    assert.equal(sent.tools.filter((t) => t.function.name === "read").length, 1)
     assert.equal(body.choices[0].message.tool_calls[0].function.name, "client_nonce_lookup")
   })
 
-  test("relayResponsesStream: the gate stub's call is dropped from the deltas", async () => {
+  test("relayResponsesStream: calls the caller cannot run are dropped from the deltas", async () => {
     const sse =
       `event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", item: { type: "function_call", call_id: "cr", id: "fc_r", name: "read" } })}\n\n` +
       `event: response.function_call_arguments.delta\ndata: ${JSON.stringify({ type: "response.function_call_arguments.delta", item_id: "cr", delta: '{"q": 7}' })}\n\n` +
@@ -4427,17 +4479,17 @@ describe("the gate's read stub rides on un-pinned tool callers (issue #20)", () 
       `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "resp_1", usage: { input_tokens: 3, output_tokens: 1 } } })}\n\n`
     const upstream = new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } })
     const res = mockRes()
-    await zp.relayResponsesStream(mockReq(), res, upstream, "up", false, null, "read")
+    await zp.relayResponsesStream(mockReq(), res, upstream, "up", false, null, keepable)
     await res.done
     assert.ok(res.body.includes('"name":"client_nonce_lookup"'), "the caller's call kept")
-    assert.ok(!res.body.includes('"name":"read"'), `the stub's call is dropped: ${res.body}`)
+    assert.ok(!res.body.includes('"name":"read"'), `a call the caller cannot run is dropped: ${res.body}`)
     assert.ok(!res.body.includes('"q"'), "the stub's arguments are dropped")
     assert.match(res.body, /"finish_reason":"tool_calls"/)
   })
 
-  test("relayChatAsResponsesStream: the gate stub's call never becomes an output item", async () => {
+  test("relayChatAsResponsesStream: calls the caller cannot run never become output items", async () => {
     const res = mockRes()
-    await zp.relayChatAsResponsesStream(mockReq(), res, toolSse(mixedArgs()), "up", false, null, "read")
+    await zp.relayChatAsResponsesStream(mockReq(), res, toolSse(mixedArgs()), "up", false, null, keepable)
     await res.done
     assert.ok(res.body.includes('"name":"client_nonce_lookup"'), "the caller's item is emitted")
     assert.ok(!res.body.includes('"name":"read"'), `the stub's item is dropped: ${res.body}`)
@@ -4445,17 +4497,17 @@ describe("the gate's read stub rides on un-pinned tool callers (issue #20)", () 
     assert.ok(res.body.includes("response.completed"))
   })
 
-  test("relayResponsesPassthrough: the gate stub's item is dropped whole", async () => {
+  test("relayResponsesPassthrough: calls the caller cannot run are dropped whole", async () => {
     const sse =
       `event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", item: { type: "function_call", call_id: "cr", id: "fc_r", name: "read" } })}\n\n` +
       `event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", item: { type: "function_call", call_id: "cs", id: "fc_s", name: "client_nonce_lookup" } })}\n\n` +
       `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "resp_1", output: [] } })}\n\n`
     const upstream = new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } })
     const res = mockRes()
-    await zp.relayResponsesPassthrough(mockReq(), res, upstream, "up", false, null, "read")
+    await zp.relayResponsesPassthrough(mockReq(), res, upstream, "up", false, null, keepable)
     await res.done
     assert.ok(res.body.includes('"name":"client_nonce_lookup"'), "the caller's item passes through")
-    assert.ok(!res.body.includes('"name":"read"'), `the stub's item is dropped: ${res.body}`)
+    assert.ok(!res.body.includes('"name":"read"'), `a call the caller cannot run is dropped: ${res.body}`)
   })
 })
 
