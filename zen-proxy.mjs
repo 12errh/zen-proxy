@@ -2,7 +2,7 @@
 import http from "node:http"
 import fs from "node:fs"
 import path from "node:path"
-import { randomBytes } from "node:crypto"
+import { randomBytes, createHash } from "node:crypto"
 import { fileURLToPath } from "node:url"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -17,12 +17,20 @@ const ENV = process.env
 // because provider-qualified ids legitimately use them (`nvidia/nemotron-3-free`).
 const VALID_MODEL_ID = /^[A-Za-z0-9._:@+/%-]+$/
 
-// Upstream base URL. `/inference/v1` is the base OpenCode documents and the one
-// the CLI itself uses; the older `/zen/v1` path still answers /models but now
-// rejects genuine agent traffic with `403 FreeTierError`, so a config that
-// still points at it silently loses every free model.
-const DEFAULT_UPSTREAM = "https://opencode.ai/inference/v1"
-const LEGACY_UPSTREAMS = new Set(["https://opencode.ai/zen/v1", "https://opencode.ai/zen"])
+// Upstream base URL. OpenCode 2 moved agent traffic to `/inference/openai/v1`
+// (the v2 CLI's own catalog says so, and capture of its real requests confirms
+// it); the old `/inference/v1` base now treats non-CLI traffic as quota-exhausted
+// `429 FreeUsageLimitError`. Configs that still point at the legacy bases are
+// migrated on load — they would silently lose every free model otherwise.
+const DEFAULT_UPSTREAM = "https://opencode.ai/inference/openai/v1"
+// `/models` is only served on the documentend legacy base; discovery keeps it.
+const MODEL_LIST_BASE = "https://opencode.ai/inference/v1"
+const LEGACY_UPSTREAMS = new Set([
+  "https://opencode.ai/zen/v1",
+  "https://opencode.ai/zen",
+  "https://opencode.ai/inference/v1",
+  "https://opencode.ai/inference",
+])
 function normalizeUpstream(v) {
   const u = String(v ?? "").trim().replace(/\/+$/, "")
   if (!u) return DEFAULT_UPSTREAM
@@ -116,6 +124,8 @@ const AGENT_TOOL_MAP = {
   write: { name: "Write", args: { filePath: "file_path" } },
   // null means "this argument has no counterpart on the caller's tool; drop it".
   bash: { name: "Bash", args: { workdir: null } },
+  // v2 renamed the shell tool; callers still see `Bash`.
+  shell: { name: "Bash", args: { workdir: null } },
   grep: { name: "Grep", args: {} },
   glob: { name: "Glob", args: {} },
   list: { name: "LS", args: {} },
@@ -126,7 +136,8 @@ function loadAgentTools() {
   agentToolsCache = []
   try {
     const parsed = JSON.parse(fs.readFileSync(AGENT_TOOLS_PATH, "utf8"))
-    const tools = Array.isArray(parsed?.tools) ? parsed.tools : []
+    // Accept both the wrapped {"tools":[…]} and a bare array capture.
+    const tools = Array.isArray(parsed?.tools) ? parsed.tools : Array.isArray(parsed) ? parsed : []
     // chatToolsToResponses() drops tools without type, which would make the
     // bridge tool unconvertible and kill the process mid-request.
     agentToolsCache = tools.filter((t) => t?.type === "function" && t?.function?.name && AGENT_TOOL_MAP[t.function.name])
@@ -134,10 +145,12 @@ function loadAgentTools() {
   return agentToolsCache
 }
 
-// The gate wants opencode's tools, but a caller that sends none — a plain chat,
-// pi's auto-compaction — has nothing for agentToolsFor() to match. opencode
-// attaches its whole registry on every call and never filters it by relevance,
-// so the proxy sends the whole manifest too; the gate takes it on `read` alone.
+// The gate takes requests that carry opencode's manifest; callers with none of
+// their own — a plain chat, an auto-compaction — still need it attached. The
+// manifest is the v2 upload (6 caller-mappable tools: read/edit/glob/grep/
+// shell/write; measured 200 against the live gateway with the preamble). The
+// model prefers opencode's names, so the relay layers rename manifest calls to
+// the caller's equivalents; un-mappable ones (question, subagent, …) never ride.
 function gateBridgeTools() {
   return config.agentTools ? loadAgentTools() : []
 }
@@ -210,7 +223,71 @@ function gateReadFor(body) {
   if (!Array.isArray(tools) || !tools.length) return null
   const offered = tools.map((t) => t?.function?.name ?? t?.name)
   if (offered.includes("read")) return null
+  // With the real manifest the gate takes a real `read` — the stub only ever
+  // matters when agent-tools.json could not be loaded.
+  if (loadAgentTools().some((t) => t?.function?.name === "read")) return null
   return gateReadTool()
+}
+
+// The gate weighs the *system prompt*, not just the tools. A request whose
+// system text is not opencode's own harness preamble is refused with
+// `429 FreeUsageLimitError` however verisimilar the rest of it is (measured
+// against the live gateway: the full captured preamble streams 200; the same
+// request with a generic assistant prompt, with the opening line alone, or
+// with the preamble cut at ~1.8 KB is refused, all within one minute). The
+// captured text ships as agent-preamble.txt; config semantics:
+//   "" / "auto" — the built-in preamble (default; the shipped file)
+//   "off"/"none" — no preamble (BYOK use, or when the wire is different)
+//   anything else — used verbatim as the preamble
+const AGENT_PREAMBLE_PATH = process.env.ZEN_PROXY_AGENT_PREAMBLE || path.join(__dirname, "agent-preamble.txt")
+const PREAMBLE_MARKER = "You are an AI agent running in OpenCode"
+let agentPreambleCache = null
+function builtInPreamble() {
+  if (agentPreambleCache === null) {
+    try {
+      agentPreambleCache = fs.readFileSync(AGENT_PREAMBLE_PATH, "utf8")
+    } catch {
+      agentPreambleCache = ""
+    }
+  }
+  return agentPreambleCache
+}
+function bridgePreamble() {
+  const v = config.agentPreamble
+  if (v == null) return builtInPreamble()
+  const s = String(v).trim()
+  if (s === "" || s === "auto") return builtInPreamble()
+  if (s === "off" || s === "none") return ""
+  return s
+}
+// A system text that is already opencode-shaped stays untouched, so opencode
+// itself (or a chained proxy) can sit behind zen-proxy without a doubled
+// preamble.
+function combinePreamble(systemText) {
+  const preamble = bridgePreamble()
+  if (!preamble) return systemText
+  if (systemText && systemText.startsWith(PREAMBLE_MARKER)) return systemText
+  return systemText ? `${preamble}\n\n${systemText}` : preamble
+}
+// Prepend the preamble to the first system message of a chat-shaped message
+// array — the single-message form the gate was measured against; splitting
+// them into two system turns is accepted differently.
+function injectPreamble(messages) {
+  const preamble = bridgePreamble()
+  if (!preamble || !Array.isArray(messages)) return messages
+  const at = messages.findIndex((m) => m?.role === "system")
+  // System content is a string or text parts; both join into one string. The
+  // upstream endpoint takes system text as a string, and a system turn never
+  // carries images.
+  const textOf = (m) => (typeof m?.content === "string" ? m.content : Array.isArray(m?.content) ? m.content.map((p) => p?.text ?? "").filter(Boolean).join("\n\n") : "")
+  if (at >= 0) {
+    const combined = combinePreamble(textOf(messages[at]))
+    if (combined === textOf(messages[at])) return messages
+    const out = [...messages]
+    out[at] = { ...messages[at], content: combined }
+    return out
+  }
+  return [{ role: "system", content: preamble }, ...messages]
 }
 
 // An opencode tool call rewritten as the caller's tool call.
@@ -246,7 +323,16 @@ const DEFAULT_CONFIG = {
   host: ENV.HOST ?? "127.0.0.1",
   port: Number(ENV.PORT ?? 8787),
   upstream: normalizeUpstream(ENV.ZEN_URL ?? DEFAULT_UPSTREAM),
-  ua: ENV.ZEN_UA ?? "opencode/1.18.30",
+  // The v2 CLI's own wire format (captured from the real client): channel
+  // "latest", artifact "cli", plus the client/project identity headers below.
+  ua: ENV.ZEN_UA ?? "opencode/latest/2.1.4/cli",
+  // "cli" mirrors x-opencode-client the real CLI sends.
+  clientName: ENV.ZEN_CLIENT ?? "cli",
+  // Stable per-install project identity (sha1 of "directory:<cwd>"), the same
+  // derivation opencode itself uses. Set to override.
+  projectHash: ENV.ZEN_PROJECT_HASH ?? "",
+  // W3C b3/traceparent propagation headers, as the real CLI sends.
+  tracing: ENV.ZEN_TRACING === "0" ? false : true,
   autoUA: ENV.AUTO_UA !== "0",
   uaRefreshMs: Number(ENV.UA_REFRESH_MS ?? 6 * 3600_000),
   injectSession: ENV.INJECT_SESSION !== "0",
@@ -562,7 +648,7 @@ function anthropicImageUrl(block) {
 
 function anthropicToChatMessages(system, messages) {
   const out = []
-  const preamble = String(config.agentPreamble ?? AGENT_PREAMBLE_TEXT ?? "")
+  const preamble = bridgePreamble()
   const sysText = anthropicSystemText(system)
   // Preamble and the client's instructions go into a *single* system message,
   // preamble first. One message is what the upstream gate was measured against;
@@ -658,11 +744,14 @@ function anthropicToChatBody(body, model) {
   if (body?.top_p != null) payload.top_p = body.top_p
   if (Array.isArray(body?.stop_sequences) && body.stop_sequences.length) payload.stop = body.stop_sequences.slice(0, 4)
   const tools = anthropicToolsToChat(body?.tools)
-  // Ship opencode's own tools ahead of the caller's. Without them the free tier
-  // rejects the request outright; the caller's prompt and tools are untouched and
-  // still take priority in the reply.
-  const bridge = agentToolsFor((body?.tools ?? []).map((t) => t?.name))
-  let all = bridge.length ? [...bridge, ...(tools ?? [])] : tools
+  // The gate takes opencode's own manifest on every request (a caller's tools
+  // plus a `read` stub alone is refused since the v2 gateway). The manifest goes
+  // first, the caller's tools after it — minus names that collide with a
+  // manifest name — and the caller's prompt and intent stay untouched.
+  const bridge = gateBridgeTools()
+  const manifestNames = new Set(bridge.map((t) => t?.function?.name))
+  const callerTools = (tools ?? []).filter((t) => !manifestNames.has(t?.function?.name ?? t?.name))
+  let all = bridge.length ? [...bridge, ...callerTools] : callerTools
   // The gate wants a tool named `read` on the list by name alone. A pinned
   // caller whose tools match nothing (a helper like `set_title`) needed the
   // stub already; any other tool-carrying caller needs it too — measured
@@ -1176,6 +1265,29 @@ function ipOmit(ip) {
   return false
 }
 
+// The CLI's trace root is stable per process; spans change per request. Both
+// formats below follow W3C propagation exactly as captured from v2.1.4.
+const traceRoot = randomBytes(16).toString("hex")
+function traceHeaders() {
+  // b3: <traceId>-<spanId>-1-<parentId 16 random>
+  // traceparent: 00-<traceId>-<spanId>-01
+  const span = randomBytes(8).toString("hex")
+  const parent = randomBytes(8).toString("hex")
+  return {
+    b3: `${traceRoot}-${span}-1-${parent}`,
+    traceparent: `00-${traceRoot}-${span}-01`,
+  }
+}
+
+// Project identity mirrors opencode's own derivation for a non-VCS directory:
+// sha1("directory:<resolved path>") — one stable value per proxy install.
+let cachedProjectHash = ""
+function projectHash() {
+  if (config.projectHash) return config.projectHash
+  if (!cachedProjectHash) cachedProjectHash = createHash("sha1").update(`directory:${process.cwd()}`).digest("hex")
+  return cachedProjectHash
+}
+
 function zenHeaders(req, auth) {
   const headers = {
     "content-type": "application/json",
@@ -1189,7 +1301,13 @@ function zenHeaders(req, auth) {
   // header so the pair upstream expects is always complete.
   if (!sess.injected || config.injectSession) {
     for (const h of SESSION_HEADERS) headers[h] = sess.value
+    // v2 parity: the affinity pair echoes the same value under two more names.
+    headers["x-session-affinity"] = sess.value
+    headers["x-session-id"] = sess.value
   }
+  headers["x-opencode-client"] = config.clientName
+  headers["x-opencode-project"] = projectHash()
+  if (config.tracing) for (const [k, v] of Object.entries(traceHeaders())) headers[k] = v
   const ip = clientIp(req)
   if (!ipOmit(ip)) headers["x-real-ip"] = ip
   for (const h of ["x-opencode-request", "x-opencode-client", "x-opencode-project"]) {
@@ -1308,17 +1426,15 @@ async function handleMessages(req, res) {
   // The model the client chose is tried first; transient failures are retried
   // against that same model before the chain moves on.
   const retries = config.retriesPerModel > 0 ? Math.floor(config.retriesPerModel) : 0
-  // Same bridge rule as the chat path: a caller that sends no tools (title-gen
-  // helper calls, plain API use) gets opencode's whole manifest pinned off, or
-  // the gate answers 403 for every model and the request walks the chain.
-  const bridge = (body?.tools ?? []).length ? [] : gateBridgeTools()
-  const bridged = bridge.length > 0
+  // Same bridge rule as the chat path: the manifest rides on every request.
+  // `bridged` now only means "callerless" — a title-gen helper or a plain API
+  // call — which still gets `tool_choice` pinned off so the answer is text.
+  const bridge = gateBridgeTools()
+  const bridged = bridge.length > 0 && !(body?.tools ?? []).length
   // A caller that pins a tool gets a reply that carries only that call: the
-  // provider ignores the pin sometimes, and a stray call (the gate stub's
-  // `read` included) is a tool the caller cannot run. Un-pinned tool callers
-  // still carry the stub on the translated request — the gate refuses any list
-  // without a `read` (same rule the chat path applies) — and the reply filter
-  // drops a stub call like any other un-invited one.
+  // provider ignores the pin sometimes, and stray manifest calls (the
+  // injected `read` included) are tools the caller cannot meaningfully run.
+  // The relay layers keep the pinned call and drop the rest.
   const gateRead = bridged ? null : gateReadFor(body)
   const gateReadName = gateRead ? gateRead.function.name : null
   const pin = bridged ? null : pinnedToolName(body.tool_choice)
@@ -1332,8 +1448,9 @@ async function handleMessages(req, res) {
     // translated body (see anthropicToChatBody) — this must not inject again.
     const chatShaped = anthropicToChatBody(body, model)
     const payload = format === "responses" ? responsesRequest(chatShaped, model, true) : { ...chatShaped, stream: true }
+    // Callerless bridged request: the manifest and preamble are for the gate;
+    // the answer to "summarize this" must be text, not a tool call.
     if (bridged) {
-      payload.tools = format === "responses" ? chatToolsToResponses(bridge) : bridge
       // /responses takes only "auto"; the chat endpoint takes the pin.
       if (format === "responses") delete payload.tool_choice
       else payload.tool_choice = "none"
@@ -1476,7 +1593,12 @@ async function handleChat(req, res, responsesRoute = false) {
   // chat-shaped body on the chat leg is unchanged.
   const responsesRequestShape =
     responsesRoute && body.messages === undefined && body.input !== undefined
-  const chatBody = responsesRequestShape ? responsesInputToChatBody(body) : body
+  // The gate fingerprints the harness system text; the preamble rides on every
+  // wire shape this leg produces (chat messages, chat→responses conversion,
+  // and the native /responses passthrough below).
+  const chatBodyBase = responsesRequestShape ? responsesInputToChatBody(body) : body
+  if (Array.isArray(chatBodyBase?.messages)) chatBodyBase.messages = injectPreamble(chatBodyBase.messages)
+  const chatBody = chatBodyBase
 
   const { requested, candidates } = resolveModel(chatBody.model)
   const isStream = !!chatBody.stream
@@ -1493,17 +1615,34 @@ async function handleChat(req, res, responsesRoute = false) {
   // The model the client chose is tried first; transient failures are retried
   // against that same model before the chain moves on.
   const retries = config.retriesPerModel > 0 ? Math.floor(config.retriesPerModel) : 0
-  const bridge = chatBody.tools?.length ? [] : gateBridgeTools()
-  const bridged = bridge.length > 0
-  // A caller that brings its own tools needs the gate's `read` on the list even
-  // when nothing is pinned (measured: one 403 per model without it). Only the
-  // request changes — `tool_choice` is forwarded untouched. A call to the stub
-  // itself is a call on a tool the caller never offered, so the reply carries
-  // the pinned call only when pinned, and never carries the stub's call.
-  const gateRead = bridged ? null : gateReadFor(chatBody)
+  // The gate refuses any request that does not carry opencode's own tool
+  // manifest — a caller with its own tools used to ride on a bare `read` stub
+  // and now gets refused too. The manifest goes on every request, ahead of the
+  // caller's tools; a caller tool whose name collides with a manifest name is
+  // dropped in favour of the gate's own schema (the reply layer renames and
+  // remaps manifest calls back to the caller's equivalent — see
+  // remapAgentTool — and `Read`/`read` do not collide by case).
+  const bridge = gateBridgeTools()
+  const callerTools = Array.isArray(chatBody.tools) ? chatBody.tools : []
+  const manifestNames = new Set(bridge.map((t) => t?.function?.name))
+  const mergedTools = bridge.length
+    ? [...bridge, ...callerTools.filter((t) => !manifestNames.has(t?.function?.name ?? t?.name))]
+    : callerTools
+  // Only when the manifest could not be loaded does the old stub rule apply.
+  const gateRead = bridge.length ? null : gateReadFor(chatBody)
   const gateReadName = gateRead ? gateRead.function.name : null
-  const pin = bridged ? null : pinnedToolName(chatBody.tool_choice)
-  const requestBody = gateRead ? { ...chatBody, tools: [gateRead, ...chatBody.tools] } : chatBody
+  const requestBody = gateRead
+    ? { ...chatBody, tools: [gateRead, ...mergedTools] }
+    : bridge.length
+      ? { ...chatBody, tools: mergedTools }
+      : chatBody
+  // Same as before: the pin is the caller's own request; only a callerless
+  // bridged request changes `tool_choice` (see the loop below).
+  const pin = pinnedToolName(chatBody.tool_choice)
+  // `bridged` now means "callerless": the manifest rides on every request, so
+  // only a caller without its own tools has the reply stripped of manifest-tool
+  // calls (the caller cannot run any of them — the answer must be text).
+  const bridged = bridge.length > 0 && !callerTools.length
   for (const model of candidates) {
     const chosen = model === candidates[0]
     used = model
@@ -1519,15 +1658,24 @@ async function handleChat(req, res, responsesRoute = false) {
     // /responses caller sent is exactly what upstream wants, so it goes as-is,
     // with `instructions` taking the system slot the translated flow gives it.
     if (responsesRequestShape && format === "responses") {
+      const preamble = bridgePreamble()
+      const caller = typeof body.instructions === "string" && body.instructions
+      const instructions = caller
+        ? (caller.startsWith(PREAMBLE_MARKER) ? caller : `${preamble}\n\n${caller}`)
+        : preamble
       payload.input =
-        typeof body.instructions === "string" && body.instructions
-          ? [{ type: "message", role: "system", content: body.instructions }, ...responsesInputItemArray(body.input)]
+        instructions
+          ? [{ type: "message", role: "system", content: instructions }, ...responsesInputItemArray(body.input)]
           : responsesInputItemArray(body.input)
     }
-    if (bridged) {
-      payload.tools = format === "responses" ? chatToolsToResponses(bridge) : bridge
-      // The gateway takes only "auto" on /responses, so forwarding anything the
-      // caller sent there is a hard error rather than a hint.
+    // A callerless bridged request (title generators, plain API pings): the
+    // manifest is for the gate, not the answer — the ask is text, so the
+    // provider is told not to call anything. A caller that manages its own
+    // tool_choice keeps it; the pin filter in the relay layers holds stray
+    // manifest calls out of the reply.
+    if (!callerTools.length && bridge.length) {
+      // The gateway takes only "auto" on /responses, so forwarding anything
+      // the caller sent there is a hard error rather than a hint.
       if (format === "responses") delete payload.tool_choice
       else payload.tool_choice = "none"
     }
@@ -2255,25 +2403,43 @@ function probeAuthHeader() {
 }
 
 // Health probes have to look like agent traffic or the free-tier gate refuses
-// them with FreeTierError before a model is ever reached: opencode's own tool
-// manifest plus `stream: true` is what a real client sends, so the probe sends
-// exactly that. Without it every model used to land in the "gate-blocked"
-// bucket, which told the user nothing about whether it actually works.
+// them: its `429 FreeUsageLimitError` covers every request it cannot tie to a
+// real opencode client, and a thin `"ping"` with a stub manifest is not one
+// (measured: the recipe below streams 200 while a 2 KB same-header request is
+// refused in the same second). It wants the *harness system text* — a truncated
+// or generic one is refused — and a plausible tool manifest. Sending this shape
+// is also what makes sync buckets land in `working` instead of `rateLimited`,
+// where a refused probe parks the model display-forever.
 function agentProbePayload(id, format) {
   const tools = gateBridgeTools()
+  const preamble = bridgePreamble()
+  const ask = "Reply with exactly OK1 and nothing else."
   if (format === "responses") {
-    const payload = { model: id, input: "ping", max_output_tokens: 32, stream: true }
+    const payload = {
+      model: id,
+      input: [{ role: "user", content: [{ type: "input_text", text: ask }] }],
+      max_output_tokens: 32,
+      stream: true,
+    }
+    if (preamble) payload.instructions = preamble
     const converted = chatToolsToResponses(tools)
     if (converted) payload.tools = converted
     return payload
   }
-  const payload = { model: id, messages: [{ role: "user", content: "ping" }], max_tokens: 5, stream: true }
-  if (tools.length) {
-    payload.tools = tools
-    // The bridge is for the gate, not the answer: a "ping" should come back as
-    // text, never as a tool call.
-    payload.tool_choice = "none"
+  // Mirror the wire shape the real client sends (stream_options and a real
+  // token budget included); no `tool_choice` — the pinned ask keeps the answer
+  // text, and the probe only reads the status anyway.
+  const payload = {
+    model: id,
+    messages: [
+      ...(preamble ? [{ role: "system", content: preamble }] : []),
+      { role: "user", content: ask },
+    ],
+    stream: true,
+    stream_options: { include_usage: true },
+    max_completion_tokens: 32000,
   }
+  if (tools.length) payload.tools = tools
   return payload
 }
 
@@ -2286,8 +2452,17 @@ async function probeModel(id, auth, session) {
     accept: "application/json, text/event-stream",
     authorization: auth,
     "user-agent": config.ua,
+    // v2 wire parity — the gate reads more than the session pair.
+    "x-opencode-client": config.clientName,
+    "x-opencode-project": projectHash(),
   }
-  if (session) for (const h of SESSION_HEADERS) headers[h] = session
+  if (session) {
+    for (const h of SESSION_HEADERS) headers[h] = session
+    // Same affinity pair a real client carries alongside the session pair.
+    headers["x-session-affinity"] = session
+    headers["x-session-id"] = session
+  }
+  if (config.tracing) for (const [k, v] of Object.entries(traceHeaders())) headers[k] = v
   const r = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
     method: "POST",
     headers,
@@ -2753,7 +2928,7 @@ async function fetchModels() {
   if (modelsFetching) return modelsFetching
   modelsFetching = (async () => {
     try {
-      const res = await fetch(`${config.upstream}/models`, {
+      const res = await fetch(`${MODEL_LIST_BASE}/models`, {
         headers: { "user-agent": config.ua },
         signal: AbortSignal.timeout(15_000),
       })
@@ -2791,7 +2966,7 @@ async function syncModels() {
   syncState.at = Date.now()
   const start = Date.now()
   try {
-    const res = await fetch(`${config.upstream}/models`, {
+    const res = await fetch(`${MODEL_LIST_BASE}/models`, {
       headers: { "user-agent": config.ua },
       signal: AbortSignal.timeout(15_000),
     })
@@ -2815,6 +2990,11 @@ async function syncModels() {
     const removeFromCurrent = new Set()
     const auth = probeAuthHeader()
     let idx = 0
+    // Probes run serially with a beat between hops. The gate blanket-403s a
+    // rapid model-hop burst from one identity: with 3 concurrent workers the
+    // identical request shape that streams 200 one-at-a-time landed all 8
+    // models in the gate-blocked bucket within a single 1.8s sync (measured
+    // both ways). ~0.4s apart reads as one focused client, not a scan.
     const probe = async () => {
       while (idx < candidates.length) {
         const id = candidates[idx++]
@@ -2829,7 +3009,15 @@ async function syncModels() {
             }
           } catch {}
           if (r.ok && !bodyErr) { working.push(id); modelHealth.set(id, 0) }
-          else if (r.status === 429 && !bodyErr) { rateLimited.push(id); modelHealth.set(id, 0) }
+          else if (r.status === 429 && (!bodyErr || /free.?usage.?limit/i.test(bodyErr))) {
+            // 429 with the aggregate free-tier quota error (`FreeUsageLimitError …
+            // OpenCode Go`) is a *shared-bucket cooldown*, not model death and not
+            // the user's own usage. It must never reach the fail counter — the
+            // reporter's “8 dead” list came exactly from these falling through to
+            // it three syncs in a row and being silently removed from the list.
+            rateLimited.push(id)
+            modelHealth.set(id, 0)
+          }
           else {
             // Only drop a model from the user's config on definitive proof that it
             // is gone: "not supported", 404, 410 Gone, "no such model", "has been
@@ -2850,7 +3038,7 @@ async function syncModels() {
             // call it flaky, never remove it.
             const isGated = /FreeTierError|free tier can only/i.test(bodyErr)
             // Temporary blocks: keep the model, just remember it is unhealthy.
-            const temporary = /RegionError|not available in your country|rate.?limit|overloaded/i.test(bodyErr)
+            const temporary = /RegionError|not available in your country|rate.?limit|free.?usage.?limit|overloaded/i.test(bodyErr)
             if (gone) { dead.push(id); removeFromCurrent.add(id) }
             else if (isGated) { gated.push(id) }
             else if (authErr) { flaky.push(id) }
@@ -2866,15 +3054,16 @@ async function syncModels() {
               }
             }
           }
+          if (idx < candidates.length) await new Promise((r) => setTimeout(r, 400))
         } catch {
           const fails = (modelHealth.get(id) ?? 0) + 1
           modelHealth.set(id, fails)
-          if (fails >= 3) dead.push(id)
+          if (fails >= 3) { dead.push(id); removeFromCurrent.add(id) }
           else flaky.push(id)
         }
       }
     }
-    await Promise.all([probe(), probe(), probe()])
+    await probe()
     // Keep the user's order, drop only definitively-gone models, then append
     // anything upstream offers that the user doesn't have yet. Temporary blocks
     // never remove a model, and new models appear without any manual step.
@@ -2972,8 +3161,11 @@ async function refreshUA(force = false) {
     const v = String(data?.version ?? "")
     if (!/^\d+\.\d+\.\d+/.test(v)) return uaAutoState.version
     uaAutoState.version = v
-    const next = `opencode/${v}`
-    if (next !== config.ua && /^opencode\/\d+\.\d+\.\d+/.test(config.ua)) {
+    // The v2 CLI advertises `opencode/latest/<version>/cli`; npm only publishes
+    // the 1.x line, so it cannot bump a v2-style UA. Leave those installs alone.
+    const next = `opencode/latest/${v}/cli`
+    const v2Style = /^opencode\/latest\//.test(config.ua)
+    if (!v2Style && next !== config.ua && /^opencode\/\d+\.\d+\.\d+/.test(config.ua)) {
       log(`auto-UA: opencode ${v} released — updating User-Agent`)
       try { saveConfig({ ua: next }) } catch {}
     }
@@ -3338,6 +3530,18 @@ if (isMain) {
     log(`zen-proxy listening on http://${config.host}:${config.port}`)
     log(`upstream ${config.upstream}  UA ${config.ua}  default ${config.defaultModel || "(auto)"}`)
     log(`config file: ${CONFIG_PATH}  UI: /`)
+    // The free-tier gate fingerprints the TLS/HTTP stack; since the v2 gateway
+    // this is load-bearing, not cosmetic — an identical request that streams
+    // 200 under Bun's fetch is bucketed `429 FreeUsageLimitError` from Node's.
+    // Everything else (headers, session mint, body realism) is duplicated here,
+    // so a node:start is the one thing left that changes the verdict.
+    if (typeof Bun === "undefined") {
+      log("")
+      log("⚠  Running under Node. The free-tier gate 429s Node's TLS stack")
+      log("   (FreeUsageLimitError) even for agent-shaped requests. Run under")
+      log("   Bun instead:  bun zen-proxy.mjs   (see README)")
+      log("")
+    }
     if (!fs.existsSync(CONFIG_PATH)) {
       try {
         // fallbackModels is deliberately left out: it comes from models.json, so

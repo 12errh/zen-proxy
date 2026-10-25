@@ -39,6 +39,12 @@ for c in "$ROOT/zen-proxy.mjs" "$ROOT/../zen-proxy.mjs" "$HERE/../zen-proxy.mjs"
 done
 [ -n "$MAIN" ] || die "zen-claude: could not find zen-proxy.mjs"
 
+# The free-tier gateway fingerprints the TLS/HTTP stack: Bun's fetch gets 200
+# where Node's identical request is bucketed `429 FreeUsageLimitError`. Bun is
+# the load-bearing choice; node stays the BYOK fallback.
+RUNNER=node
+if command -v bun >/dev/null 2>&1; then RUNNER=bun; fi
+
 CONFIG="${ZEN_PROXY_CONFIG:-}"
 [ -n "$CONFIG" ] || { for c in "$ROOT/zen-proxy.json" "$ROOT/../zen-proxy.json"; do [ -f "$c" ] && { CONFIG="$c"; break; }; done; }
 PORT=8787
@@ -69,7 +75,7 @@ watch_proxy() {
       break
     fi
     printf 'zen-claude: zen-proxy stopped, restarting (%d/10)…\n' "$restarts" >&2
-    node "$MAIN" >>"$STARTED_LOG" 2>&1 &
+    "$RUNNER" "$MAIN" >>"$STARTED_LOG" 2>&1 &
     pid=$!
     for _ in $(seq 1 40); do
       healthy && break
@@ -95,7 +101,7 @@ trap cleanup EXIT
 if ! healthy; then
   printf 'zen-claude: starting zen-proxy on port %s…\n' "$PORT" >&2
   STARTED_LOG="${TMPDIR:-/tmp}/zen-proxy.$$.log"
-  node "$MAIN" >"$STARTED_LOG" 2>&1 &
+  "$RUNNER" "$MAIN" >"$STARTED_LOG" 2>&1 &
   STARTED_PID=$!
   for _ in $(seq 1 40); do
     healthy && break

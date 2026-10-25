@@ -39,6 +39,15 @@ command -v node >/dev/null 2>&1 || die "Node.js >= 18 is required. See https://n
 NODE_MAJOR=$(node -e 'console.log(process.versions.node.split(".")[0])' 2>/dev/null || echo 0)
 if [ "$NODE_MAJOR" -lt 18 ]; then die "Node.js >= 18 is required (found $(node -v)). See https://nodejs.org"; fi
 
+# The free tier fingerprints the client's TLS/HTTP stack: Node's fetch is
+# bucketed `429 FreeUsageLimitError` even for agent-shaped requests, Bun's is
+# not. Bun is the anonymous (no-key) mode's requirement; BYOK works on node
+# because a real key bypasses the free-tier gate.
+if ! command -v bun >/dev/null 2>&1; then
+  info "NOTE: bun not found — anonymous 'public' access needs it (Node's stack gets 429'd on the free tier)."
+  info "      Install with: curl -fsSL https://bun.sh/install | bash"
+fi
+
 mkdir -p "$INSTALL_DIR"
 info "Installing zen-proxy to $INSTALL_DIR"
 
@@ -101,6 +110,11 @@ fi
 
 cat > "$INSTALL_DIR/zen-proxy" <<EOF
 #!/usr/bin/env bash
+# Bun first: the free-tier gate fingerprints the TLS/HTTP stack and bucket 429s
+# Node's (FreeUsageLimitError) even for perfectly agent-shaped requests.
+if command -v bun >/dev/null 2>&1; then
+  exec bun "$INSTALL_DIR/zen-proxy.mjs" "\$@"
+fi
 exec node "$INSTALL_DIR/zen-proxy.mjs" "\$@"
 EOF
 chmod +x "$INSTALL_DIR/zen-proxy"
@@ -159,16 +173,18 @@ if command -v systemctl >/dev/null 2>&1 && [ -w /etc/systemd/system ]; then
   info ""
   read -r -p "Install as a systemd service (auto-start)? [y/N] " ans || true
   if [[ "$ans" =~ ^[Yy]$ ]]; then
-    cat > /etc/systemd/system/zen-proxy.service <<SVC
+    # Prefer Bun: the gateway 429s Node's TLS stack on the free tier even for
+# agent-shaped requests (see README). Node keeps working for BYOK keys.
+SYSTEM_RUNNER=$(command -v bun || command -v node)
+cat > /etc/systemd/system/zen-proxy.service <<SVC
 [Unit]
 Description=Zen Proxy
 After=network.target
 
 [Service]
-ExecStart=$(command -v node) $INSTALL_DIR/zen-proxy.mjs
+ExecStart=$SYSTEM_RUNNER $INSTALL_DIR/zen-proxy.mjs
 Restart=always
 RestartSec=3
-Environment=NODE_ENV=production
 
 [Install]
 WantedBy=multi-user.target

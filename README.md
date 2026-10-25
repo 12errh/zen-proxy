@@ -11,7 +11,7 @@
     <img src="https://img.shields.io/badge/Discord-Join%20the%20server-5865F2?style=flat-square&labelColor=1a1612&logo=discord&logoColor=white" alt="Join the Discord server">
   </a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-ccf73a?style=flat-square&labelColor=1a1612" alt="MIT License"></a>
-  <img src="https://img.shields.io/badge/node-%3E%3D18-8b8b8b?style=flat-square&labelColor=1a1612" alt="Node 18+">
+  <img src="https://img.shields.io/badge/bun-1.2%2B%20(or%20node%2018%2B%20BYOK)-8b8b8b?style=flat-square&labelColor=1a1612" alt="Bun 1.2+">
   <img src="https://img.shields.io/badge/dependencies-0-8b8b8b?style=flat-square&labelColor=1a1612" alt="Zero dependencies">
   <a href="#any-openai-compatible-agent">
     <img src="https://img.shields.io/badge/OpenAI_compatible-8b8b8b?style=flat-square&labelColor=1a1612&logo=openai" alt="OpenAI compatible">
@@ -73,7 +73,7 @@ Confirm the proxy is up:
 
 ```bash
 curl -s http://127.0.0.1:8787/health
-# {"ok":true,"upstream":"https://opencode.ai/inference/v1"}
+# {"ok":true,"upstream":"https://opencode.ai/inference/openai/v1"}
 ```
 
 <details>
@@ -108,42 +108,42 @@ The free-model catalog in [`models.json`](models.json) is refreshed from OpenCod
 
 ## Why a proxy is needed
 
-OpenCode's free models are served only to the OpenCode CLI itself. Everyone else gets:
+OpenCode's free models are served only to the OpenCode CLI itself. Everyone else gets one of:
 
 ```
 403 FreeTierError: OpenCode's free tier can only be used from within OpenCode
+429 FreeUsageLimitError: Free usage limit reached …   ← what you get instead now
 ```
 
-zen-proxy sits in front of that gateway and identifies your agent as a real session.
+Since OpenCode 2, the second one is what a non-CLI client sees — with a `retry-after` window and zero personal usage. It is not your quota: it is the gate's verdict on the request.
+
+zen-proxy sits in front of that gateway and makes your agent's traffic indistinguishable from the CLI's, on three layers — all measured from a byte-capture of a real OpenCode 2.1.4 request.
 
 <details>
 <summary>What it actually changes</summary>
 
 | Gateway requirement | What zen-proxy does |
 |---|---|
-| `x-opencode-session` **and** `x-opencode-session-id`, same value | Mints a stable per-client id and sends both |
-| The id must look real — its first 12 hex chars encode a timestamp | Generates ids in OpenCode's own format, not random hex |
-| Base must be `https://opencode.ai/inference/v1` | Uses it, and migrates configs still pointing at the retired `/zen/v1` |
-| Streaming, a system message, tool definitions | Real agents already send these; the proxy fills gaps where it can |
+| **Run under Bun.** The gate fingerprints the TLS/HTTP stack — the exact bytes that stream `200` under Bun's fetch get `429 FreeUsageLimitError` from Node's (same second, same session) | `zen-proxy` / `zen-claude` prefer bun; node works with a BYOK key, and the proxy warns at boot under node |
+| The v2 endpoint `https://opencode.ai/inference/openai/v1` | Uses it, and migrates old configs pointing at `/inference/v1` or `/zen/v1` |
+| The v2 wire identity: `x-opencode-client`, `x-opencode-project` (sha1, per-install), `b3`/`traceparent`, affinity pair | Sends all of it, in the CLI's own formats |
+| The **OpenCode harness system text** — requests whose system prompt is not the CLI's harness preamble are refused however agent-shaped the rest is (a generic prompt, the opening line, or a ~1.8 KB cut of it are all refused) | Prepends the captured harness preamble (`agent-preamble.txt`) ahead of your agent's own instructions, on every route, idempotently |
+| OpenCode's own tool manifest (the gate refuses a bare `read` stub now) | Attaches the captured v2 manifest (`agent-tools.json`: read/edit/glob/grep/shell/write are the ones whose name your agent maps to) alongside your tools and renames the resulting calls back |
+| Streams with `stream_options` and a real `max_completion_tokens` | Mirrors the CLI's shape on health probes, and forwards yours untouched |
 
-For `/v1/messages` specifically, the gateway also requires OpenCode's own tool manifest, so zen-proxy attaches those tools alongside Claude Code's and renames the resulting calls back. **Claude Code's system prompt is passed through untouched.**
+**Run it with bun** (`bun zen-proxy.mjs`, or through `zen-proxy`/`zen-claude`, which pick bun when present): that is the one requirement node cannot substitute away — the gateway 429s node's stack even though headers, sessions and bodies are byte-identical.
 
-The OpenAI-shaped routes get no name mapping, so they are handled differently: a request carrying **no tools at all** — an agent's own internal call, like summarization or title generation — is given OpenCode's own tool manifest so it passes the gate, exactly as opencode sends it on every call. The gateway does not honour `tool_choice: "none"` — it answers a plain summarization prompt with real `read` calls — so any tool call is stripped from the reply instead, on both OpenAI-shaped routes.
-
-A request that brings **its own tools** and pins one of them with `tool_choice` — a forced-tool helper, like a title or label call — needs the same `read` in the list, or the gateway refuses the whole request. The proxy adds a **stub** named `read` for exactly those calls: the gate looks at the tool's name and nothing else, and the pin is what makes it safe to add one, because a caller that pins a function cannot be asked for anything else. Your tool list and your pin are forwarded untouched.
-
-The pin is not enforcement, though — the gateway hands it to the provider, and the provider may still answer with a call you never offered. The stub is deliberately a stub for that reason: OpenCode's own `read` schema invites the model to call it, and a pinned helper that comes back with a stray `read` is a tool your client cannot run. So a pinned reply is **filtered down to the pinned call** — on all three routes, streaming included — and a reply whose every call got dropped ends as a plain stop instead of claiming a tool call that does not exist. An unpinned agent turn is never filtered.
+For replies: an agent turn with its own tools keeps them pinned and forwarded untouched, and a reply with no tools attached (stray manifest calls) is filtered. Health probes send the same harness preamble + manifest + a real ask (serially, spaced out — the gate blanket-403s a rapid model-hop burst from one identity), so a model in the dashboard's `ok` row genuinely answered; the old `rate-limited` parking behaviour is gone (a `FreeUsageLimitError` bucket no longer removes or dead-labels a model).
 </details>
 
 <details>
 <summary>Gotchas worth knowing before you file a bug</summary>
 
 - **This rides an anonymous free tier.** Per-IP quotas, shared pool, sometimes saturated. Bring a key if you need reliability.
-- **A bare `curl` gets `403`.** The gateway only answers genuine *agent* traffic. Every agent above does this; a hand-rolled chat client won't.
-- **Health probes are agent-shaped.** Sync sends each model the same thing a real client sends — opencode's tool manifest plus `stream: true` — so `ok` means the model genuinely answered. A model marked `gate-blocked` is one the free-tier gate refused even for that shape; blocks lift on their own and the model is never dropped. Real traffic is still tracked on top (`ok (live traffic)`).
-- **Probing tells real health; the catalog tells existence.** A retired model answers `400 Model is unavailable` and is not added, while a live one answers with a stream — so the list reflects what actually works, not just what upstream advertises.
+- **A bare `curl` gets 429/403.** The gateway only answers genuine *agent* traffic (harness preamble, manifest, plausible wire) — every agent above does this; a hand-rolled chat client won't.
+- **Health probes are agent-shaped.** Sync sends each model the same thing a real v2 client sends — harness preamble, OpenCode's manifest, `stream_options`, a real token budget — serially, with a beat between hops (a rapid burst from one identity is blanket-refused), so `ok` means the model actually streamed. A `FreeUsageLimitError` probe never marks a model dead or drops it from your list.
 - **Fallbacks announce themselves** via `zen_served_by` and the `x-zen-served-by` / `x-zen-fallback` headers.
-- **`agent-tools.json` is a capture of OpenCode's tools.** If OpenCode changes its tool schemas, the `/v1/messages` bridge may stop satisfying the gateway. Re-capture it from any OpenCode request.
+- **`agent-tools.json` and `agent-preamble.txt` are captures of OpenCode v2.1.4's request.** If OpenCode changes its harness text or tool schemas, re-capture both from any real request (the gate fingerprints the preamble; the first 139 characters are not enough). The preamble file is plain text; the tools file accepts a bare array or `{"tools":[...]}`.
 </details>
 
 ---
@@ -158,10 +158,12 @@ The pin is not enforcement, though — the gateway hands it to the provider, and
 | Key | Default | Description |
 |---|---|---|
 | `host` / `port` | `127.0.0.1` / `8787` | Bind address (restart required) |
-| `upstream` | `https://opencode.ai/inference/v1` | Zen gateway base |
-| `ua` / `autoUA` | `opencode/1.18.30` / `true` | User-Agent sent upstream; auto-tracks OpenCode releases |
-| `injectSession` | `true` | Mint and send the session header pair |
-| `agentTools` | `true` | Attach OpenCode's tools to `/v1/messages`, and to tool-less requests on the OpenAI-shaped routes |
+| `upstream` | `https://opencode.ai/inference/openai/v1` | Zen gateway base (v2; discovery stays on `/inference/v1`) |
+| `ua` / `autoUA` | `opencode/latest/2.1.4/cli` / `true` | The v2 CLI's UA format; auto-tracking skips v2-style UAs (npm only carries 1.x) |
+| `clientName` / `projectHash` / `tracing` | `cli` / auto / `true` | The v2 identity headers: `x-opencode-client`, per-install `x-opencode-project` (sha1 of `directory:<cwd>`), `b3`/`traceparent` |
+| `injectSession` | `true` | Mint and send the session header pair + affinity pair |
+| `agentPreamble` | `""` (= auto) | `""`/`auto` → shipped harness preamble; `off`/`none` → none; other text → used verbatim |
+| `agentTools` | `true` | Attach OpenCode's v2 manifest to every request, ahead of your agent's tools; calls are renamed back |
 | `defaultModel` | `""` | Empty = auto-pick the first working free model |
 | `fallbackModels` | *(from [`models.json`](models.json))* | Tried in order on failure. Omit to follow the catalog; save once to pin your own list |
 | `modelAliases` | `{}` | e.g. `{"gpt-4o": "space-bunny-free"}` |
@@ -173,7 +175,7 @@ The pin is not enforcement, though — the gateway hands it to the provider, and
 | `autoSync` / `autoSyncIntervalMs` | `true` / `3600000` | Runtime discovery of newly-offered free models |
 | `trustForwarded` | `false` | Honour `x-forwarded-for` behind a reverse proxy |
 
-`HOST` `PORT` `ZEN_URL` `ZEN_UA` `INJECT_SESSION=0` `AUTO_UA=0` `UA_REFRESH_MS` `AGENT_TOOLS=0` `PROBE_AUTH` `DEFAULT_MODEL` `FALLBACK_MODELS` `MODEL_ALIASES` `RESPONSES_MODELS` `PROXY_KEY` `ZEN_KEY` `TRUST_FORWARDED=1` `TIMEOUT_MS` `CACHE_MS` `RATE_LIMIT_MAX` `RATE_LIMIT_WINDOW_MS` `AUTO_SYNC=0` `AUTO_SYNC_MS` `ZEN_PROXY_CONFIG`
+`HOST` `PORT` `ZEN_URL` `ZEN_UA` `ZEN_CLIENT` `ZEN_PROJECT_HASH` `ZEN_TRACING=0` `INJECT_SESSION=0` `AUTO_UA=0` `UA_REFRESH_MS` `AGENT_TOOLS=0` `AGENT_PREAMBLE=off` `ZEN_PROXY_AGENT_TOOLS` `ZEN_PROXY_AGENT_PREAMBLE` `PROBE_AUTH` `DEFAULT_MODEL` `FALLBACK_MODELS` `MODEL_ALIASES` `RESPONSES_MODELS` `PROXY_KEY` `ZEN_KEY` `TRUST_FORWARDED=1` `TIMEOUT_MS` `CACHE_MS` `RATE_LIMIT_MAX` `RATE_LIMIT_WINDOW_MS` `AUTO_SYNC=0` `AUTO_SYNC_MS` `ZEN_PROXY_CONFIG`
 
 Anonymous `public` access shares a per-IP quota that is sometimes saturated. Set `defaultZenKey`, or send `x-zen-key` per request, for steadier service.
 </details>
