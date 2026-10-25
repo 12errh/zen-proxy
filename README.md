@@ -128,12 +128,12 @@ zen-proxy sits in front of that gateway and makes your agent's traffic indisting
 | The v2 endpoint `https://opencode.ai/inference/openai/v1` | Uses it, and migrates old configs pointing at `/inference/v1` or `/zen/v1` |
 | The v2 wire identity: `x-opencode-client`, `x-opencode-project` (sha1, per-install), `b3`/`traceparent`, affinity pair | Sends all of it, in the CLI's own formats |
 | The **OpenCode harness system text** — requests whose system prompt is not the CLI's harness preamble are refused however agent-shaped the rest is (a generic prompt, the opening line, or a ~1.8 KB cut of it are all refused) | Prepends the captured harness preamble (`agent-preamble.txt`) ahead of your agent's own instructions, on every route, idempotently |
-| OpenCode's own tool manifest (the gate refuses a bare `read` stub now) | Attaches the captured v2 manifest (`agent-tools.json`: read/edit/glob/grep/shell/write are the ones whose name your agent maps to) alongside your tools and renames the resulting calls back |
+| OpenCode's own tool manifest (the gate refuses a bare `read` stub now) | Attaches the captured v2 manifest (`agent-tools.json`: read/edit/glob/grep/shell/write are the ones whose name your agent maps to) ahead of your tools, renames the mapped calls back to your agent's names, and drops the rest |
 | Streams with `stream_options` and a real `max_completion_tokens` | Mirrors the CLI's shape on health probes, and forwards yours untouched |
 
 **Run it with bun** (`bun zen-proxy.mjs`, or through `zen-proxy`/`zen-claude`, which pick bun when present): that is the one requirement node cannot substitute away — the gateway 429s node's stack even though headers, sessions and bodies are byte-identical.
 
-For replies: an agent turn with its own tools keeps them pinned and forwarded untouched, and a reply with no tools attached (stray manifest calls) is filtered. Health probes send the same harness preamble + manifest + a real ask (serially, spaced out — the gate blanket-403s a rapid model-hop burst from one identity), so a model in the dashboard's `ok` row genuinely answered; the old `rate-limited` parking behaviour is gone (a `FreeUsageLimitError` bucket no longer removes or dead-labels a model).
+For replies, one rule: a reply may only carry calls your agent can actually run. An agent turn with its own tools keeps its calls (mapped manifest calls come back renamed) and loses everything else — manifest names it has no counterpart for, and tool names the provider invents; a `tool_choice`-pinned turn keeps only the pinned call; a reply with no tools attached at all (title generators, plain pings) is stripped of every `tool_call`. Health probes send the same harness preamble + manifest + a real ask (serially, spaced out — the gate blanket-403s a rapid model-hop burst from one identity), so a model in the dashboard's `ok` row genuinely answered; the old `rate-limited` parking behaviour is gone (a `FreeUsageLimitError` bucket no longer removes or dead-labels a model).
 </details>
 
 <details>
@@ -163,7 +163,7 @@ For replies: an agent turn with its own tools keeps them pinned and forwarded un
 | `clientName` / `projectHash` / `tracing` | `cli` / auto / `true` | The v2 identity headers: `x-opencode-client`, per-install `x-opencode-project` (sha1 of `directory:<cwd>`), `b3`/`traceparent` |
 | `injectSession` | `true` | Mint and send the session header pair + affinity pair |
 | `agentPreamble` | `""` (= auto) | `""`/`auto` → shipped harness preamble; `off`/`none` → none; other text → used verbatim |
-| `agentTools` | `true` | Attach OpenCode's v2 manifest to every request, ahead of your agent's tools; calls are renamed back |
+| `agentTools` | `true` | Attach OpenCode's v2 manifest to every request, ahead of your agent's tools; replies keep only the calls your agent can run — mapped ones renamed back, the rest dropped |
 | `defaultModel` | `""` | Empty = auto-pick the first working free model |
 | `fallbackModels` | *(from [`models.json`](models.json))* | Tried in order on failure. Omit to follow the catalog; save once to pin your own list |
 | `modelAliases` | `{}` | e.g. `{"gpt-4o": "space-bunny-free"}` |
