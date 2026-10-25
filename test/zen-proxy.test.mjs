@@ -401,6 +401,20 @@ describe("identityFor", () => {
     assert.equal(later.project, "f".repeat(40), "the configured pin holds across rotations")
   })
 
+  test("every forwarded request leaves its identity in the log feed", () => {
+    const before = zp.logLines.length
+    zp.recordReq(mockReq({ remoteAddress: "3.6.6.6", headers: { "user-agent": "ua-log-a/1" } }), "m-free", 10, 200)
+    zp.recordReq(mockReq({ remoteAddress: "3.6.6.6", headers: { "user-agent": "ua-log-b/2" } }), "m-free", 10, 200)
+    const a = zp.logLines[before].msg
+    const b = zp.logLines[before + 1].msg
+    assert.match(a, /req 200 m-free 10ms ses_[0-9a-f]+…[0-9A-Za-z]{4}\(injected\) prj:[0-9a-f]{8}/)
+    const tailOf = (line) => line.match(/…([0-9A-Za-z]{4})\(/)[1]
+    assert.notEqual(tailOf(a), tailOf(b), "two callers, two distinct identities in the feed")
+    zp.recordReq(mockReq({ headers: { "x-opencode-session": "ses_stablecfg001" } }), "m-free", 10, 200)
+    const c = zp.logLines[before + 2].msg
+    assert.match(c, /ses_stablec…g001\(client\) prj:/, "a caller-supplied id shows as client, untouched")
+  })
+
   test("zenHeaders sends the minted session and project as one pair", () => {
     zp.saveConfig({ projectHash: "" })
     const req = mockReq({ remoteAddress: "9.10.10.10", headers: { "user-agent": "zen-headers/1" } })
@@ -1676,6 +1690,111 @@ describe("handleChat", () => {
     assert.equal(res.state.status, 200)
     assert.match(res.body, new RegExp(`"model":"${m.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`))
     assert.ok(res.body.includes("data: [DONE]"))
+  })
+})
+
+describe("exhausted free verdict + BYOK escalation", () => {
+  const PITCH = "Free usage limit reached. Subscribe to OpenCode Go for higher limits."
+
+  test("classifier: the upgrade pitch is spent, the bare shared cooldown is not", () => {
+    assert.ok(zp.exhaustedFreeVerdict(429, { error: { message: PITCH } }), "the pitch is the spent verdict")
+    assert.ok(
+      zp.exhaustedFreeVerdict(429, { error: { type: "FreeUsageLimitError", message: "Free usage limit reached — your window resets." } }),
+      "message wording decides, not the error type",
+    )
+    assert.ok(!zp.exhaustedFreeVerdict(429, { error: { message: "FreeUsageLimitError" } }), "bare shared-bucket text never escalates")
+    assert.ok(!zp.exhaustedFreeVerdict(429, { error: { type: "FreeUsageLimitError", message: "" } }))
+    assert.ok(!zp.exhaustedFreeVerdict(403, { error: { type: "FreeTierError", message: PITCH } }), "only a 429 is a spent allowance")
+    assert.ok(!zp.exhaustedFreeVerdict(429, null), "no body, no pitch, no escalation")
+  })
+
+  test("a spent allowance retries the same attempt once under the configured key", async () => {
+    zp.saveConfig({ retriesPerModel: 0, defaultZenKey: "zen-byok-1", retryBackoffMs: 1 })
+    const [m1] = zp.config.fallbackModels
+    const auths = []
+    let calls = 0
+    globalThis.fetch = routeFetch([
+      ["/chat/completions", (_u, opts) => {
+        calls++
+        auths.push(opts.headers.authorization)
+        return calls === 1
+          ? jsonResponse({ error: { message: PITCH } }, 429)
+          : jsonResponse({ model: m1, choices: [{ message: { role: "assistant", content: "saved" } }] })
+      }],
+    ])
+    const req = mockReq({ headers: { authorization: "Bearer own-key" }, _body: JSON.stringify({ model: m1, messages: [] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 200)
+    assert.deepEqual(
+      auths,
+      ["Bearer own-key", "Bearer zen-byok-1"],
+      "exactly one escalation, on the same attempt — no extra attempt budget",
+    )
+    assert.equal(calls, 2)
+  })
+
+  test("the shared-bucket cooldown never escalates — the chain just walks on", async () => {
+    zp.saveConfig({ retriesPerModel: 0, defaultZenKey: "zen-byok-1", retryBackoffMs: 1 })
+    const [m1, m2] = zp.config.fallbackModels
+    const auths = []
+    let calls = 0
+    globalThis.fetch = routeFetch([
+      ["/chat/completions", (_u, opts) => {
+        calls++
+        auths.push(opts.headers.authorization)
+        return jsonResponse({ error: { message: "FreeUsageLimitError" } }, 429)
+      }],
+    ])
+    const req = mockReq({ headers: { authorization: "Bearer own-key" }, _body: JSON.stringify({ model: m1, messages: [] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 429)
+    assert.ok(auths.length >= 2, "walked the chain instead of escalating")
+    assert.ok(!auths.includes("Bearer zen-byok-1"), "a shared cooldown must never spend the configured key")
+  })
+
+  test("no key configured, a spent allowance has nothing to escalate to", async () => {
+    zp.saveConfig({ retriesPerModel: 0, defaultZenKey: "", retryBackoffMs: 1 })
+    const [m1, m2] = zp.config.fallbackModels
+    const auths = []
+    globalThis.fetch = routeFetch([
+      ["/chat/completions", (_u, opts) => {
+        auths.push(opts.headers.authorization)
+        return jsonResponse({ error: { message: PITCH } }, 429)
+      }],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: m1, messages: [] }) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 429)
+    assert.match(res.body, /Free usage limit reached/)
+    for (const a of auths) assert.equal(a, "Bearer public")
+  })
+
+  test("the Anthropic loop escalates the same way", async () => {
+    zp.saveConfig({ retriesPerModel: 0, defaultZenKey: "zen-byok-2", retryBackoffMs: 1 })
+    const [m1] = zp.config.fallbackModels
+    const auths = []
+    let calls = 0
+    globalThis.fetch = routeFetch([
+      ["/chat/completions", (_u, opts) => {
+        calls++
+        auths.push(opts.headers.authorization)
+        return calls === 1
+          ? jsonResponse({ error: { message: PITCH } }, 429)
+          : jsonResponse({ model: m1, choices: [{ message: { role: "assistant", content: "hola" } }] })
+      }],
+    ])
+    const req = mockReq({
+      headers: { authorization: "Bearer own-key" },
+      _body: JSON.stringify({ model: m1, max_tokens: 64, messages: [{ role: "user", content: "hey" }] }),
+      url: "/v1/messages",
+    })
+    const res = mockRes()
+    await zp.handleMessages(req, res)
+    assert.equal(res.state.status, 200)
+    assert.deepEqual(auths, ["Bearer own-key", "Bearer zen-byok-2"], "one same-attempt escalation, once per request")
   })
 })
 

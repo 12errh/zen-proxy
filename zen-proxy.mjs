@@ -633,6 +633,23 @@ function transientUpstream(status, body) {
   return t === "server_error" || t === "api_error" || t === "upstream_error" || t === "ProviderError"
 }
 
+// Two different 429s come back from this gateway, and only one of them is the
+// caller's own usage running out. The shared-bucket cooldown says its bare
+// error text (`FreeUsageLimitError`, a `retry-after` window, nobody's personal
+// allowance involved — the gate's own verdict on a request it cannot tie to a
+// client). A spent identity answers with the upgrade pitch instead —
+// "Free usage limit reached. Subscribe to OpenCode Go" — the same words the
+// real CLI logs when its anonymous allowance is genuinely gone (measured
+// 2026-10-24). Only the pitch earns escalating the same attempt to BYOK; a
+// shared cooldown bought with the user's key would drain paid quota against a
+// wall that lifts itself in a few seconds.
+function exhaustedFreeVerdict(status, body) {
+  if (status !== 429) return false
+  const e = body?.error ?? body ?? {}
+  const text = `${e.type ?? ""} ${e.message ?? ""}`
+  return /free usage limit reached|subscribe to opencode go/i.test(text)
+}
+
 // ---- endpoint family resolution -------------------------------------------
 // Zen serves each model on one endpoint family. We translate to/from the
 // Responses API ourselves instead of pattern-matching a single vendor in code,
@@ -1231,6 +1248,12 @@ function log(message) {
 
 function recordReq(req, model, ms, status, at = Date.now()) {
   const entry = { at, ip: clientIp(req), model, status, ms }
+  // Identity observability: the log feed is where a human confirms identities
+  // rotate across windows and stay stable when a caller brings its own. The
+  // id's head encodes its mint time (rotation), its random tail the identity
+  // itself — so both ends travel, and never the whole id in a log file.
+  const id = identityFor(req)
+  log(`req ${status} ${model} ${ms}ms ${id.session.slice(0, 11)}…${id.session.slice(-4)}${id.injected ? "(injected)" : "(client)"} prj:${id.project.slice(0, 8)}`)
   const key = `${entry.at}|${entry.model}|${entry.status}`
   if (!requestStats.recent.length || requestStats.recent[requestStats.recent.length - 1][0] !== key) {
     requestStats.recent.push([key, 1, ms])
@@ -1443,6 +1466,7 @@ async function handleMessages(req, res) {
   // rather than failing the request outright.
   const fallbackAuth = config.proxyKey ? null : config.defaultZenKey ? `Bearer ${config.defaultZenKey}` : "Bearer public"
   let triedFallback = false
+  let triedByok = false
 
   let lastErr = null
   let lastStatus = 502
@@ -1563,6 +1587,23 @@ async function handleMessages(req, res) {
         lastErr = { error: { type: "invalid_request_error", message: `upstream returned ${upstreamRes.status}` } }
       }
       lastStatus = upstreamRes.status
+      // The one 429 that is the caller's own spent allowance: retry the same
+      // attempt under the configured key before the chain moves on. Same
+      // attempt budget (attempt-- mirrors the 401 fallback above), once per
+      // request, and the key value never reaches the log.
+      if (
+        upstreamRes.status === 429 &&
+        !triedByok &&
+        config.defaultZenKey &&
+        auth !== `Bearer ${config.defaultZenKey}` &&
+        exhaustedFreeVerdict(upstreamRes.status, lastErr)
+      ) {
+        triedByok = true
+        auth = `Bearer ${config.defaultZenKey}`
+        log(`   exhausted free allowance on ${model} — same attempt once under BYOK (${maskKey(config.defaultZenKey)})`)
+        attempt--
+        continue
+      }
       const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
       if (transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
         delayMs = Math.max(config.retryBackoffMs * (attempt + 1), retryAfterMs)
@@ -1630,11 +1671,12 @@ async function handleChat(req, res, responsesRoute = false) {
 
   const { requested, candidates } = resolveModel(chatBody.model)
   const isStream = !!chatBody.stream
-  const auth = authForUpstream(req)
+  let auth = authForUpstream(req)
   if (!auth) {
     recordReq(req, requested, Date.now() - start, 401)
     return json(res, 401, { error: { type: "invalid_request_error", message: "invalid proxy key" } })
   }
+  let triedByok = false
   let lastErr = null
   let lastStatus = 502
   let firstErr = null
@@ -1812,6 +1854,23 @@ async function handleChat(req, res, responsesRoute = false) {
         lastErr = { error: { type: "invalid_request_error", message: `upstream returned ${upstreamRes.status}` } }
       }
       lastStatus = upstreamRes.status
+      // Same BYOK escalation as the Anthropic loop: a genuinely spent identity
+      // ("Free usage limit reached") retries the same attempt under the
+      // configured key — once per request, no extra attempt budget, no shared
+      // cooldown ever mistaken for exhausted, key value never logged.
+      if (
+        upstreamRes.status === 429 &&
+        !triedByok &&
+        config.defaultZenKey &&
+        auth !== `Bearer ${config.defaultZenKey}` &&
+        exhaustedFreeVerdict(upstreamRes.status, lastErr)
+      ) {
+        triedByok = true
+        auth = `Bearer ${config.defaultZenKey}`
+        log(`   exhausted free allowance on ${model} — same attempt once under BYOK (${maskKey(config.defaultZenKey)})`)
+        attempt--
+        continue
+      }
       const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
       if (transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
         delayMs = Math.max(config.retryBackoffMs * (attempt + 1), retryAfterMs)
@@ -3716,6 +3775,7 @@ export {
   parseRetryAfter,
   retryableUpstream,
   transientUpstream,
+  exhaustedFreeVerdict,
   maxBodyBytes,
   toBool,
   identityFor,
