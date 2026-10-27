@@ -80,31 +80,8 @@ function loadShippedModels() {
 // The exact text matters: the gate is not satisfied by neutral or generic agent
 // boilerplate (tested), only by opencode's real framing, and it degrades if the
 // preamble is truncated much below this length. It is prepended, never
-// substituted, so the client's own system prompt is always preserved.
-const AGENT_PREAMBLE_TEXT = `You are a title generator. You output ONLY a thread title. Nothing else.
-
-<task>
-Generate a brief title that would help the user find this conversation later.
-
-Follow all rules in <rules>
-Use the <examples> so you know what a good title looks like.
-Your output must be:
-- A single line
-- ≤50 characters
-- No explanations
-</task>
-
-<rules>
-- you MUST use the same language as the user message you are summarizing
-- Title must be grammatically correct and read naturally - no word salad
-- Never include tool names in the title (e.g. "read tool", "bash tool", "edit tool")
-- Focus on the main topic or question the user needs to retrieve
-- Vary your phrasing - avoid repetitive patterns like always starting with "Analyzing"
-- If a file is mentioned, focus on WHAT the user wants to do WITH the file, not just that they shared it
-- Keep exact: technical terms, numbers, filenames, HTTP codes
-- Remove: the, this, my, a, an
-- Never assume tech stack
-- Never use tools`
+// substituted, so the client's own system prompt is always preserved. The text
+// itself ships as agent-preamble.txt and is loaded by bridgePreamble().
 
 // ---- opencode agent tools ---------------------------------------------------
 // Measured behaviour of the free tier's gate: a request is accepted when it
@@ -293,9 +270,32 @@ function remapAgentTool(name, rawArgs) {
 // The default mirrors Anthropic's own 32MB guidance; `maxBodyBytes` overrides it.
 const MAX_BODY = 32 * 1024 * 1024
 
+// Env-var JSON used to be parsed inline in the object literal above, so one
+// malformed variable (a trailing comma in FALLBACK_MODELS) threw during module
+// import — before any config, logging or server existed — and killed the
+// process with a bare SyntaxError. Parse defensively: a bad value falls back to
+// the default and says so, and the rest of the configuration still loads.
+function envJson(name, dflt) {
+  const raw = ENV[name]
+  if (typeof raw !== "string" || !raw.trim()) return dflt
+  try {
+    return JSON.parse(raw)
+  } catch (err) {
+    console.error(`zen-proxy: ${name} is not valid JSON (${err.message}); using the default`)
+    return dflt
+  }
+}
+
+function envNum(name, dflt) {
+  const raw = ENV[name]
+  if (raw == null || raw === "") return dflt
+  const n = Number(raw)
+  return Number.isFinite(n) ? n : dflt
+}
+
 const DEFAULT_CONFIG = {
   host: ENV.HOST ?? "127.0.0.1",
-  port: Number(ENV.PORT ?? 8787),
+  port: envNum("PORT", 8787),
   upstream: normalizeUpstream(ENV.ZEN_URL ?? DEFAULT_UPSTREAM),
   // The v2 CLI's own wire format (captured from the real client): channel
   // "latest", artifact "cli", plus the client/project identity headers below.
@@ -308,7 +308,7 @@ const DEFAULT_CONFIG = {
   // W3C b3/traceparent propagation headers, as the real CLI sends.
   tracing: ENV.ZEN_TRACING === "0" ? false : true,
   autoUA: ENV.AUTO_UA !== "0",
-  uaRefreshMs: Number(ENV.UA_REFRESH_MS ?? 6 * 3600_000),
+  uaRefreshMs: envNum("UA_REFRESH_MS", 6 * 3600_000),
   injectSession: ENV.INJECT_SESSION !== "0",
   // Which credentials the auto-sync health probe uses:
   //   "auto"      — use defaultZenKey when set, otherwise anonymous `public`
@@ -319,15 +319,12 @@ const DEFAULT_CONFIG = {
   // (see effectiveDefault), so a model that disappears upstream never bricks new
   // installs. Set an explicit model here to pin it.
   defaultModel: ENV.DEFAULT_MODEL ?? "",
-  fallbackModels: JSON.parse(ENV.FALLBACK_MODELS ?? JSON.stringify(loadShippedModels())),
-  modelAliases: JSON.parse(ENV.MODEL_ALIASES ?? "{}"),
-  // Prepended to Anthropic /v1/messages system prompts so the free tier accepts
-  // the request. The client's own instructions are kept intact after it.
-  // Set to "" (or AGENT_PREAMBLE=0) to send requests unadorned.
-  // Optional extra preamble prepended to Anthropic /v1/messages system prompts.
-  // Off by default: shipping opencode's agent tools (agentTools, below) is what
-  // makes the free tier accept the request, and combining the two measures was
-  // measured to *break* requests that the tool bridge alone gets through.
+  fallbackModels: envJson("FALLBACK_MODELS", loadShippedModels()),
+  modelAliases: envJson("MODEL_ALIASES", {}),
+  // Harness system text prepended ahead of the caller's instructions on every
+  // route, because the gate refuses requests that do not carry opencode's own
+  // preamble. Semantics mirror bridgePreamble(): "" / "auto" = the shipped
+  // agent-preamble.txt, "off" / "none" = send nothing, anything else = verbatim.
   agentPreamble: ENV.AGENT_PREAMBLE ?? "",
   // Append opencode's own tools to Anthropic /v1/messages requests so the free
   // tier accepts them. Calls to them are renamed back to the caller's tools.
@@ -335,24 +332,25 @@ const DEFAULT_CONFIG = {
   // opencode Zen serves each model on a specific endpoint family
   // (chat/completions | responses | messages). Patterns may end in `*`.
   // Source of truth: https://opencode.ai/docs/zen
-  responsesModels: JSON.parse(
-    ENV.RESPONSES_MODELS ??
-      JSON.stringify(["gpt-5*", "gpt-6*", "grok-*", "muse-spark-*"]),
-  ),
-  maxBodyBytes: Number(ENV.MAX_BODY_BYTES ?? MAX_BODY),
+  responsesModels: envJson("RESPONSES_MODELS", ["gpt-5*", "gpt-6*", "grok-*", "muse-spark-*"]),
+  maxBodyBytes: envNum("MAX_BODY_BYTES", MAX_BODY),
   // How many extra attempts a request gets against the *same* model when it
   // fails transiently (429/5xx/network) before the fallback chain moves on.
-  retriesPerModel: Number(ENV.RETRIES_PER_MODEL ?? 2),
-  retryBackoffMs: Number(ENV.RETRY_BACKOFF_MS ?? 500),
-  rateLimitMax: Number(ENV.RATE_LIMIT_MAX ?? 0),
-  rateLimitWindowMs: Number(ENV.RATE_LIMIT_WINDOW_MS ?? 60_000),
+  retriesPerModel: envNum("RETRIES_PER_MODEL", 2),
+  retryBackoffMs: envNum("RETRY_BACKOFF_MS", 500),
+  rateLimitMax: envNum("RATE_LIMIT_MAX", 0),
+  rateLimitWindowMs: envNum("RATE_LIMIT_WINDOW_MS", 60_000),
   proxyKey: ENV.PROXY_KEY ?? "",
   defaultZenKey: ENV.ZEN_KEY ?? "",
   trustForwarded: ENV.TRUST_FORWARDED === "1",
-  timeoutMs: Number(ENV.TIMEOUT_MS ?? 120000),
-  cacheMs: Number(ENV.CACHE_MS ?? 30000),
+  timeoutMs: envNum("TIMEOUT_MS", 120000),
+  // The shipped values must match what the docs promise: a 30s model cache and
+  // an hourly discovery pass. Both used to ship as 0, which meant /health (an
+  // unauthenticated route) re-fetched the upstream catalog on every poll, and
+  // auto-sync never actually re-ran after startup.
+  cacheMs: envNum("CACHE_MS", 30000),
   autoSync: ENV.AUTO_SYNC !== "0",
-  autoSyncIntervalMs: Number(ENV.AUTO_SYNC_MS ?? 3600000),
+  autoSyncIntervalMs: envNum("AUTO_SYNC_MS", 3600000),
 }
 
 // True when the user's own config carries an explicit model list. While it is
@@ -362,9 +360,15 @@ const DEFAULT_CONFIG = {
 // back.
 let fallbackModelsPinned = false
 
+// A corrupt config file must not look like a missing one. The old catch-all
+// said nothing and silently ran on defaults, so a typo in zen-proxy.json
+// (a trailing comma, a hand-edited key) looked exactly like "my settings are
+// being ignored" with no clue why. Say what is wrong, loudly, and keep serving
+// on defaults rather than exiting.
 function loadConfig() {
   try {
     const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"))
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("config file must hold a JSON object")
     const merged = { ...DEFAULT_CONFIG, ...raw }
     // A config file that predates the models.json catalog still holds a list
     // written by an older build. Those are only ever subsets of what we shipped
@@ -401,8 +405,12 @@ function loadConfig() {
       } catch {}
     }
     return merged
-  } catch {
+  } catch (err) {
     fallbackModelsPinned = false
+    if (err?.code !== "ENOENT") {
+      console.error(`zen-proxy: cannot read ${CONFIG_PATH}: ${err.message}`)
+      console.error("zen-proxy: running on defaults; fix or delete the file to silence this")
+    }
     return { ...DEFAULT_CONFIG, fallbackModels: loadShippedModels() }
   }
 }
@@ -437,8 +445,16 @@ function isFallbackModelsPinned() {
 }
 
 function writeConfigFile(obj) {
-  fs.writeFileSync(CONFIG_PATH + ".tmp", JSON.stringify(obj, null, 2))
-  fs.renameSync(CONFIG_PATH + ".tmp", CONFIG_PATH)
+  // The file holds the Zen key and the proxy key, so it must not inherit the
+  // process umask (022 makes it world-readable). Written to a temp file already
+  // at 0600 and renamed, so the secret is never readable at the final path.
+  const body = JSON.stringify(obj, null, 2)
+  const tmp = CONFIG_PATH + ".tmp"
+  fs.writeFileSync(tmp, body, { mode: 0o600 })
+  try {
+    fs.chmodSync(tmp, 0o600)
+  } catch {}
+  fs.renameSync(tmp, CONFIG_PATH)
 }
 
 function saveConfig(next) {
@@ -544,19 +560,19 @@ const identityPool = new Map()
 function mintedIdentity(req, now) {
   const key = identityBucketKey(req)
   const hit = identityPool.get(key)
-  if (hit && now - hit.at < SESSION_MAX_AGE_MS) return hit
+  if (hit && now - hit.at < SESSION_MAX_AGE_MS) {
+    // Re-insert on hit so the map stays in least-recently-used order.
+    identityPool.delete(key)
+    identityPool.set(key, hit)
+    return hit
+  }
   const fresh = { ...genSessionId(now), project: genProjectHash() }
+  identityPool.delete(key)
   identityPool.set(key, fresh)
-  while (identityPool.size > IDENTITY_POOL_MAX) {
-    let oldest = null
-    let oldestAt = Infinity
-    for (const [k, v] of identityPool) {
-      if (v.at < oldestAt) {
-        oldest = k
-        oldestAt = v.at
-      }
-    }
-    if (oldest == null) break
+  // The pool is LRU-ordered now, so eviction is "drop from the front" instead
+  // of a full sort/scan of up to IDENTITY_POOL_MAX entries on every mint.
+  for (const oldest of identityPool.keys()) {
+    if (identityPool.size <= IDENTITY_POOL_MAX) break
     identityPool.delete(oldest)
   }
   return fresh
@@ -580,11 +596,6 @@ function identityFor(req, now = Date.now()) {
   const minted = mintedIdentity(req, now)
   return { session: minted.value, injected: true, project: minted.project }
 }
-function sessionHeader(req) {
-  if (!config.injectSession) return undefined
-  return identityFor(req).session
-}
-
 function parseRetryAfter(v) {
   if (v == null) return 0
   const n = Number(v)
@@ -713,6 +724,7 @@ function anthropicToChatMessages(system, messages) {
       continue
     }
     const blocks = Array.isArray(m?.content) ? m.content : []
+    const turnStart = out.length
     const toolCalls = []
     const parts = []
     // A tool_result is its own chat message with role "tool", not part of the
@@ -758,7 +770,19 @@ function anthropicToChatMessages(system, messages) {
       }
     }
     flush()
-    if (toolCalls.length) out.push({ role: "assistant", content: "", tool_calls: toolCalls })
+    if (toolCalls.length) {
+      // An assistant turn that carries both text and tool_use is ONE chat
+      // message with content *and* tool_calls. Pushing a separate assistant
+      // message for the calls produced two assistant turns in a row, which
+      // chat endpoints reject or silently misread as two separate replies.
+      const last = out[turnStart]
+      if (last && last.role === "assistant" && turnStart === out.length - 1) {
+        last.tool_calls = toolCalls
+        if (!last.content) last.content = ""
+      } else {
+        out.push({ role: "assistant", content: "", tool_calls: toolCalls })
+      }
+    }
   }
   if (!out.length) out.push({ role: "user", content: "" })
   return out
@@ -1056,7 +1080,10 @@ function responsesInputToMessages(input) {
         const parts = []
         for (const p of content) {
           if (typeof p === "string") { if (p) parts.push({ type: "text", text: p }) }
-          else if ((p?.type === "input_text" || p?.type === "text") && p.text) parts.push({ type: "text", text: p.text })
+          // `output_text` is what an assistant item carries when a caller
+          // replays a prior /responses answer back as input. Without it every
+          // prior assistant turn was dropped and the model lost its own history.
+          else if ((p?.type === "input_text" || p?.type === "text" || p?.type === "output_text") && p.text) parts.push({ type: "text", text: p.text })
           else if (p?.type === "input_image" && (p.image_url ?? p.url)) parts.push({ type: "image_url", image_url: p.image_url ?? p.url })
         }
         if (parts.length) messages.push({ role, content: parts })
@@ -1158,11 +1185,17 @@ function chatToResponses(content, requested, servedBy) {
     })
   }
   const u = content?.usage ?? {}
+  // `finish_reason: "length"` means the model was cut off at the token cap.
+  // Reporting that as "completed" tells a Responses caller it got a whole
+  // answer; the Responses vocabulary has `incomplete` + `incomplete_details`
+  // for exactly this.
+  const truncated = content?.choices?.[0]?.finish_reason === "length"
   return {
     id: content?.id ? `resp_${content.id.replace(/^resp_/, "")}` : `resp_${randomBytes(12).toString("hex")}`,
     object: "response",
     created_at: content?.created ?? Math.floor(Date.now() / 1000),
-    status: "completed",
+    status: truncated ? "incomplete" : "completed",
+    ...(truncated ? { incomplete_details: { reason: "max_output_tokens" } } : {}),
     model: requested,
     ...output.length ? { output } : { output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "", annotations: [] }] }] },
     usage: {
@@ -1307,10 +1340,21 @@ function effectiveDefault() {
 
 function resolveModel(requested) {
   const dflt = effectiveDefault()
-  const id = String(requested ?? "").split("/").pop()
-  const target = config.modelAliases[id] || (ALLOWED().has(id) ? id : "") || dflt
+  const full = String(requested ?? "").trim()
+  // An id may arrive provider-qualified (`anthropic/claude-...`, `openai/gpt-…`)
+  // from routers and OpenAI-compatible clients. The bare suffix is what this
+  // proxy's catalog uses, so try the full id first and fall back to the suffix —
+  // but only split when the suffix actually resolves, otherwise a same-named
+  // provider prefix is discarded for nothing.
+  const bare = full.includes("/") ? full.split("/").pop() : full
+  const allowed = ALLOWED()
+  const resolves = (id) => !!id && (!!config.modelAliases[id] || allowed.has(id))
+  // `requested` is the name the caller used (so replies echo it back), `target`
+  // is what it maps to: an alias target, a catalog id, or the default.
+  const name = resolves(full) ? full : bare
+  const target = (name && config.modelAliases[name]) || (name && allowed.has(name) ? name : "") || dflt
   const rest = config.fallbackModels.filter((m) => m !== target)
-  return { requested: id || dflt, candidates: [target, ...rest] }
+  return { requested: (name && resolves(name) ? name : "") || bare || dflt, candidates: [target, ...rest] }
 }
 
 function clientIp(req) {
@@ -1373,16 +1417,17 @@ function zenHeaders(req, auth) {
     headers["x-session-id"] = identity.session
   }
   headers["x-opencode-client"] = config.clientName
-  // The project half of the same pair: a caller that supplied a project gets
-  // it forwarded verbatim below; the minted pair keeps session and project one.
+  // identityFor() already resolved the project half: a caller that sent a full
+  // session+project pair has its project forwarded verbatim, otherwise it is
+  // the other half of the minted pair. Forwarding the header again here used to
+  // let a caller who sent *only* `x-opencode-project` split the minted pair —
+  // one session, another project, i.e. an identity upstream never issued.
   headers["x-opencode-project"] = identity.project
   if (config.tracing) for (const [k, v] of Object.entries(traceHeaders())) headers[k] = v
   const ip = clientIp(req)
   if (!ipOmit(ip)) headers["x-real-ip"] = ip
-  for (const h of ["x-opencode-request", "x-opencode-client", "x-opencode-project"]) {
-    const v = req.headers[h]
-    if (typeof v === "string" && v) headers[h] = v
-  }
+  const requestHeader = req.headers["x-opencode-request"]
+  if (typeof requestHeader === "string" && requestHeader) headers["x-opencode-request"] = requestHeader
   return headers
 }
 
@@ -1421,16 +1466,24 @@ function apiKeyHeader(req) {
 // Without `proxyKey` the caller's own credential is forwarded: bearer first,
 // then `x-api-key`, which is how an Anthropic-native client supplies a real Zen
 // key.
+//
+// `x-zen-key` is honoured on every path, with or without a proxy key: the docs
+// promise a per-request Zen key and it used to be read only inside the
+// `proxyKey` branch, so setting it alone silently did nothing.
+function zenKeyOverride(req) {
+  const zen = req.headers["x-zen-key"]
+  return typeof zen === "string" && zen.trim() && zen.trim() !== "public" ? `Bearer ${zen.trim()}` : null
+}
+
 function authForUpstream(req) {
   const incoming = bearer(req)
   const key = apiKeyHeader(req)
+  const override = zenKeyOverride(req)
   if (config.proxyKey) {
     if (!safeEqual(incoming, config.proxyKey) && !safeEqual(key, config.proxyKey)) return null
-    const zen = req.headers["x-zen-key"]
-    if (typeof zen === "string" && zen && zen !== "public") return `Bearer ${zen}`
-    if (config.defaultZenKey) return `Bearer ${config.defaultZenKey}`
-    return "Bearer public"
+    return override ?? (config.defaultZenKey ? `Bearer ${config.defaultZenKey}` : "Bearer public")
   }
+  if (override) return override
   if (incoming && !safeEqual(incoming, "public")) return `Bearer ${incoming}`
   if (key && !safeEqual(key, "public")) return `Bearer ${key}`
   if (config.defaultZenKey) return `Bearer ${config.defaultZenKey}`
@@ -1476,8 +1529,8 @@ function json(res, status, data) {
 // zen-proxy also speaks the Anthropic Messages protocol (`POST /v1/messages`)
 // so Claude Code can point straight at it. Requests are translated to whichever
 // endpoint family the target model actually lives on, and the reply is
-// translated back. See AGENT_PREAMBLE_TEXT above for why an opencode preamble is
-// prepended to the client's system prompt.
+// translated back. See the note above AGENT_TOOLS_PATH for why an opencode
+// preamble is prepended to the client's system prompt.
 
 
 // Anthropic clients authenticate with `x-api-key`; the OpenAI-compatible SDKs
@@ -1546,7 +1599,7 @@ async function handleMessages(req, res) {
     // The gate's read stub, when the caller needs one, rides inside the
     // translated body (see anthropicToChatBody) — this must not inject again.
     const chatShaped = anthropicToChatBody(body, model)
-    const payload = format === "responses" ? responsesRequest(chatShaped, model, true) : { ...chatShaped, stream: true }
+    const payload = format === "responses" ? responsesRequest(chatShaped, model, true) : withStreamUsage({ ...chatShaped, stream: true })
     // Callerless bridged request: the manifest and preamble are for the gate;
     // the answer to "summarize this" must be text, not a tool call.
     if (bridged) {
@@ -1597,8 +1650,10 @@ async function handleMessages(req, res) {
           // surprises.
           relayAnthropicStream(req, res, chunks, requested, model, bridged, pin, keepable).catch(() => {})
           res.on("finish", () => {
-            recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
-            recordObserved(model, true)
+            // A relay that died mid-reply (in-band `error` event) is recorded as
+            // the failure it was, not as a clean 200 (see markStreamFailure).
+            recordReq(req, `${requested}→${model}`, Date.now() - start, res.streamFailure ? 502 : 200)
+            recordObserved(model, !res.streamFailure)
           })
           return
         }
@@ -1726,6 +1781,12 @@ async function handleChat(req, res, responsesRoute = false) {
     recordReq(req, requested, Date.now() - start, 401)
     return json(res, 401, { error: { type: "invalid_request_error", message: "invalid proxy key" } })
   }
+  // Mirrors handleMessages: OpenAI-shaped clients usually send a placeholder
+  // key (OPENAI_API_KEY=sk-local, or whatever the SDK defaults to), and a
+  // configured proxy must not fail just because upstream rejects that string.
+  // Only applied when no proxyKey is required, so the proxy key can never leak.
+  const fallbackAuth = config.proxyKey ? null : config.defaultZenKey ? `Bearer ${config.defaultZenKey}` : "Bearer public"
+  let triedFallback = false
   let triedByok = false
   let lastErr = null
   let lastStatus = 502
@@ -1766,7 +1827,7 @@ async function handleChat(req, res, responsesRoute = false) {
     // Streams upstream regardless of what the client asked for — see
     // collectChatCompletion — and the collector puts the shape back.
     const payload =
-      format === "responses" ? responsesRequest(requestBody, model, true) : { ...requestBody, model, stream: true }
+      format === "responses" ? responsesRequest(requestBody, model, true) : withStreamUsage({ ...requestBody, model, stream: true })
     // A Responses body that reaches a responses-family model keeps its input
     // verbatim: the chat round-trip above preserves mostly everything, but
     // content parts do not survive it losslessly — an input_image next to
@@ -1821,6 +1882,13 @@ async function handleChat(req, res, responsesRoute = false) {
         break
       }
 
+      if (upstreamRes.status === 401 && !triedFallback && fallbackAuth && fallbackAuth !== auth) {
+        triedFallback = true
+        auth = fallbackAuth
+        attempt--
+        continue
+      }
+
       if (upstreamRes.ok) {
         if (isStream) {
           if (model !== requested) {
@@ -1841,7 +1909,7 @@ async function handleChat(req, res, responsesRoute = false) {
           } else {
             relayStream(req, res, upstreamRes, requested, bridged, pin, keepable).catch(() => {})
           }
-          res.on("finish", () => { recordReq(req, `${requested}→${model}`, Date.now() - start, 200); recordObserved(model, true) })
+          res.on("finish", () => { recordReq(req, `${requested}→${model}`, Date.now() - start, res.streamFailure ? 502 : 200); recordObserved(model, !res.streamFailure) })
           return
         }
         try {
@@ -1973,14 +2041,20 @@ async function* sseChunks(upstreamRes) {
     for (;;) {
       const { done, value } = await reader.read()
       if (done) break
-      buf += decoder.decode(value, { stream: true })
+      // SSE permits CRLF (and bare CR) line endings, and some gateways emit
+      // them. Splitting on "\n\n" alone never matched, so a whole CRLF stream
+      // arrived as one giant block with no finish chunk — reported as a false
+      // mid-reply cut. Normalise as data arrives, holding back a trailing "\r"
+      // so a CRLF pair split across two reads is not mistaken for a bare CR.
+      buf = appendSse(buf, decoder.decode(value, { stream: true }))
       let i
       while ((i = buf.indexOf("\n\n")) !== -1) {
         yield buf.slice(0, i + 2)
         buf = buf.slice(i + 2)
       }
     }
-    if (buf.trim()) yield buf
+    const tail = flushSse(buf)
+    if (tail.trim()) yield tail
   } finally {
     try {
       reader.cancel()
@@ -2169,6 +2243,34 @@ function chatBlockError(block) {
   }
 }
 
+// Append decoded SSE text to a block buffer, normalising CRLF / bare CR line
+// endings to \n while holding back a trailing "\r" (it may be the first half of
+// a CRLF pair whose \n has not arrived yet). Every splitter uses this so a
+// gateway that emits CRLF is not read as one endless block.
+function appendSse(buffer, text) {
+  if (!text) return buffer
+  // A CR held back by the previous chunk is still unresolved when this one
+  // arrives. If it is followed by \n the pair is a CRLF and must collapse to
+  // one \n — leaving it alone broke the "\n\n" block delimiter across the hold,
+  // so the block was split at the wrong place and a raw \r leaked into the
+  // frame. With nothing following, the held CR was a bare terminator of its own.
+  if (buffer.endsWith("\r")) {
+    buffer = buffer.slice(0, -1) + "\n"
+    if (text.startsWith("\n")) text = text.slice(1)
+  }
+  const heldCR = text.endsWith("\r")
+  const body = heldCR ? text.slice(0, -1) : text
+  return buffer + body.replace(/\r\n?/g, "\n") + (heldCR ? "\r" : "")
+}
+
+// The held CR from appendSse is resolved by the next chunk — except when there
+// is no next chunk, which is exactly how a stream ends. Flushing the raw buffer
+// then leaked that \r into the final frame; at end of stream a lone CR really
+// was a terminator, so settle it as \n before the block is emitted.
+function flushSse(buffer) {
+  return buffer.endsWith("\r") ? buffer.slice(0, -1) + "\n" : buffer
+}
+
 // Stream relays need walls that no runtime disagrees with. req.signal is
 // undefined on node 18+ and current bun (1.3.14) — a stream's upstream fetch
 // then ran with NO abort handling, so a dead upstream stalled the caller's
@@ -2215,10 +2317,47 @@ function relayWall(timeoutMs = config.timeoutMs) {
       clearTimeout(timer)
       arm()
     },
+    abort() {
+      clearTimeout(timer)
+      ctrl.abort(new Error("client went away"))
+    },
     release() {
       clearTimeout(timer)
     },
   }
+}
+
+// A client that hangs up leaves res destroyed with `writableEnded` still false,
+// so the old `!res.writableEnded` guard would try to write an error into a dead
+// socket. Check both.
+function clientGone(res) {
+  return !!(res.writableEnded || res.destroyed)
+}
+
+// A relay that fails after the 200 line is already on the wire cannot change
+// the status, but the request was not a success. Every relay marks the response
+// so the `finish` recorder logs 502 and counts the error, instead of the old
+// unconditional 200 that made a stream of in-band errors read as healthy.
+function markStreamFailure(res, message) {
+  res.streamFailure = message ?? "upstream stream ended mid-reply"
+}
+
+// Client-side backpressure: res.write() reports false once the socket buffer is
+// full, and the relays ignored the signal, so a slow reader let upstream text
+// pile up in memory while the proxy kept pulling. Wait for `drain` between
+// blocks instead. Mocks and non-socket responses have no `writableNeedDrain`,
+// so this is a no-op there.
+function waitDrain(res) {
+  if (!res.writableNeedDrain) return Promise.resolve()
+  return new Promise((resolve) => {
+    const done = () => {
+      res.off?.("drain", done)
+      res.off?.("close", done)
+      resolve()
+    }
+    res.on("drain", done)
+    res.on("close", done)
+  })
 }
 
 function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = false, pin = null, keepable = null) {
@@ -2233,7 +2372,11 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
   const id = `msg_${randomBytes(12).toString("hex")}`
   const emit = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`)
 
-  const st = { textOpen: false, thinkOpen: false, toolIndex: 0, blocks: new Map(), finish: "stop", finished: false, usage: null, dropped: new Set(), kept: false, callKept: false, nextBlock: 1 }
+  // Content blocks are numbered in the order they open. Thinking and text used
+  // to both claim index 0, which is a malformed stream: two blocks with the
+  // same index, and every delta/stop attributed to whichever the client opened
+  // first. A single counter keeps thinking, text and tool blocks distinct.
+  const st = { textOpen: false, textIndex: -1, thinkOpen: false, thinkIndex: -1, blocks: new Map(), finish: "stop", finished: false, usage: null, dropped: new Set(), kept: false, callKept: false, nextBlock: 0 }
   emit("message_start", {
     message: {
       id,
@@ -2247,23 +2390,41 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
     },
   })
 
+  const openBlock = (content_block) => {
+    const index = st.nextBlock++
+    emit("content_block_start", { index, content_block })
+    return index
+  }
+  // Tool blocks in the plain path keep their upstream index + 1 (the layout
+  // Anthropic clients have always been fed by this proxy), so the shared
+  // counter has to jump past whatever index that produced.
+  const takeToolBlock = (tIndex) => {
+    const index = Math.max(st.nextBlock, tIndex + 1)
+    st.nextBlock = index + 1
+    return index
+  }
   const closeText = () => {
     if (st.textOpen) {
-      emit("content_block_stop", { index: 0 })
+      emit("content_block_stop", { index: st.textIndex })
       st.textOpen = false
     }
   }
   const closeThink = () => {
     if (st.thinkOpen) {
-      emit("content_block_stop", { index: 0 })
+      emit("content_block_stop", { index: st.thinkIndex })
       st.thinkOpen = false
     }
   }
 
   // Canceling the chunks generator makes the loop below end cleanly and reach
-  // the same mid-reply handling, where the stall is named for what it is.
+  // the same mid-reply handling, where the stall is named for what it is. The
+  // same cancel happens when the client goes away: the turn is over, so stop
+  // pulling tokens upstream instead of paying for a reply nobody will read.
   const wall = relayWall()
   wall.signal.addEventListener("abort", () => { chunks.return?.()?.catch?.(() => {}) })
+  res.on?.("close", () => {
+    if (!res.writableEnded) wall.abort()
+  })
   const cleanup = () => wall.release()
 
   const pump = async () => {
@@ -2296,17 +2457,17 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
             if (typeof delta.content === "string" && delta.content) {
               closeThink()
               if (!st.textOpen) {
-                emit("content_block_start", { index: 0, content_block: { type: "text", text: "" } })
+                st.textIndex = openBlock({ type: "text", text: "" })
                 st.textOpen = true
               }
-              emit("content_block_delta", { index: 0, delta: { type: "text_delta", text: delta.content } })
+              emit("content_block_delta", { index: st.textIndex, delta: { type: "text_delta", text: delta.content } })
             }
             if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
               if (!st.textOpen && !st.thinkOpen) {
-                emit("content_block_start", { index: 0, content_block: { type: "thinking", thinking: "", signature: "" } })
+                st.thinkIndex = openBlock({ type: "thinking", thinking: "", signature: "" })
                 st.thinkOpen = true
               }
-              emit("content_block_delta", { index: 0, delta: { type: "thinking_delta", thinking: delta.reasoning_content } })
+              emit("content_block_delta", { index: st.thinkIndex, delta: { type: "thinking_delta", thinking: delta.reasoning_content } })
             }
             for (const tc of strip ? [] : delta.tool_calls ?? []) {
               closeThink()
@@ -2336,9 +2497,7 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
               } else if (st.dropped.has(tIndex)) {
                 continue
               }
-              // Renumbered blocks only when filtering — the plain path keeps the
-              // upstream index so a caller never sees a numbering change.
-              const blockIndex = st.blocks.has(tIndex) ? st.blocks.get(tIndex).index : pin ? st.nextBlock++ : tIndex + 1
+              const blockIndex = st.blocks.has(tIndex) ? st.blocks.get(tIndex).index : takeToolBlock(tIndex)
               if (!st.blocks.has(tIndex)) {
                 const rawName = tc.function?.name ?? "unknown"
                 const mapped = remapAgentTool(rawName, "{}")
@@ -2393,14 +2552,18 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
         usage: { input_tokens: u.prompt_tokens ?? 0, output_tokens: u.completion_tokens ?? 0 },
       })
       emit("message_stop", {})
-      res.write("data: [DONE]\n\n")
+      // No `data: [DONE]` here: that sentinel belongs to the OpenAI dialect.
+      // Anthropic clients end the stream on message_stop and an unexpected
+      // [DONE] is, at best, ignored junk.
+      await waitDrain(res)
       res.end()
     } catch (err) {
-      if (!req.signal?.aborted && !res.writableEnded) {
+      if (!req.signal?.aborted && !clientGone(res)) {
         closeThink()
         closeText()
         // The 200 is already on the wire; Anthropic's mid-stream failure event
         // is the only way left to tell the caller the turn collapsed.
+        markStreamFailure(res, err?.message ?? "upstream stream ended mid-reply")
         emit("error", { error: { type: "api_error", message: err?.message ?? "upstream stream ended mid-reply" } })
       }
       res.end()
@@ -2531,12 +2694,18 @@ function relayStream(req, res, upstreamRes, requested, strip = false, pin = null
   wall.signal.addEventListener("abort", () => {
     reader.cancel().catch(() => {})
   })
+  // The client hung up: stop reading upstream so a turn nobody will read stops
+  // consuming quota now rather than at the model's own pace.
+  res.on?.("close", () => {
+    if (!res.writableEnded) wall.abort()
+  })
   const cleanup = () => wall.release()
   const midReplyError = (message) => {
     // The 200 line is already on the wire — an in-band error chunk plus the
     // [DONE] sentinel is the only honest ending left. SDKs raise on error
     // chunks instead of returning a silent half-turn.
-    if (!req.signal?.aborted && !res.writableEnded) {
+    if (!req.signal?.aborted && !clientGone(res)) {
+      markStreamFailure(res, message)
       res.write(`data: ${JSON.stringify({ error: { type: "upstream_error", message } })}\n\n`)
       res.write("data: [DONE]\n\n")
     }
@@ -2547,17 +2716,21 @@ function relayStream(req, res, upstreamRes, requested, strip = false, pin = null
       for (;;) {
         const { done, value } = await reader.read()
         if (done) {
-          if (buffer.trim()) res.write(buffer)
+          const tail = flushSse(buffer)
+          if (tail.trim()) res.write(tail)
           // Upstream closed without delivering a finish chunk or [DONE]: the
           // reply died in flight, and a silent end reads like a successful
           // empty turn (measured against a hostile mid-cut). A wall abort
           // cancels the reader into done — name the stall for what it is.
           if (!sawFinish) midReplyError(upstreamErr ?? (wall.state.stalled ? "upstream stalled past the relay wall" : "upstream stream ended mid-reply"))
-          else res.end()
+          else {
+            await waitDrain(res)
+            res.end()
+          }
           return
         }
         wall.touch()
-        buffer += decoder.decode(value, { stream: true })
+        buffer = appendSse(buffer, decoder.decode(value, { stream: true }))
         let idx
         while ((idx = buffer.indexOf("\n\n")) !== -1) {
           const block = buffer.slice(0, idx)
@@ -2566,6 +2739,7 @@ function relayStream(req, res, upstreamRes, requested, strip = false, pin = null
           const out = rewriteSSE(block, requested, strip, pinned)
           if (out) res.write(out)
           if (chatBlockTerminal(block)) sawFinish = true
+          await waitDrain(res)
         }
       }
     } catch (err) {
@@ -2577,6 +2751,15 @@ function relayStream(req, res, upstreamRes, requested, strip = false, pin = null
     }
   }
   return pump()
+}
+
+// The proxy always streams upstream even when the caller asked for one JSON
+// reply, so `stream_options` has to be requested here rather than forwarded
+// from a caller who never asked to stream. Without it the gateway sends no
+// usage chunk at all and every collected reply reported zero tokens.
+function withStreamUsage(body) {
+  const opts = body.stream_options && typeof body.stream_options === "object" ? body.stream_options : {}
+  return { ...body, stream_options: { ...opts, include_usage: true } }
 }
 
 // Build a Responses API request from a chat.completions body.
@@ -2711,6 +2894,9 @@ function relayResponsesStream(req, res, upstreamRes, requested, strip = false, p
   wall.signal.addEventListener("abort", () => {
     reader.cancel().catch(() => {})
   })
+  res.on?.("close", () => {
+    if (!res.writableEnded) wall.abort()
+  })
   const cleanup = () => wall.release()
   const send = (choices, extra) =>
     res.write(`data: ${JSON.stringify({ ...base, choices, ...(extra ?? {}) })}\n\n`)
@@ -2721,7 +2907,7 @@ function relayResponsesStream(req, res, upstreamRes, requested, strip = false, p
         const { done, value } = await reader.read()
         if (done) break
         wall.touch()
-        buffer += decoder.decode(value, { stream: true })
+        buffer = appendSse(buffer, decoder.decode(value, { stream: true }))
         let idx
         while ((idx = buffer.indexOf("\n\n")) !== -1) {
           const block = buffer.slice(0, idx)
@@ -2799,6 +2985,7 @@ function relayResponsesStream(req, res, upstreamRes, requested, strip = false, p
             send([{ index: 0, delta, finish_reason: null }])
           }
         }
+        await waitDrain(res)
       }
       if (sawFinish) {
         send([{ index: 0, delta: {}, finish_reason: state.finish }], state.usage ? { usage: usageToChat(state.usage) } : {})
@@ -2806,14 +2993,17 @@ function relayResponsesStream(req, res, upstreamRes, requested, strip = false, p
       } else {
         // Upstream never declared completion: end with the failure instead of
         // a finish_reason the model never reached (measured: hostile mid-cut).
-        if (!req.signal?.aborted && !res.writableEnded) {
+        if (!req.signal?.aborted && !clientGone(res)) {
+          markStreamFailure(res)
           res.write(`data: ${JSON.stringify({ error: { type: "upstream_error", message: upstreamErr ?? (wall.state.stalled ? "upstream stalled past the relay wall" : "upstream stream ended mid-reply") } })}\n\n`)
           res.write("data: [DONE]\n\n")
         }
       }
+      await waitDrain(res)
       res.end()
     } catch (err) {
-      if (!req.signal?.aborted && !res.writableEnded) {
+      if (!req.signal?.aborted && !clientGone(res)) {
+        markStreamFailure(res)
         res.write(`data: ${JSON.stringify({ error: { type: "upstream_error", message: upstreamErr ?? err?.message ?? "upstream stream ended mid-reply" } })}\n\n`)
         res.write("data: [DONE]\n\n")
       }
@@ -2851,6 +3041,7 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
     calls: new Map(), // chat index -> { index, id, callId, name, args }
     usage: null,
     finished: false, // a finish chunk or [DONE] was seen upstream
+    reason: null, // the chat finish_reason, so a capped reply can say so
     dropped: new Set(), // pinned-filter: chat indices that name a stray call
   }
 
@@ -2860,6 +3051,9 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
   const chunksIter = sseChunks(upstreamRes)
   const wall = relayWall()
   wall.signal.addEventListener("abort", () => { chunksIter.return?.()?.catch?.(() => {}) })
+  res.on?.("close", () => {
+    if (!res.writableEnded) wall.abort()
+  })
   const cleanup = () => wall.release()
 
   const pump = async () => {
@@ -2880,6 +3074,7 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
         if (d?.usage) st.usage = d.usage
         const choice = d?.choices?.[0]
         if (!choice) continue
+        if (choice.finish_reason) st.reason = choice.finish_reason
         const delta = choice.delta ?? {}
         if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
           evt("response.reasoning_text.delta", { delta: delta.reasoning_content })
@@ -2936,7 +3131,10 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
         // mid-cut): emitting response.completed would tell the caller a turn
         // ended that upstream never finished. The Responses dialect carries
         // mid-stream failure as an `error` event.
-        if (!req.signal?.aborted && !res.writableEnded) evt("error", { error: { type: "api_error", message: wall.state.stalled ? "upstream stalled past the relay wall" : "upstream stream ended mid-reply" } })
+        if (!req.signal?.aborted && !clientGone(res)) {
+          markStreamFailure(res)
+          evt("error", { error: { type: "api_error", message: wall.state.stalled ? "upstream stalled past the relay wall" : "upstream stream ended mid-reply" } })
+        }
         res.end()
         return
       }
@@ -2955,17 +3153,21 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
       })
       if (st.message) evt("response.output_text.done", { output_index: st.message.index, content_index: 0, text: st.message.text })
       for (const entry of st.calls.values()) {
-        evt("response.function_call_arguments.done", { item_id: entry.id, output_index: entry.index, arguments: entry.args })
+        evt("response.function_call_arguments.done", { item_id: entry.item.id, output_index: entry.index, arguments: entry.args })
       }
       items.forEach((item, i) => {
         evt("response.output_item.done", { output_index: i, item })
       })
-      evt("response.completed", {
+      // A reply cut off at the token cap is not a completed answer; the
+      // Responses dialect carries that as `incomplete` + `incomplete_details`.
+      const truncated = st.reason === "length"
+      evt(truncated ? "response.incomplete" : "response.completed", {
         response: {
           id,
           object: "response",
           created_at: created,
-          status: "completed",
+          status: truncated ? "incomplete" : "completed",
+          ...(truncated ? { incomplete_details: { reason: "max_output_tokens" } } : {}),
           model: requested,
           output,
           usage: {
@@ -2975,10 +3177,14 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
           },
         },
       })
+      await waitDrain(res)
       res.end()
     } catch (err) {
       // The 200 is on the wire already: announce the collapse in-band.
-      if (!req.signal?.aborted) evt("error", { error: { type: "api_error", message: err?.message ?? "upstream stream ended mid-reply" } })
+      if (!req.signal?.aborted && !clientGone(res)) {
+        markStreamFailure(res)
+        evt("error", { error: { type: "api_error", message: err?.message ?? "upstream stream ended mid-reply" } })
+      }
       res.end()
     }
   }
@@ -3032,6 +3238,9 @@ function relayResponsesPassthrough(req, res, upstreamRes, requested, strip = fal
   wall.signal.addEventListener("abort", () => {
     reader.cancel().catch(() => {})
   })
+  res.on?.("close", () => {
+    if (!res.writableEnded) wall.abort()
+  })
   const cleanup = () => wall.release()
   const parseBlock = (block) => {
     let event = ""
@@ -3053,7 +3262,7 @@ function relayResponsesPassthrough(req, res, upstreamRes, requested, strip = fal
         const { done, value } = await reader.read()
         if (done) break
         wall.touch()
-        buffer += decoder.decode(value, { stream: true })
+        buffer = appendSse(buffer, decoder.decode(value, { stream: true }))
         let idx
         while ((idx = buffer.indexOf("\n\n")) !== -1) {
           const block = buffer.slice(0, idx)
@@ -3077,10 +3286,12 @@ function relayResponsesPassthrough(req, res, upstreamRes, requested, strip = fal
             data.response.output = data.response.output.filter((item) => (item?.type === "function_call" ? decide(item) : true))
           }
           res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`)
+          await waitDrain(res)
         }
       }
-      if (buffer.trim()) {
-        const data = parseBlock(buffer)
+      const tail = flushSse(buffer)
+      if (tail.trim()) {
+        const data = parseBlock(tail)
         if (data) {
           if (data?.response?.model && typeof data.response.model === "string") data.response.model = requested
           res.write(`event: ${data?.type ?? ""}\ndata: ${JSON.stringify(data)}\n\n`)
@@ -3090,12 +3301,15 @@ function relayResponsesPassthrough(req, res, upstreamRes, requested, strip = fal
       // No completion event ever arrived: the stream died mid-reply (measured
       // against a hostile cut). The Responses dialect says failure as an
       // `error` event; silence reads like a successful partial turn.
-      if (!sawFinish && !req.signal?.aborted && !res.writableEnded) {
+      if (!sawFinish && !req.signal?.aborted && !clientGone(res)) {
+        markStreamFailure(res)
         res.write(`event: error\ndata: ${JSON.stringify({ type: "error", code: "upstream_error", message: upstreamErr ?? (wall.state.stalled ? "upstream stalled past the relay wall" : "upstream stream ended mid-reply") })}\n\n`)
       }
+      await waitDrain(res)
       res.end()
     } catch (err) {
-      if (!req.signal?.aborted && !res.writableEnded) {
+      if (!req.signal?.aborted && !clientGone(res)) {
+        markStreamFailure(res)
         res.write(`event: error\ndata: ${JSON.stringify({ type: "error", code: "upstream_error", message: upstreamErr ?? err?.message ?? "upstream stream ended mid-reply" })}\n\n`)
       }
       res.end()
@@ -3326,11 +3540,21 @@ function rateLimitFor(req) {
   const max = Number(config.rateLimitMax ?? 0)
   if (!Number.isFinite(max) || max <= 0) return { limited: false }
   const window = Number(config.rateLimitWindowMs) > 0 ? Number(config.rateLimitWindowMs) : 60_000
-  const key = clientIp(req) || "unknown"
+  const ip = clientIp(req)
+  // Every caller behind one reverse proxy shares its socket address unless
+  // `trustForwarded` is on, so keying by IP alone made the limit one global
+  // budget for the whole proxy. Loopback callers get the same split the identity
+  // pool uses (UA family), which separates the agents on one machine without
+  // inventing a key from data a caller controls.
+  const key = !ip ? "unknown" : ipOmit(ip) ? `local\n${uaFingerprint(req)}` : ip
   const now = Date.now()
   let hits = rateBuckets.get(key)
   if (!hits) {
     hits = []
+    rateBuckets.set(key, hits)
+  } else {
+    // Re-insert so Map order stays least-recently-used first.
+    rateBuckets.delete(key)
     rateBuckets.set(key, hits)
   }
   while (hits.length && now - hits[0] >= window) hits.shift()
@@ -3339,7 +3563,13 @@ function rateLimitFor(req) {
   }
   hits.push(now)
   if (rateBuckets.size > 10_000) {
-    for (const [k, v] of rateBuckets) if (!v.length || now - v[v.length - 1] >= window) rateBuckets.delete(k)
+    // The old sweep walked every bucket on every request past the cap. The map
+    // is now LRU-ordered, so dropping from the front is enough: skip the ones
+    // that are still live, stop as soon as a fresh one is reached.
+    for (const [k, v] of rateBuckets) {
+      if (rateBuckets.size <= 9000) break
+      if (!v.length || now - v[v.length - 1] >= window) rateBuckets.delete(k)
+    }
   }
   return { limited: false }
 }
@@ -3515,10 +3745,25 @@ async function handleApiConfig(req, res) {
       if (cleaned.defaultZenKey === sanitize({ defaultZenKey: config.defaultZenKey }).defaultZenKey) {
         cleaned.defaultZenKey = config.defaultZenKey
       }
-      if (!Array.isArray(cleaned.fallbackModels)) cleaned.fallbackModels = config.fallbackModels
-      // Saving from the dashboard is an explicit edit of the list, so from here on
-      // this install owns it rather than tracking models.json.
-      else fallbackModelsPinned = true
+      if (!Array.isArray(cleaned.fallbackModels)) {
+        cleaned.fallbackModels = config.fallbackModels
+      } else {
+        // Any dashboard save used to pin the catalog forever, because the
+        // dashboard PUTs the whole config it just read back — the model list
+        // included — even when the user only changed a port. Pin only when the
+        // submitted list actually differs from the catalog the install is
+        // following; an unchanged list keeps tracking models.json.
+        const submitted = cleaned.fallbackModels.filter((m) => typeof m === "string")
+        const shipped = loadShippedModels()
+        const sameAsCatalog =
+          submitted.length === shipped.length && submitted.every((m, i) => m === shipped[i])
+        if (sameAsCatalog) {
+          cleaned.fallbackModels = undefined
+          fallbackModelsPinned = false
+        } else {
+          fallbackModelsPinned = true
+        }
+      }
       if (!Array.isArray(cleaned.responsesModels)) cleaned.responsesModels = config.responsesModels
       if (typeof cleaned.modelAliases !== "object" || cleaned.modelAliases === null) {
         cleaned.modelAliases = config.modelAliases
@@ -3627,7 +3872,11 @@ async function handleTest(req, res) {
         }
         h["x-opencode-client"] = config.clientName
         h["x-opencode-project"] = identity.project
-        const ip = req.socket.remoteAddress ?? ""
+        // clientIp(), not the raw socket: behind a reverse proxy the socket is
+        // the proxy's and TEST used to report a different caller IP than the
+        // request path reported for the same client (and, with trustForwarded
+        // on, the wrong one entirely).
+        const ip = clientIp(req)
         if (!ipOmit(ip)) h["x-real-ip"] = ip
         return h
       })(),
@@ -3669,14 +3918,27 @@ async function handleTest(req, res) {
 
 function handleLogs(req, res) {
   if (!adminAuth(req, res)) return
-  const n = Number(new URL(req.url, "http://x").searchParams.get("n") ?? 200)
-  json(res, 200, { logs: logLines.slice(-n) })
+  // `?n=NaN` made `slice(-NaN)` return the whole array, and `?n=1e9` did the
+  // same; clamp to what the ring buffer can hold so the query cannot ask for
+  // more than exists (or surprise a caller with every line when it meant 100).
+  const raw = new URL(req.url, "http://x").searchParams.get("n")
+  const n = raw == null || raw === "" ? 200 : Math.floor(Number(raw))
+  const limit = Number.isFinite(n) && n > 0 ? Math.min(n, MAX_LOG) : 200
+  json(res, 200, { logs: logLines.slice(-limit) })
 }
 
 // Claude Code calls this before a session to size the context window. The real
 // Anthropic API tokenises server-side; we approximate from character count,
 // which is only used for a progress percentage.
 async function handleCountTokens(req, res) {
+  // Same credential as the inference routes. It costs no upstream quota, but an
+  // unauthenticated route on a keyed proxy is still a free oracle for anyone who
+  // can reach the port; a request that would be refused on /v1/messages must
+  // not be answered here.
+  if (!authForUpstream(req)) {
+    const e = anthropicError(401, { error: { type: "authentication_error", message: "invalid proxy key" } })
+    return json(res, e.status, e.body)
+  }
   let body
   try {
     body = JSON.parse(await readBody(req))
@@ -3720,11 +3982,16 @@ async function router(req, res) {
     }
   }
   if ((req.method === "GET" || req.method === "HEAD") && p === "/health") {
-    const cache = await fetchModels()
+    // Cache-only on purpose. /health is unauthenticated, and a fresh upstream
+    // fetch per poll let any monitor (or anyone who can reach the port) drive
+    // the proxy's upstream quota. It reports the last known state; the first
+    // poll after startup may be "unknown", which a monitor reads as 200 with
+    // ok:null rather than as a failure.
+    const cache = modelsCache
     // Monitors (uptime pingers, container checks) probe with HEAD and inspect
     // only the status line; a HEAD reply carries no body by definition.
     if (req.method === "HEAD") return res.end()
-    return json(res, 200, { ok: cache.ok, upstream: config.upstream })
+    return json(res, 200, { ok: cache.at ? cache.ok : null, upstream: config.upstream, sync: syncState.at ? { at: syncState.at, ok: syncState.ok } : null })
   }
 
   if (p.startsWith("/api/")) {
@@ -3780,7 +4047,12 @@ async function router(req, res) {
 
 const server = http.createServer(router)
 
-server.requestTimeout = 0
+// Bound inbound request reception. `requestTimeout = 0` meant no limit at all,
+// so a client that opened a request and dribbled (or never sent) its body held
+// a socket and a handler for the life of the process — slowloris by omission.
+// This covers *receiving* the request only; a long streamed reply is bounded by
+// the relay walls instead.
+server.requestTimeout = 300_000
 server.headersTimeout = 60_000
 
 // A proxy is a long-lived daemon: one bad request must not take it down for the
@@ -3792,8 +4064,17 @@ server.headersTimeout = 60_000
 process.on("unhandledRejection", (err) => {
   log(`unhandled rejection (ignored): ${err?.stack || err?.message || err}`)
 })
+// An uncaught exception is a different animal: the stack unwound through
+// arbitrary state, so the process can no longer be trusted to hold a coherent
+// identity pool, config or half-written stream. Swallowing it kept a daemon
+// alive in an unknown state; log it, stop accepting, and exit non-zero so the
+// supervisor (systemd `Restart=always`, or zen-claude) starts a clean one.
 process.on("uncaughtException", (err) => {
-  log(`uncaught exception (ignored): ${err?.stack || err?.message || err}`)
+  log(`uncaught exception — exiting: ${err?.stack || err?.message || err}`)
+  try {
+    server.close()
+  } catch {}
+  setTimeout(() => process.exit(1), 100).unref()
 })
 
 server.on("error", (err) => {
@@ -3828,7 +4109,10 @@ if (isMain) {
         // writing it here would pin this install to today's catalog and it would
         // never see a refresh.
         const { fallbackModels, ...seed } = config
-        fs.writeFileSync(CONFIG_PATH, JSON.stringify(seed, null, 2))
+        // Through writeConfigFile, not a bare write: the seed carries the same
+        // secrets (PROXY_KEY / ZEN_KEY from the environment), and a plain
+        // writeFileSync here created it world-readable with umask 022.
+        writeConfigFile(seed)
         log(`created default config: ${CONFIG_PATH}`)
       } catch {}
     }
@@ -3883,16 +4167,13 @@ export {
   chatToAnthropic,
   anthropicError,
   remapAgentTool,
-  agentToolsFor,
   loadAgentTools,
   AGENT_TOOL_MAP,
-  AGENT_PREAMBLE_TEXT,
   relayStream,
   relayAnthropicStream,
   relayResponsesStream,
   relayChatAsResponsesStream,
   relayResponsesPassthrough,
-  headersWall,
   rewriteSSE,
   stripUnpinnedCalls,
   filterPinnedDelta,
@@ -3917,7 +4198,6 @@ export {
   toBool,
   identityFor,
   sessionFor,
-  sessionHeader,
   SESSION_MAX_AGE_MS,
   MAX_BODY,
   VALID_MODEL_ID,

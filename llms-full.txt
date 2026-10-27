@@ -156,7 +156,7 @@ If `zen-claude` reports `command not found`, check the symlink exists before bla
 
 ## Anthropic API (Claude Code)
 
-`POST /v1/messages` and `POST /v1/messages/count_tokens` implement the Anthropic Messages protocol: system blocks, message content blocks, images, `tool_use`/`tool_result`, `thinking`, `tool_choice` and `stop_sequences` are all translated to the endpoint family the target model actually uses, and the reply is translated back including the full streaming envelope (`message_start` → `content_block_*` → `message_delta` → `message_stop`). Errors use Anthropic's `{type:"error",error:{type,message}}` shape. Both `x-api-key` and `Authorization: Bearer` authenticate.
+`POST /v1/messages` and `POST /v1/messages/count_tokens` implement the Anthropic Messages protocol: system blocks, message content blocks, images, `tool_use`/`tool_result`, `thinking`, `tool_choice` and `stop_sequences` are all translated to the endpoint family the target model actually uses, and the reply is translated back including the full streaming envelope (`message_start` → `content_block_*` → `message_delta` → `message_stop`). Errors use Anthropic's `{type:"error",error:{type,message}}` shape. Both `x-api-key` and `Authorization: Bearer` authenticate, and both routes require the proxy key when `proxyKey` is set.
 
 The free tier accepts a request only when it carries opencode's own v2 tool manifest, so the manifest rides on **every** request: opencode's 12 tools go first, the caller's own tools after them (an exact-name collision dedupes to the manifest's schema). The harness preamble is prepended ahead of the caller's system prompt — everything the caller sent still follows, nothing is edited away, and the prepend is idempotent. Calls whose mapped name the caller actually offers are renamed back (`read`→`Read`, `filePath`→`file_path`, …) so the caller runs the tool it knows; anything else is not returnable. Disable with `agentTools: false`.
 
@@ -189,13 +189,13 @@ Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded wh
 | `defaultModel` | `""` | Empty = auto: pick the first *healthy* free model (no more hardcoded/vanished defaults) |
 | `fallbackModels` | *(from `models.json`)* | Tried in order on `429`/`5xx` and dead-model `4xx`. Omit it to follow the shipped catalog (refreshed by the model-sync Action every 6h); save it from the dashboard to pin your own list |
 | `responsesModels` | `["gpt-5*","gpt-6*","grok-*","muse-spark-*"]` | Models served on `/v1/responses` (patterns may end in `*`); the proxy translates to/from chat completions for you |
-| `rateLimitMax` | `0` (off) | Max chat requests per client per window — `0` disables the limiter |
+| `rateLimitMax` | `0` (off) | Max chat requests per client per window — `0` disables the limiter. Local callers are split by user-agent family, so several agents behind one address get separate budgets |
 | `rateLimitWindowMs` | `60000` | Rate-limit window |
 | `modelAliases` | `{}` | e.g. `{"gpt-4o":"mimo-v2.5-free"}` — reply model rewritten back |
 | `proxyKey` | `""` | If set, clients must send it — as `Authorization: Bearer` or `x-api-key`; locks the dashboard too. It is the proxy's own secret and is never forwarded upstream |
 | `defaultZenKey` | `""` | Your own Zen key (BYOK) instead of anonymous `public`. On the one 429 that means your identity's own allowance is spent (the "Free usage limit reached" pitch, not the shared-bucket cooldown), the same attempt is retried once under this key before the fallback chain walks on |
 | `trustForwarded` | `false` | Trust `x-forwarded-for`/`x-real-ip` from a reverse proxy |
-| `timeoutMs` | `120000` | Upstream timeout for non-streaming |
+| `timeoutMs` | `120000` | Upstream *silence* timeout, re-armed on every chunk so long replies are not cut |
 | `cacheMs` | `30000` | `/v1/models` cache TTL |
 
 Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION` (`0` to disable), `AUTO_UA` (`0` to disable), `UA_REFRESH_MS`, `PROBE_AUTH`, `RESPONSES_MODELS` (JSON), `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW_MS`, `DEFAULT_MODEL`, `FALLBACK_MODELS` (JSON), `MODEL_ALIASES` (JSON), `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED=1`, `TIMEOUT_MS`, `CACHE_MS`, `ZEN_PROXY_CONFIG` (custom config path).
@@ -213,7 +213,7 @@ Anonymous `public` access rides opencode's shared free pool (per-IP quota, somet
 | `POST` | `/v1/chat/completions` | Chat completions (stream + non-stream) |
 | `POST` | `/v1/responses` | Responses API in either dialect — Responses bodies on the route get Responses replies, chat bodies keep chat replies; bridge and pinned filters apply |
 | `GET` | `/v1/models` | Allowed models (cached) |
-| `GET` | `/health` | Health check |
+| `GET` | `/health` | Health check — never calls upstream, reports the last known catalog state |
 | `GET` | `/` | Dashboard |
 | `GET` | `/api/status` | Stats + upstream health |
 | `GET/PUT` | `/api/config` | Read / update config |

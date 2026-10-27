@@ -2198,9 +2198,13 @@ describe("syncModels model-ID validation", () => {
 })
 
 describe("router / health", () => {
-  test("/health reports ok:true when upstream responds", async () => {
+  // /health is cache-only (audit #17): an unauthenticated route must not drive
+  // an upstream fetch per poll. The tests warm the cache the way any real
+  // traffic does — one catalog fetch — then assert what /health reports.
+  test("/health reports ok:true when the last catalog fetch succeeded", async () => {
     zp.saveConfig({ cacheMs: 0 })
     globalThis.fetch = routeFetch([["/models", jsonResponse({ data: [{ id: "space-bunny-free" }] })]])
+    await zp.fetchModels()
     const res = mockRes()
     await zp.router(mockReq({ method: "GET", url: "/health" }), res)
     assert.equal(res.state.status, 200)
@@ -2210,10 +2214,29 @@ describe("router / health", () => {
   test("/health reports ok:false when upstream is down", async () => {
     zp.saveConfig({ cacheMs: 0 })
     globalThis.fetch = routeFetch([["/models", () => { throw new Error("ECONNREFUSED") }]])
+    await zp.fetchModels()
     const res = mockRes()
     await zp.router(mockReq({ method: "GET", url: "/health" }), res)
     assert.equal(res.state.status, 200)
     assert.equal(JSON.parse(res.body).ok, false)
+  })
+
+  test("/health never calls upstream, however often it is polled", async () => {
+    let calls = 0
+    globalThis.fetch = async () => {
+      calls++
+      return jsonResponse({ data: [{ id: "space-bunny-free" }] })
+    }
+    // The route answers from module state only. A monitor polling it must not
+    // drive catalog fetches, and it must always answer — "unknown" (null) is a
+    // 200, not a failure.
+    for (let i = 0; i < 5; i++) {
+      const res = mockRes()
+      await zp.router(mockReq({ method: "GET", url: "/health" }), res)
+      assert.equal(res.state.status, 200)
+      assert.ok(JSON.parse(res.body).ok !== undefined)
+    }
+    assert.equal(calls, 0, "the unauthenticated route made no upstream call")
   })
 
   test("unknown route → 404", async () => {
@@ -5017,5 +5040,711 @@ describe("request bodies survive chunk boundaries (audit #7)", () => {
   test("a body under the byte limit is accepted", async () => {
     const req = mockStreamingReq([bytes("😀")]) // 4 bytes
     assert.equal(await zp.readBody(req, 4), "😀")
+  })
+})
+
+// ---- audit 2026-10-27: high / medium backlog -------------------------------
+
+describe("anthropic stream block indices are distinct (audit #11)", () => {
+  const chatSse = (blocks) => (async function* () {
+    for (const b of blocks) yield `data: ${JSON.stringify(b)}\n\n`
+    yield "data: [DONE]\n\n"
+  })()
+
+  test("thinking and text get different block indices", async () => {
+    const chunks = chatSse([
+      { choices: [{ index: 0, delta: { reasoning_content: "pondering" } }] },
+      { choices: [{ index: 0, delta: { content: "answer" } }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+    ])
+    const res = mockRes()
+    await zp.relayAnthropicStream(mockReq(), res, chunks, "m", "m")
+    const starts = res.body
+      .split("\n\n")
+      .filter((b) => b.includes("content_block_start"))
+      .map((b) => JSON.parse(b.split("\n").find((l) => l.startsWith("data:")).slice(5)))
+    assert.equal(starts.length, 2, "one thinking block, one text block")
+    assert.deepEqual(starts.map((s) => s.content_block.type), ["thinking", "text"])
+    assert.notEqual(starts[0].index, starts[1].index, "two blocks must not share an index")
+    const stops = res.body
+      .split("\n\n")
+      .filter((b) => b.includes("content_block_stop"))
+      .map((b) => JSON.parse(b.split("\n").find((l) => l.startsWith("data:")).slice(5)).index)
+    assert.deepEqual([...new Set(stops)].sort(), [...new Set(starts.map((s) => s.index))].sort(), "every opened block closes under its own index")
+  })
+
+  test("a tool block after text does not collide with the text block", async () => {
+    const chunks = chatSse([
+      { choices: [{ index: 0, delta: { content: "let me look" } }] },
+      { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "c1", type: "function", function: { name: "Read", arguments: '{"file_path":"/a"}' } }] } }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+    ])
+    const res = mockRes()
+    await zp.relayAnthropicStream(mockReq(), res, chunks, "m", "m")
+    const blocks = res.body
+      .split("\n\n")
+      .filter((b) => b.includes("content_block_start"))
+      .map((b) => JSON.parse(b.split("\n").find((l) => l.startsWith("data:")).slice(5)))
+    assert.deepEqual(blocks.map((b) => b.content_block.type), ["text", "tool_use"])
+    assert.notEqual(blocks[0].index, blocks[1].index)
+  })
+})
+
+describe("the minted identity pair cannot be split by the caller (audit #12)", () => {
+  test("a caller-supplied project alone does not override the minted project", () => {
+    const h = zp.zenHeaders(mockReq({ remoteAddress: "5.5.5.5", headers: { "x-opencode-project": "attacker-project" } }), "Bearer public")
+    assert.notEqual(h["x-opencode-project"], "attacker-project", "the project must stay half of the minted pair")
+    assert.equal(h["x-opencode-project"], zp.identityFor(mockReq({ remoteAddress: "5.5.5.5" })).project)
+  })
+
+  test("a caller that brings a full session+project pair still keeps both", () => {
+    const req = mockReq({ headers: { "x-opencode-session": "ses_caller111111", "x-opencode-project": "caller-project" } })
+    const h = zp.zenHeaders(req, "Bearer public")
+    assert.equal(h["x-opencode-project"], "caller-project")
+    assert.equal(h["x-opencode-session"], "ses_caller111111")
+  })
+})
+
+describe("usage is requested on every forced stream (audit #15)", () => {
+  const collect = async (body, path = "/v1/chat/completions") => {
+    let sent = null
+    globalThis.fetch = async (u, opts) => {
+      sent = JSON.parse(opts.body)
+      return new Response(
+        `data: ${JSON.stringify({ model: "m", choices: [{ index: 0, delta: { content: "hi" } }] })}\n\n` +
+          `data: ${JSON.stringify({ model: "m", choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 7, completion_tokens: 3, total_tokens: 10 } })}\n\n` +
+          "data: [DONE]\n\n",
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      )
+    }
+    const res = mockRes()
+    const req = mockReq({ method: "POST", url: path, headers: { "content-type": "application/json" }, _body: JSON.stringify(body) })
+    await zp.router(req, res)
+    return { sent, res }
+  }
+
+  test("a non-streaming chat request still asks upstream for usage", async () => {
+    const m = zp.config.fallbackModels[0]
+    const { sent } = await collect({ model: m, messages: [{ role: "user", content: "hi" }] })
+    assert.equal(sent.stream_options?.include_usage, true)
+  })
+
+  test("the usage the gateway sends is surfaced in the collected reply", async () => {
+    const m = zp.config.fallbackModels[0]
+    const { res } = await collect({ model: m, messages: [{ role: "user", content: "hi" }] })
+    assert.deepEqual(JSON.parse(res.body).usage, { prompt_tokens: 7, completion_tokens: 3, total_tokens: 10 })
+  })
+
+  test("a caller's own stream_options keys survive", async () => {
+    const m = zp.config.fallbackModels[0]
+    const { sent } = await collect({ model: m, messages: [{ role: "user", content: "hi" }], stream_options: { include_obfuscation: false } })
+    assert.equal(sent.stream_options.include_obfuscation, false)
+    assert.equal(sent.stream_options.include_usage, true)
+  })
+})
+
+describe("a relay that dies after the 200 is recorded as a failure (audit #33)", () => {
+  test("a mid-reply cut is logged as 502, not 200", async () => {
+    const m = zp.config.fallbackModels[0]
+    globalThis.fetch = async () =>
+      new Response(
+        `data: ${JSON.stringify({ model: m, choices: [{ index: 0, delta: { content: "half" } }] })}\n\n`,
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      )
+    const res = mockRes()
+    await zp.router(
+      mockReq({ method: "POST", url: "/v1/chat/completions", headers: { "content-type": "application/json" }, _body: JSON.stringify({ model: m, messages: [], stream: true }) }),
+      res,
+    )
+    await res.done
+    assert.ok(res.body.includes('"error"'), "the client was told the reply collapsed")
+    assert.ok(zp.requestStats.recent.at(-1)[0].endsWith("|502"), `recorded as a failure: ${zp.requestStats.recent.at(-1)[0]}`)
+    assert.equal(zp.requestStats.errors, 1)
+  })
+})
+
+describe("provider-qualified model ids (audit #21)", () => {
+  test("a known suffix resolves to the catalog model", () => {
+    const m = zp.config.fallbackModels[0]
+    const { requested, candidates } = zp.resolveModel(`anthropic/${m}`)
+    assert.equal(candidates[0], m)
+    assert.equal(requested, m, "the reply echoes the id the proxy actually served")
+  })
+
+  test("an unknown suffix still falls back to the default", () => {
+    const { requested, candidates } = zp.resolveModel("someprovider/no-such-model-xyz")
+    assert.equal(candidates[0], zp.effectiveDefault())
+    assert.equal(requested, "no-such-model-xyz", "the caller's own naming is echoed back")
+  })
+
+  test("an unqualified id is unaffected", () => {
+    const m = zp.config.fallbackModels[0]
+    assert.equal(zp.resolveModel(m).requested, m)
+  })
+})
+
+describe("admin and helper routes (audit #28/#31/#32)", () => {
+  test("count_tokens is refused without the proxy key", async () => {
+    zp.saveConfig({ proxyKey: "admin-1" })
+    const res = mockRes()
+    await zp.router(
+      mockReq({ method: "POST", url: "/v1/messages/count_tokens", headers: { "content-type": "application/json" }, _body: JSON.stringify({ messages: [] }) }),
+      res,
+    )
+    assert.equal(res.state.status, 401)
+  })
+
+  test("count_tokens still answers with the proxy key", async () => {
+    zp.saveConfig({ proxyKey: "admin-1" })
+    const res = mockRes()
+    await zp.router(
+      mockReq({
+        method: "POST",
+        url: "/v1/messages/count_tokens",
+        headers: { "content-type": "application/json", authorization: "Bearer admin-1" },
+        _body: JSON.stringify({ messages: [{ role: "user", content: "hello world" }] }),
+      }),
+      res,
+    )
+    assert.equal(res.state.status, 200)
+    assert.ok(JSON.parse(res.body).input_tokens > 0)
+  })
+
+  test("/api/logs clamps a NaN or absurd n instead of dumping everything", async () => {
+    for (const n of ["NaN", "1e9", "-5", "abc"]) {
+      const res = mockRes()
+      await zp.router(mockReq({ method: "GET", url: `/api/logs?n=${n}` }), res)
+      const logs = JSON.parse(res.body).logs
+      assert.ok(Array.isArray(logs), `n=${n} still returns an array`)
+      assert.ok(logs.length <= zp.logLines.length, `n=${n} never exceeds the buffer`)
+    }
+  })
+
+  test("/api/logs still honours a real n", async () => {
+    const res = mockRes()
+    await zp.router(mockReq({ method: "GET", url: "/api/logs?n=1" }), res)
+    assert.ok(JSON.parse(res.body).logs.length <= 1)
+  })
+})
+
+describe("chatToResponses reports a truncated reply honestly (audit #29)", () => {
+  const chat = (finish) => ({ id: "chatcmpl-1", created: 1, choices: [{ index: 0, message: { role: "assistant", content: "cut" }, finish_reason: finish }] })
+
+  test("finish_reason length becomes status incomplete", () => {
+    const out = zp.chatToResponses(chat("length"), "m", "m")
+    assert.equal(out.status, "incomplete")
+    assert.deepEqual(out.incomplete_details, { reason: "max_output_tokens" })
+  })
+
+  test("a normal stop stays completed", () => {
+    const out = zp.chatToResponses(chat("stop"), "m", "m")
+    assert.equal(out.status, "completed")
+    assert.equal(out.incomplete_details, undefined)
+  })
+})
+
+describe("the chat->responses relay addresses arguments by the item's own id (audit #30)", () => {
+  test("function_call_arguments.done carries the fc_ id, not undefined", async () => {
+    const chunks = (async function* () {
+      yield `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_A", type: "function", function: { name: "Read", arguments: '{"a":1}' } }] } }] })}\n\n`
+      yield `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}\n\n`
+      yield "data: [DONE]\n\n"
+    })()
+    // The relay reads a Response, so collect the generator into one body.
+    let text = ""
+    for await (const c of chunks) text += c
+    const res = mockRes()
+    await zp.relayChatAsResponsesStream(
+      mockReq(),
+      res,
+      new Response(text, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      "m",
+      false,
+    )
+    const done = res.body
+      .split("\n\n")
+      .filter((b) => b.includes("function_call_arguments.done"))
+      .map((b) => JSON.parse(b.split("\n").find((l) => l.startsWith("data:")).slice(5)))
+    assert.equal(done.length, 1)
+    assert.match(String(done[0].item_id), /^fc_/, `item_id is the call item's id: ${JSON.stringify(done[0])}`)
+  })
+})
+
+// ---- second pass: the High/Medium backlog ----
+
+// An EventEmitter-shaped response the tests can drive: `emit("close")` is a
+// client hanging up, `emit("drain")` clears socket backpressure.
+function eventRes() {
+  const handlers = {}
+  const state = { status: 200, headers: {}, chunks: [] }
+  const res = {
+    state,
+    writableEnded: false,
+    destroyed: false,
+    writableNeedDrain: false,
+    get body() {
+      return state.chunks.join("")
+    },
+    writeHead(status, headers = {}) {
+      state.status = status
+      Object.assign(state.headers, headers)
+    },
+    setHeader(name, value) {
+      state.headers[String(name).toLowerCase()] = value
+    },
+    write(chunk) {
+      state.chunks.push(String(chunk))
+    },
+    end(chunk) {
+      if (chunk !== undefined && chunk !== null) state.chunks.push(String(chunk))
+      res.writableEnded = true
+    },
+    on(ev, cb) {
+      ;(handlers[ev] ??= []).push(cb)
+      return res
+    },
+    off(ev, cb) {
+      handlers[ev] = (handlers[ev] ?? []).filter((f) => f !== cb)
+      return res
+    },
+    emit(ev, ...args) {
+      for (const cb of handlers[ev] ?? []) cb(...args)
+    },
+  }
+  return res
+}
+
+function streamOfText(parts) {
+  const enc = new TextEncoder()
+  return new Response(
+    new ReadableStream({
+      start(c) {
+        for (const p of parts) c.enqueue(enc.encode(p))
+        c.close()
+      },
+    }),
+    { status: 200, headers: { "content-type": "text/event-stream" } },
+  )
+}
+
+describe("CRLF streams survive every chunk boundary (audit #8)", () => {
+  const CRLF_BODY =
+    `data: ${JSON.stringify({ model: "u", choices: [{ delta: { content: "hi" }, finish_reason: null }] })}\r\n\r\n` +
+    `data: ${JSON.stringify({ model: "u", choices: [{ delta: {}, finish_reason: "stop" }] })}\r\n\r\n` +
+    "data: [DONE]\r\n\r\n"
+
+  test("a CRLF stream relays as clean \\n\\n frames with no false mid-reply error", async () => {
+    const res = mockRes()
+    await zp.relayStream(mockReq(), res, streamOfText([CRLF_BODY]), "m")
+    await res.done
+    assert.ok(!res.body.includes('"error"'), `no synthetic failure: ${res.body.slice(-160)}`)
+    assert.ok(res.body.includes('"content":"hi"'))
+    assert.ok(res.body.includes('"finish_reason":"stop"'))
+    assert.ok(res.body.includes("data: [DONE]"))
+    assert.equal(res.body.includes("\r"), false, "no raw CR reaches the client")
+  })
+
+  test("a split at every CR boundary still frames the blocks correctly", async () => {
+    // A chunk that ends exactly on the \r of a CRLF pair left the held \r
+    // unresolved in the next buffer, so the pair never collapsed and a literal
+    // \r leaked into the data frame. Every CR position is exercised here.
+    const splits = [...CRLF_BODY.matchAll(/\r/g)].map((m) => m.index + 1)
+    assert.ok(splits.length > 0)
+    for (const at of splits) {
+      const res = mockRes()
+      await zp.relayStream(mockReq(), res, streamOfText([CRLF_BODY.slice(0, at), CRLF_BODY.slice(at)]), "m")
+      await res.done
+      assert.ok(!res.body.includes("\r"), `split ${at}: raw CR in output ${JSON.stringify(res.body.slice(0, 120))}`)
+      assert.ok(res.body.includes('"content":"hi"'), `split ${at}: text lost`)
+      assert.ok(res.body.includes('"finish_reason":"stop"'), `split ${at}: finish lost`)
+      assert.ok(!res.body.includes('"error"'), `split ${at}: false mid-reply error`)
+    }
+  })
+
+  test("a bare-CR stream is normalised too", async () => {
+    const body = CRLF_BODY.replace(/\r\n/g, "\r")
+    const res = mockRes()
+    await zp.relayStream(mockReq(), res, streamOfText([body]), "m")
+    await res.done
+    assert.ok(res.body.includes('"content":"hi"'))
+    assert.ok(res.body.includes('"finish_reason":"stop"'))
+    assert.equal(res.body.includes("\r"), false)
+  })
+})
+
+describe("x-zen-key works without a proxy key (audit #9)", () => {
+  test("a per-request Zen key is honoured on an open proxy", () => {
+    zp.saveConfig({ proxyKey: "", defaultZenKey: "" })
+    assert.equal(zp.authForUpstream(mockReq({ headers: { "x-zen-key": "sk-custom" } })), "Bearer sk-custom")
+  })
+
+  test("a per-request Zen key outranks a configured default", () => {
+    zp.saveConfig({ proxyKey: "", defaultZenKey: "zen-default" })
+    assert.equal(zp.authForUpstream(mockReq({ headers: { "x-zen-key": "sk-custom" } })), "Bearer sk-custom")
+    assert.equal(zp.authForUpstream(mockReq()), "Bearer zen-default")
+  })
+
+  test("`public` is anonymous, not an override", () => {
+    zp.saveConfig({ proxyKey: "", defaultZenKey: "" })
+    assert.equal(zp.authForUpstream(mockReq({ headers: { "x-zen-key": "public" } })), "Bearer public")
+  })
+})
+
+describe("the chat route retries a rejected placeholder key (audit #10)", () => {
+  test("a 401 for the caller's placeholder key falls back to the configured Zen key", async () => {
+    zp.saveConfig({
+      proxyKey: "",
+      defaultZenKey: "zen-configured",
+      fallbackModels: ["big-pickle"],
+      defaultModel: "",
+      retriesPerModel: 0,
+      autoSyncIntervalMs: 0,
+      cacheMs: 0,
+    })
+    const auths = []
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          auths.push(opts.headers["authorization"])
+          if (opts.headers["authorization"] !== "Bearer zen-configured") {
+            return jsonResponse({ error: { message: "invalid api key" } }, 401)
+          }
+          return sseResponse(["hello"])
+        },
+      ],
+    ])
+    const req = mockReq({
+      headers: { authorization: "Bearer sk-placeholder" },
+      _body: JSON.stringify({ model: "big-pickle", messages: [] }),
+    })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 200)
+    assert.deepEqual(auths, ["Bearer sk-placeholder", "Bearer zen-configured"], "one retry under the configured key")
+  })
+
+  test("a proxy key is never swapped for the fallback (it would leak)", async () => {
+    zp.saveConfig({ proxyKey: "proxy-secret", defaultZenKey: "zen-configured", fallbackModels: ["big-pickle"], defaultModel: "", retriesPerModel: 0 })
+    const auths = []
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          auths.push(opts.headers["authorization"])
+          return jsonResponse({ error: { message: "invalid api key" } }, 401)
+        },
+      ],
+    ])
+    // With a proxy key configured the handler authenticates first, then uses the
+    // configured Zen key for upstream — the proxy key itself is never forwarded.
+    const req = mockReq({
+      headers: { authorization: "Bearer proxy-secret" },
+      _body: JSON.stringify({ model: "big-pickle", messages: [] }),
+    })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    assert.equal(res.state.status, 401)
+    assert.ok(!auths.some((a) => a === "Bearer proxy-secret"), `proxy key leaked upstream: ${JSON.stringify(auths)}`)
+  })
+})
+
+describe("an assistant turn with text and tool_use stays one turn (audit #13)", () => {
+  test("text plus tool_use is a single assistant message", () => {
+    const out = zp.anthropicToChatMessages(undefined, [
+      { role: "user", content: "do it" },
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "let me look" },
+          { type: "tool_use", id: "call_1", name: "Read", input: { file_path: "/a" } },
+        ],
+      },
+    ])
+    const assistant = out.filter((m) => m.role === "assistant")
+    assert.equal(assistant.length, 1, `two assistant turns in a row: ${JSON.stringify(out)}`)
+    assert.equal(assistant[0].content, "let me look")
+    assert.equal(assistant[0].tool_calls[0].id, "call_1")
+  })
+
+  test("a tool-only assistant turn is still a single message", () => {
+    const out = zp.anthropicToChatMessages(undefined, [
+      { role: "user", content: "do it" },
+      { role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "Read", input: {} }] },
+    ])
+    const assistant = out.filter((m) => m.role === "assistant")
+    assert.equal(assistant.length, 1)
+    assert.equal(assistant[0].content, "")
+    assert.equal(assistant[0].tool_calls.length, 1)
+  })
+
+  test("a user turn is never merged into the assistant message", () => {
+    const out = zp.anthropicToChatMessages(undefined, [
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+      { role: "assistant", content: [{ type: "text", text: "hello" }] },
+    ]).filter((m) => m.role !== "system")
+    assert.deepEqual(out, [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "hello" },
+    ])
+  })
+})
+
+describe("Responses history keeps prior assistant answers (audit #14)", () => {
+  test("output_text parts survive the trip back to chat history", () => {
+    const out = zp.responsesInputToMessages([
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "previous answer" }] },
+      { type: "message", role: "user", content: [{ type: "input_text", text: "next" }] },
+    ])
+    assert.deepEqual(out, [
+      { role: "assistant", content: [{ type: "text", text: "previous answer" }] },
+      { role: "user", content: [{ type: "text", text: "next" }] },
+    ])
+  })
+})
+
+describe("a dashboard save only pins the catalog when it changed (audit #16)", () => {
+  const put = async (body) => {
+    const res = mockRes()
+    await zp.handleApiConfig(
+      mockReq({ method: "PUT", headers: { "content-type": "application/json" }, _body: JSON.stringify(body) }),
+      res,
+    )
+    return res
+  }
+
+  test("re-submitting the shipped list keeps following models.json", async () => {
+    await put({ fallbackModels: ["big-pickle"] })
+    assert.equal(zp.isFallbackModelsPinned(), true, "a custom list pins, as before")
+    const res = await put({ fallbackModels: zp.loadShippedModels() })
+    assert.equal(res.state.status, 200)
+    assert.equal(zp.isFallbackModelsPinned(), false, "the unchanged catalog list must not pin")
+    const onDisk = JSON.parse(fs.readFileSync(process.env.ZEN_PROXY_CONFIG, "utf8"))
+    assert.equal("fallbackModels" in onDisk, false, "the following list stays off disk")
+  })
+})
+
+describe("the shipped defaults match the docs (audit #17/#18)", () => {
+  const defaults = () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zen-proxy-defaults-"))
+    const script = `import { config } from ${JSON.stringify(new URL("../zen-proxy.mjs", import.meta.url).href)}
+console.log(JSON.stringify({ cacheMs: config.cacheMs, autoSync: config.autoSync, autoSyncIntervalMs: config.autoSyncIntervalMs }))`
+    const env = { ...process.env, ZEN_PROXY_CONFIG: path.join(dir, "zen-proxy.json") }
+    delete env.CACHE_MS
+    delete env.AUTO_SYNC
+    delete env.AUTO_SYNC_MS
+    try {
+      return JSON.parse(
+        execFileSync(process.execPath, ["--input-type=module", "-e", script], { encoding: "utf8", env })
+          .trim()
+          .split("\n")
+          .pop(),
+      )
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  test("the model cache is 30s and discovery runs hourly", () => {
+    const c = defaults()
+    assert.equal(c.cacheMs, 30000, "/health must not refetch the catalog on every poll")
+    assert.equal(c.autoSync, true)
+    assert.equal(c.autoSyncIntervalMs, 3600000, "hourly, as documented")
+  })
+})
+
+describe("relays obey client backpressure and disconnects (audit #19/#20)", () => {
+  const oneBlock = (text) =>
+    `data: ${JSON.stringify({ model: "u", choices: [{ delta: { content: text }, finish_reason: null }] })}\n\n`
+  const doneBlock = `data: ${JSON.stringify({ model: "u", choices: [{ delta: {}, finish_reason: "stop" }] })}\n\n`
+
+  test("a relay waits for drain before finishing the reply", async () => {
+    const res = eventRes()
+    res.writableNeedDrain = true
+    const pump = zp.relayStream(mockReq(), res, streamOfText([oneBlock("a") + doneBlock]), "m")
+    await new Promise((r) => setTimeout(r, 10))
+    assert.equal(res.writableEnded, false, "still backpressured: the relay must not finish")
+    res.writableNeedDrain = false
+    res.emit("drain")
+    await pump
+    assert.equal(res.writableEnded, true, "draining lets the reply finish")
+  })
+
+  test("a client disconnect cancels the upstream reader instead of draining it", async () => {
+    const enc = new TextEncoder()
+    let cancelled = false
+    const upstream = new Response(
+      new ReadableStream({
+        start(c) {
+          c.enqueue(enc.encode(oneBlock("partial")))
+        },
+        cancel() {
+          cancelled = true
+        },
+      }),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    )
+    const res = eventRes()
+    const pump = zp.relayStream(mockReq(), res, upstream, "m")
+    await new Promise((r) => setTimeout(r, 10))
+    // A real hang-up leaves the socket destroyed but not ended — that is the
+    // state the relay has to read as "nobody is listening any more".
+    res.destroyed = true
+    res.emit("close")
+    await pump
+    assert.equal(cancelled, true, "the upstream body was cancelled")
+    assert.ok(!res.body.includes('"error"'), "a client that left gets no error frame")
+  })
+})
+
+describe("the config file is written private (audit #23)", () => {
+  test("saveConfig creates it 0600", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zen-proxy-mode-"))
+    const cfg = path.join(dir, "zen-proxy.json")
+    const script = `import { saveConfig } from ${JSON.stringify(new URL("../zen-proxy.mjs", import.meta.url).href)}
+import fs from "node:fs"
+saveConfig({ port: 8791 })
+console.log(JSON.stringify({ mode: (fs.statSync(process.env.ZEN_PROXY_CONFIG).mode & 0o777).toString(8) }))`
+    try {
+      const out = JSON.parse(
+        execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+          encoding: "utf8",
+          env: { ...process.env, ZEN_PROXY_CONFIG: cfg },
+        })
+          .trim()
+          .split("\n")
+          .pop(),
+      )
+      assert.equal(out.mode, "600", "the file holds the Zen key and the proxy key")
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("a malformed env var does not kill the process at import (audit #24)", () => {
+  test("bad JSON and bad numbers fall back to their defaults", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zen-proxy-env-"))
+    const script = `import { config } from ${JSON.stringify(new URL("../zen-proxy.mjs", import.meta.url).href)}
+console.log(JSON.stringify({
+  n: config.fallbackModels.length,
+  aliases: config.modelAliases,
+  responses: config.responsesModels,
+  port: config.port,
+  timeoutMs: config.timeoutMs,
+}))`
+    try {
+      const out = JSON.parse(
+        execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            ZEN_PROXY_CONFIG: path.join(dir, "zen-proxy.json"),
+            FALLBACK_MODELS: "[oops",
+            MODEL_ALIASES: "{nope",
+            RESPONSES_MODELS: "not json",
+            PORT: "abc",
+            TIMEOUT_MS: "soon",
+          },
+        })
+          .trim()
+          .split("\n")
+          .pop(),
+      )
+      assert.ok(out.n > 0, "shipped catalog used when FALLBACK_MODELS is broken")
+      assert.deepEqual(out.aliases, {})
+      assert.ok(out.responses.includes("gpt-5*"))
+      assert.equal(out.port, 8787)
+      assert.equal(out.timeoutMs, 120000)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("rate limiting splits local agents and stays bounded (audit #26)", () => {
+  test("two agents on loopback get separate budgets, one agent's versions do not", () => {
+    zp.saveConfig({ rateLimitMax: 1, rateLimitWindowMs: 60_000 })
+    const a = mockReq({ remoteAddress: "127.0.0.1", headers: { "user-agent": "agent-a/1.0" } })
+    const aBumped = mockReq({ remoteAddress: "127.0.0.1", headers: { "user-agent": "agent-a/2.7" } })
+    const b = mockReq({ remoteAddress: "127.0.0.1", headers: { "user-agent": "agent-b/1.0" } })
+    assert.equal(zp.rateLimitFor(a).limited, false)
+    assert.equal(zp.rateLimitFor(aBumped).limited, true, "the same agent family shares one budget")
+    assert.equal(zp.rateLimitFor(b).limited, false, "another agent on the same machine is its own caller")
+  })
+})
+
+describe("the identity pool evicts the least recently used pair (audit #26/#27)", () => {
+  test("a bucket older than the cap is re-minted, a fresh one is kept", () => {
+    const T = 1_800_000_000_000
+    // Public addresses: every loopback/private IP collapses into the one
+    // "local" bucket, which would defeat an eviction test.
+    const oldest = mockReq({ remoteAddress: "198.51.100.1" })
+    const before = zp.identityFor(oldest, T)
+    let lastReq = null
+    for (let i = 0; i < 2100; i++) {
+      lastReq = mockReq({ remoteAddress: `203.0.113.${1 + (i % 250)}.${1 + Math.floor(i / 250)}` })
+      zp.identityFor(lastReq, T)
+    }
+    const newest = zp.identityFor(lastReq, T)
+    assert.equal(zp.identityFor(lastReq, T).session, newest.session, "the newest bucket is still pooled")
+    const after = zp.identityFor(oldest, T)
+    assert.notEqual(after.session, before.session, "the oldest bucket was evicted, not kept forever")
+  })
+})
+
+describe("/api/test reports the caller the request path reports (audit #32)", () => {
+  test("a forwarded address is used when trustForwarded is on", async () => {
+    zp.saveConfig({ trustForwarded: true })
+    let realIp = null
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          realIp = opts.headers["x-real-ip"]
+          return jsonResponse({ model: "ok", choices: [] })
+        },
+      ],
+    ])
+    const res = mockRes()
+    await zp.handleTest(mockReq({ headers: { "x-forwarded-for": "8.8.4.4" }, _body: JSON.stringify({ model: "big-pickle" }) }), res)
+    assert.equal(realIp, "8.8.4.4", "TEST must honour trustForwarded like the request path")
+  })
+})
+
+describe("server hardening (audit #25)", () => {
+  const src = fs.readFileSync(new URL("../zen-proxy.mjs", import.meta.url), "utf8")
+
+  test("inbound request reception is bounded", () => {
+    assert.match(src, /server\.requestTimeout\s*=\s*300_000/, "requestTimeout is not left at 0")
+    assert.match(src, /server\.headersTimeout\s*=\s*60_000/)
+  })
+
+  test("an uncaught exception exits non-zero instead of being swallowed", () => {
+    const block = src.slice(src.indexOf('process.on("uncaughtException"'))
+    assert.match(block.slice(0, 600), /process\.exit\(1\)/, "a supervisor has to see a clean restart")
+  })
+})
+
+describe("the Anthropic stream carries no OpenAI sentinel (audit #35)", () => {
+  test("data: [DONE] never reaches an Anthropic client", async () => {
+    const chunks = (async function* () {
+      yield `data: ${JSON.stringify({ model: "u", choices: [{ delta: { content: "hi" }, finish_reason: null }] })}\n\n`
+      yield `data: ${JSON.stringify({ model: "u", choices: [{ delta: {}, finish_reason: "stop" }] })}\n\n`
+      yield "data: [DONE]\n\n"
+    })()
+    const res = mockRes()
+    await zp.relayAnthropicStream(mockReq(), res, chunks, "m", "m")
+    await res.done
+    assert.ok(!res.body.includes("[DONE]"), "that sentinel belongs to the OpenAI dialect")
+    assert.ok(res.body.includes("message_stop"))
+  })
+})
+
+describe("dead exports are gone, not just unused (audit #34)", () => {
+  test("the stale preamble constant and session helper are no longer exported", () => {
+    for (const name of ["AGENT_PREAMBLE_TEXT", "sessionHeader", "agentToolsFor", "headersWall"]) {
+      assert.equal(name in zp, false, `${name} is still exported`)
+    }
   })
 })

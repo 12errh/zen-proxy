@@ -170,8 +170,8 @@ For replies, one rule: a reply may only carry calls your agent can actually run.
 | `responsesModels` | `["gpt-5*","gpt-6*","grok-*","muse-spark-*"]` | Models served on `/v1/responses`; patterns may end in `*` |
 | `defaultZenKey` | `""` | Your own Zen key instead of anonymous `public`; a 429 that says the *identity's* free allowance is spent ("Free usage limit reached") retries that same attempt once under this key before walking the chain — the shared-bucket cooldown never escalates |
 | `proxyKey` | `""` | Require this from clients (`Authorization: Bearer` or `x-api-key`); also locks the dashboard and `/api/*`. It is the proxy's own secret — never sent upstream |
-| `rateLimitMax` / `rateLimitWindowMs` | `0` (off) / `60000` | Per-client rate limiting |
-| `timeoutMs` / `cacheMs` | `120000` / `30000` | Upstream timeout, `/v1/models` cache TTL |
+| `rateLimitMax` / `rateLimitWindowMs` | `0` (off) / `60000` | Per-client rate limiting; local callers are split by user-agent family so several agents behind the same address do not share one budget |
+| `timeoutMs` / `cacheMs` | `120000` / `30000` | Upstream *silence* timeout (re-armed on every chunk, so long replies are not cut), `/v1/models` cache TTL |
 | `autoSync` / `autoSyncIntervalMs` | `true` / `3600000` | Runtime discovery of newly-offered free models |
 | `trustForwarded` | `false` | Honour `x-forwarded-for` behind a reverse proxy |
 
@@ -198,9 +198,9 @@ Anonymous `public` access shares a per-IP quota that is sometimes saturated. Set
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
 | `POST` | `/v1/responses` | OpenAI Responses API |
 | `POST` | `/v1/messages` | Anthropic Messages API |
-| `POST` | `/v1/messages/count_tokens` | Anthropic token estimate |
+| `POST` | `/v1/messages/count_tokens` | Anthropic token estimate (needs the proxy key when one is set) |
 | `GET` | `/v1/models` | Available models |
-| `GET` | `/health` | Health check (always open) |
+| `GET` | `/health` | Health check (never calls upstream; reports the last known catalog state) |
 | `GET` | `/` | Dashboard |
 | `GET`/`PUT` | `/api/config` | Read / update configuration |
 | `GET` | `/api/status` | Stats and upstream health |
