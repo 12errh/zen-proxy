@@ -477,7 +477,10 @@ let savedZenKeyMasked = ""
 function api(path, opts = {}) {
   const headers = { ...(opts.headers || {}) }
   if (key) headers["Authorization"] = "Bearer " + key
-  if (opts.body) headers["Content-Type"] = "application/json"
+  // Every mutating /api/* route requires application/json, including the ones
+  // that take no body (/api/sync), so the server can tell a dashboard click
+  // from a cross-origin form post it never got a preflight for.
+  if (opts.body || opts.method === "POST" || opts.method === "PUT") headers["Content-Type"] = "application/json"
   return fetch(path, { ...opts, headers }).then(async (r) => {
     if (r.status === 401) { showAuth(); throw new Error("unauthorized") }
     return r.json()

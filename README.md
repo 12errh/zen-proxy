@@ -169,7 +169,7 @@ For replies, one rule: a reply may only carry calls your agent can actually run.
 | `modelAliases` | `{}` | e.g. `{"gpt-4o": "space-bunny-free"}` |
 | `responsesModels` | `["gpt-5*","gpt-6*","grok-*","muse-spark-*"]` | Models served on `/v1/responses`; patterns may end in `*` |
 | `defaultZenKey` | `""` | Your own Zen key instead of anonymous `public`; a 429 that says the *identity's* free allowance is spent ("Free usage limit reached") retries that same attempt once under this key before walking the chain — the shared-bucket cooldown never escalates |
-| `proxyKey` | `""` | Require this from clients; also locks the dashboard and `/api/*` |
+| `proxyKey` | `""` | Require this from clients (`Authorization: Bearer` or `x-api-key`); also locks the dashboard and `/api/*`. It is the proxy's own secret — never sent upstream |
 | `rateLimitMax` / `rateLimitWindowMs` | `0` (off) / `60000` | Per-client rate limiting |
 | `timeoutMs` / `cacheMs` | `120000` / `30000` | Upstream timeout, `/v1/models` cache TTL |
 | `autoSync` / `autoSyncIntervalMs` | `true` / `3600000` | Runtime discovery of newly-offered free models |
@@ -208,6 +208,10 @@ Anonymous `public` access shares a per-IP quota that is sometimes saturated. Set
 | `GET` | `/api/logs` | Log tail |
 | `POST` | `/api/sync` | Re-run model discovery |
 | `POST` | `/api/reset` | Reset request statistics |
+
+Mutating `/api/*` routes must be same-origin (loopback `Host`, matching `Origin`)
+and send `content-type: application/json`, so a web page you happen to visit cannot
+rewrite the config and redirect every forwarded key to its own server.
 </details>
 
 <details>

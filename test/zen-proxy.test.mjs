@@ -1252,7 +1252,10 @@ describe("restore model list", () => {
   test("POST /api/config re-adds shipped models without touching keys", async () => {
     zp.saveConfig({ fallbackModels: ["space-bunny-free"], defaultZenKey: "zen-keep-me", proxyKey: "" })
     const res = mockRes()
-    await zp.handleApiConfig(mockReq({ method: "POST", _body: JSON.stringify({ fallbackModels: true }) }), res)
+    await zp.handleApiConfig(
+      mockReq({ method: "POST", url: "/api/config", headers: { "content-type": "application/json" }, _body: JSON.stringify({ fallbackModels: true }) }),
+      res,
+    )
     assert.equal(res.state.status, 200)
     const data = JSON.parse(res.body)
     for (const m of zp.config.fallbackModels) {
@@ -1263,7 +1266,10 @@ describe("restore model list", () => {
 
   test("unknown POST body is rejected", async () => {
     const res = mockRes()
-    await zp.handleApiConfig(mockReq({ method: "POST", _body: JSON.stringify({ bogus: true }) }), res)
+    await zp.handleApiConfig(
+      mockReq({ method: "POST", url: "/api/config", headers: { "content-type": "application/json" }, _body: JSON.stringify({ bogus: true }) }),
+      res,
+    )
     assert.equal(res.state.status, 400)
   })
 })
@@ -2081,7 +2087,7 @@ describe("handleApiConfig", () => {
 
   test("PUT ignores unknown keys", async () => {
     const before = zp.config.port
-    const req = mockReq({ method: "PUT", _body: JSON.stringify({ notAKey: "x", port: before }) })
+    const req = mockReq({ method: "PUT", headers: { "content-type": "application/json" }, _body: JSON.stringify({ notAKey: "x", port: before }) })
     const res = mockRes()
     await zp.handleApiConfig(req, res)
     assert.equal(zp.config.notAKey, undefined)
@@ -2092,7 +2098,7 @@ describe("handleApiConfig", () => {
     zp.saveConfig({ proxyKey: "real-key-123" })
     const req = mockReq({
       method: "PUT",
-      headers: { authorization: "Bearer real-key-123" },
+      headers: { authorization: "Bearer real-key-123", "content-type": "application/json" },
       _body: JSON.stringify({ proxyKey: "••••••••", port: zp.config.port }),
     })
     const res = mockRes()
@@ -2104,7 +2110,7 @@ describe("handleApiConfig", () => {
     zp.saveConfig({ proxyKey: "admin-1", defaultZenKey: "zen-real-abcdef" })
     const req = mockReq({
       method: "PUT",
-      headers: { authorization: "Bearer admin-1" },
+      headers: { authorization: "Bearer admin-1", "content-type": "application/json" },
       _body: JSON.stringify({
         defaultZenKey: zp.sanitize({ defaultZenKey: "zen-real-abcdef" }).defaultZenKey,
         port: zp.config.port,
@@ -2116,14 +2122,14 @@ describe("handleApiConfig", () => {
   })
 
   test('PUT autoSync "0" → false', async () => {
-    const req = mockReq({ method: "PUT", _body: JSON.stringify({ autoSync: "0", port: zp.config.port }) })
+    const req = mockReq({ method: "PUT", headers: { "content-type": "application/json" }, _body: JSON.stringify({ autoSync: "0", port: zp.config.port }) })
     const res = mockRes()
     await zp.handleApiConfig(req, res)
     assert.equal(zp.config.autoSync, false)
   })
 
   test('PUT trustForwarded "true" → true', async () => {
-    const req = mockReq({ method: "PUT", _body: JSON.stringify({ trustForwarded: "true", port: zp.config.port }) })
+    const req = mockReq({ method: "PUT", headers: { "content-type": "application/json" }, _body: JSON.stringify({ trustForwarded: "true", port: zp.config.port }) })
     const res = mockRes()
     await zp.handleApiConfig(req, res)
     assert.equal(zp.config.trustForwarded, true)
@@ -2131,14 +2137,14 @@ describe("handleApiConfig", () => {
 
   test("PUT invalid port keeps existing port", async () => {
     const before = zp.config.port
-    const req = mockReq({ method: "PUT", _body: JSON.stringify({ port: "abc" }) })
+    const req = mockReq({ method: "PUT", headers: { "content-type": "application/json" }, _body: JSON.stringify({ port: "abc" }) })
     const res = mockRes()
     await zp.handleApiConfig(req, res)
     assert.equal(zp.config.port, before)
   })
 
   test("PUT with non-object body → 400", async () => {
-    const req = mockReq({ method: "PUT", _body: JSON.stringify([1]) })
+    const req = mockReq({ method: "PUT", headers: { "content-type": "application/json" }, _body: JSON.stringify([1]) })
     const res = mockRes()
     await zp.handleApiConfig(req, res)
     assert.equal(res.state.status, 400)
@@ -2148,7 +2154,7 @@ describe("handleApiConfig", () => {
     zp.saveConfig({ maxBodyBytes: 1024 * 1024 })
     const chunk = "x".repeat(100 * 1024)
     const chunks = Array.from({ length: 20 }, () => chunk) // ~2MB, no proxyKey set so adminAuth passes
-    const req = mockStreamingReq(chunks, { method: "PUT" })
+    const req = mockStreamingReq(chunks, { method: "PUT", headers: { "content-type": "application/json" } })
     const res = mockRes()
     await zp.handleApiConfig(req, res)
     assert.equal(res.state.status, 413)
@@ -2221,7 +2227,7 @@ describe("router / health", () => {
     zp.requestStats.total = 42
     const res = mockRes()
     await zp.router(
-      mockReq({ method: "POST", url: "/api/reset", headers: { authorization: "Bearer admin-1" } }),
+      mockReq({ method: "POST", url: "/api/reset", headers: { authorization: "Bearer admin-1", "content-type": "application/json" } }),
       res,
     )
     assert.equal(res.state.status, 200)
@@ -4757,3 +4763,259 @@ describe("manifest calls the caller cannot run are dropped from replies (issue #
 
 
 
+
+// ---- audit 2026-10-27: critical fixes -------------------------------------
+
+describe("proxyKey is the proxy's secret, not a Zen credential (audit #1/#2)", () => {
+  const anthro = (headers = {}) =>
+    mockReq({
+      method: "POST",
+      url: "/v1/messages",
+      headers: { "content-type": "application/json", ...headers },
+      _body: JSON.stringify({ model: "m", max_tokens: 8, messages: [{ role: "user", content: "hi" }] }),
+    })
+  const chat = (headers = {}) =>
+    mockReq({
+      method: "POST",
+      url: "/v1/chat/completions",
+      headers: { "content-type": "application/json", ...headers },
+      _body: JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] }),
+    })
+
+  beforeEach(() => {
+    zp.saveConfig({ proxyKey: "proxy-secret", defaultZenKey: "zen-good-key", fallbackModels: ["m"], defaultModel: "m", responsesModels: [] })
+    globalThis.fetch = async () =>
+      jsonResponse({ id: "x", object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }] })
+  })
+
+  test("an arbitrary x-api-key cannot bypass proxyKey", async () => {
+    const res = mockRes()
+    await zp.handleMessages(anthro({ "x-api-key": "attacker-chosen-value" }), res)
+    assert.equal(res.state.status, 401, "a token the proxy key does not match must be refused")
+  })
+
+  test("the proxy key presented as x-api-key is accepted but never forwarded upstream", async () => {
+    let seenAuth = null
+    globalThis.fetch = async (u, opts) => {
+      seenAuth = opts.headers.authorization
+      return jsonResponse({ id: "x", choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }] })
+    }
+    const res = mockRes()
+    await zp.handleMessages(anthro({ "x-api-key": "proxy-secret" }), res)
+    assert.equal(res.state.status, 200)
+    assert.equal(seenAuth, "Bearer zen-good-key", "the configured Zen key is used, not the proxy key")
+    assert.ok(!String(seenAuth).includes("proxy-secret"), "the proxy secret never leaves the machine")
+  })
+
+  test("the same bypass is closed on the OpenAI-shaped route", async () => {
+    const res = mockRes()
+    await zp.handleChat(chat({ "x-api-key": "attacker-chosen-value" }), res)
+    assert.equal(res.state.status, 401)
+  })
+
+  test("x-api-key still works as a real Zen key when no proxyKey is set", () => {
+    zp.saveConfig({ proxyKey: "", defaultZenKey: "" })
+    assert.equal(zp.authForUpstream(mockReq({ headers: { "x-api-key": "my-zen-key" } })), "Bearer my-zen-key")
+  })
+
+  test("adminAuth compares in constant time and accepts either header", () => {
+    zp.saveConfig({ proxyKey: "admin-1", defaultZenKey: "" })
+    assert.equal(zp.authForUpstream(mockReq({ headers: { authorization: "Bearer admin-1" } })), "Bearer public")
+    assert.equal(zp.authForUpstream(mockReq({ headers: { authorization: "Bearer admin-2" } })), null)
+    assert.equal(zp.authForUpstream(mockReq({ headers: { "x-api-key": "admin-1" } })), "Bearer public")
+  })
+})
+
+describe("admin writes cannot be forged by a web page (audit #3)", () => {
+  const put = (headers = {}, body = { port: 8787 }) =>
+    mockReq({
+      method: "PUT",
+      url: "/api/config",
+      headers: { "content-type": "application/json", ...headers },
+      _body: JSON.stringify(body),
+    })
+
+  test("a cross-origin upgrade attempt is refused", async () => {
+    const res = mockRes()
+    await zp.handleApiConfig(put({ host: "127.0.0.1:8787", origin: "https://evil.example" }), res)
+    assert.equal(res.state.status, 403)
+    assert.notEqual(zp.config.upstream, "https://evil.example")
+  })
+
+  test("a non-JSON content type is refused (simple-request CSRF)", async () => {
+    const res = mockRes()
+    await zp.handleApiConfig(
+      mockReq({ method: "PUT", url: "/api/config", headers: { "content-type": "text/plain" }, _body: JSON.stringify({ upstream: "https://evil.example" }) }),
+      res,
+    )
+    assert.equal(res.state.status, 415)
+    assert.notEqual(zp.config.upstream, "https://evil.example")
+  })
+
+  test("a non-loopback Host is refused (DNS rebinding)", async () => {
+    const res = mockRes()
+    await zp.handleApiConfig(put({ host: "evil.example" }), res)
+    assert.equal(res.state.status, 403)
+  })
+
+  test("a same-origin JSON write still works", async () => {
+    const res = mockRes()
+    await zp.handleApiConfig(put({ host: "127.0.0.1:8787", origin: "http://127.0.0.1:8787" }), res)
+    assert.equal(res.state.status, 200)
+  })
+
+  test("requests with no Host header (tooling, tests) are unaffected", async () => {
+    const res = mockRes()
+    await zp.handleApiConfig(put(), res)
+    assert.equal(res.state.status, 200)
+  })
+})
+
+describe("responses passthrough drops a call's arguments with the call (audit #4)", () => {
+  const sse =
+    `event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", item: { type: "function_call", id: "fc_R", call_id: "call_R", name: "read" } })}\n\n` +
+    `event: response.function_call_arguments.delta\ndata: ${JSON.stringify({ type: "response.function_call_arguments.delta", item_id: "fc_R", delta: '{"filePath":"/secret"}' })}\n\n` +
+    `event: response.function_call_arguments.done\ndata: ${JSON.stringify({ type: "response.function_call_arguments.done", item_id: "fc_R", arguments: '{"filePath":"/secret"}' })}\n\n` +
+    `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r", output: [] } })}\n\n`
+
+  test("arguments addressed by item_id are dropped with the call", async () => {
+    const res = mockRes()
+    await zp.relayResponsesPassthrough(
+      mockReq(),
+      res,
+      new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      "up",
+      false,
+      null,
+      () => false, // the caller can run nothing
+    )
+    await res.done
+    assert.ok(!res.body.includes("/secret"), `dropped call's arguments must not leak: ${res.body}`)
+  })
+
+  test("a permitted call keeps its arguments", async () => {
+    const res = mockRes()
+    await zp.relayResponsesPassthrough(
+      mockReq(),
+      res,
+      new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      "up",
+      false,
+      null,
+      (name) => name === "read",
+    )
+    await res.done
+    assert.ok(res.body.includes("/secret"), "permitted call's arguments still arrive")
+  })
+})
+
+describe("parallel tool calls keep their own identity (audit #5)", () => {
+  const responsesSse =
+    `event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", item: { type: "function_call", id: "fc_A", call_id: "call_A", name: "read" } })}\n\n` +
+    `event: response.function_call_arguments.delta\ndata: ${JSON.stringify({ type: "response.function_call_arguments.delta", item_id: "fc_A", delta: '{"q":"first"}' })}\n\n` +
+    `event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", item: { type: "function_call", id: "fc_B", call_id: "call_B", name: "grep" } })}\n\n` +
+    `event: response.function_call_arguments.delta\ndata: ${JSON.stringify({ type: "response.function_call_arguments.delta", item_id: "fc_B", delta: '{"q":"second"}' })}\n\n` +
+    `event: response.function_call_arguments.done\ndata: ${JSON.stringify({ type: "response.function_call_arguments.done", item_id: "fc_B", arguments: '{"q":"second"}' })}\n\n` +
+    `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r" } })}\n\n`
+
+  test("deltas resolve to the call they belong to", () => {
+    const state = { tools: [] }
+    const items = responsesSse
+      .split("\n\n")
+      .filter((b) => b.trim())
+      .map((b) => JSON.parse(b.split("\n").find((l) => l.startsWith("data:"))?.slice(5) ?? "null"))
+      .filter(Boolean)
+    const deltas = items.flatMap((d) => zp.responsesEventToDeltas("", d, state))
+    const callDeltas = deltas.filter((d) => d.tool_calls)
+    const firstArg = callDeltas.find((d) => d.tool_calls[0].function?.arguments === '{"q":"first"}')
+    const secondArg = callDeltas.find((d) => d.tool_calls[0].function?.arguments === '{"q":"second"}')
+    assert.equal(firstArg.tool_calls[0].index, 0)
+    assert.equal(secondArg.tool_calls[0].index, 1, "the second call's arguments must not land on call 0")
+  })
+
+  test("the anthropic relay receives two blocks with their own arguments", async () => {
+    // Drive the real responses->chat converter through the exported relay by
+    // reproducing its chunk shape (same identities, distinct indices).
+    const chatChunks = (async function* () {
+      yield `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_A", type: "function", function: { name: "Read", arguments: "" } }] } }] })}\n\n`
+      yield `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '{"q":"first"}' } }] } }] })}\n\n`
+      yield `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 1, id: "call_B", type: "function", function: { name: "Grep", arguments: "" } }] } }] })}\n\n`
+      yield `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 1, function: { arguments: '{"q":"second"}' } }] } }] })}\n\n`
+      yield `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}\n\n`
+      yield "data: [DONE]\n\n"
+    })()
+    const res = mockRes()
+    await zp.relayAnthropicStream(mockReq(), res, chatChunks, "m", "m")
+    const args = res.body
+      .split("\n\n")
+      .filter((b) => b.includes("input_json_delta"))
+      .map((b) => JSON.parse(b.split("\n").find((l) => l.startsWith("data:"))?.slice(5)))
+    assert.equal(args.length, 2, "both calls emit arguments")
+    assert.deepEqual(
+      args.map((a) => a.index),
+      [1, 2],
+      "each call keeps its own block index",
+    )
+    assert.deepEqual(args.map((a) => a.delta.partial_json), ['{"q":"first"}', '{"q":"second"}'])
+  })
+})
+
+describe("the relay wall measures silence, not total duration (audit #6)", () => {
+  const chunksEvery = (count, gapMs) =>
+    (async function* () {
+      for (let i = 0; i < count; i++) {
+        await new Promise((r) => setTimeout(r, gapMs))
+        yield `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "x" }, finish_reason: i === count - 1 ? "stop" : null }] })}\n\n`
+      }
+      yield "data: [DONE]\n\n"
+    })()
+
+  test("a healthy stream that outlives timeoutMs is not cut", async () => {
+    zp.saveConfig({ timeoutMs: 60 })
+    const res = mockRes()
+    await zp.relayAnthropicStream(mockReq(), res, chunksEvery(8, 25), "m", "m")
+    assert.ok(res.body.includes("message_stop"), "the turn must complete")
+    assert.ok(!res.body.includes("relay wall"), "no false stall")
+    assert.equal((res.body.match(/text_delta/g) ?? []).length, 8, "every chunk arrived")
+  })
+
+  test("a genuinely silent upstream is still cut", async () => {
+    zp.saveConfig({ timeoutMs: 50 })
+    // relayStream holds the reader directly, so a stalled body is cancellable
+    // there — this is the same relayWall() the other pumps use.
+    const silent = new Response(new ReadableStream({ start() {} }), {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    })
+    const res = mockRes()
+    await Promise.race([zp.relayStream(mockReq(), res, silent, "m"), new Promise((r) => setTimeout(r, 2000))])
+    assert.equal(res.state.status, 200)
+    assert.match(res.body, /relay wall/)
+  })
+})
+
+describe("request bodies survive chunk boundaries (audit #7)", () => {
+  const bytes = (s) => Buffer.from(s, "utf8")
+
+  test("a multi-byte character split across chunks is not corrupted", async () => {
+    const original = JSON.stringify({ model: "m", messages: [{ role: "user", content: "héllo 😀 wörld" }] })
+    const buf = bytes(original)
+    // split inside the two-byte `é`
+    const cut = buf.indexOf(bytes("é")) + 1
+    const req = mockStreamingReq([buf.subarray(0, cut), buf.subarray(cut)])
+    const parsed = JSON.parse(await zp.readBody(req))
+    assert.equal(parsed.messages[0].content, "héllo 😀 wörld")
+  })
+
+  test("the size limit counts bytes, not UTF-16 code units", async () => {
+    const heavy = "😀".repeat(10) // 40 bytes, 20 code units
+    const limit = 20
+    const req = mockStreamingReq([bytes(heavy)])
+    await assert.rejects(() => zp.readBody(req, limit), (err) => err.statusCode === 413)
+  })
+
+  test("a body under the byte limit is accepted", async () => {
+    const req = mockStreamingReq([bytes("😀")]) // 4 bytes
+    assert.equal(await zp.readBody(req, 4), "😀")
+  })
+})

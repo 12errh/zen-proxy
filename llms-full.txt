@@ -126,7 +126,11 @@ manage everything, no config files
 - **Settings** — edit host, port, upstream URL, User-Agent, proxy key, BYOK key, timeout, fallback list, aliases; saved to `zen-proxy.json` and applied instantly
 - **Logs** — live terminal-style log tail
 
-Set `proxyKey` and both the dashboard and the API require that key.
+Set `proxyKey` and both the dashboard and the API require that key (`Authorization:
+Bearer` or `x-api-key`). The proxy key is the proxy's own secret: it is checked
+and then dropped, never forwarded to the upstream. Mutating `/api/*` requests must
+also be same-origin and `content-type: application/json`, so a web page cannot
+rewrite the config and redirect your Zen key to another host.
 
 ---
 
@@ -188,7 +192,7 @@ Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded wh
 | `rateLimitMax` | `0` (off) | Max chat requests per client per window — `0` disables the limiter |
 | `rateLimitWindowMs` | `60000` | Rate-limit window |
 | `modelAliases` | `{}` | e.g. `{"gpt-4o":"mimo-v2.5-free"}` — reply model rewritten back |
-| `proxyKey` | `""` | If set, clients must send it as `Bearer`; locks the dashboard too |
+| `proxyKey` | `""` | If set, clients must send it — as `Authorization: Bearer` or `x-api-key`; locks the dashboard too. It is the proxy's own secret and is never forwarded upstream |
 | `defaultZenKey` | `""` | Your own Zen key (BYOK) instead of anonymous `public`. On the one 429 that means your identity's own allowance is spent (the "Free usage limit reached" pitch, not the shared-bucket cooldown), the same attempt is retried once under this key before the fallback chain walks on |
 | `trustForwarded` | `false` | Trust `x-forwarded-for`/`x-real-ip` from a reverse proxy |
 | `timeoutMs` | `120000` | Upstream timeout for non-streaming |

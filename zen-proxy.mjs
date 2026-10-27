@@ -2,7 +2,7 @@
 import http from "node:http"
 import fs from "node:fs"
 import path from "node:path"
-import { randomBytes, createHash } from "node:crypto"
+import { randomBytes, createHash, timingSafeEqual } from "node:crypto"
 import { fileURLToPath } from "node:url"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -1185,20 +1185,40 @@ function filterResponsesOutput(data, callOk = null) {
 }
 
 // Responses SSE event -> chat.completion.chunk deltas.
+//
+// A Responses call is announced once with `id` (fc_…) and `call_id` (call_…),
+// while its argument deltas reference it by `item_id`. Storing only `call_id`
+// and looking up only `item_id` made every lookup miss and fall back to index 0,
+// which merged two concurrent calls' arguments into the first one. Both names
+// are indexed here, and an unresolvable delta is attached to the most recent
+// call rather than silently rewriting call 0.
+function callIndexFor(state, data, create = false) {
+  const keys = [data?.item_id, data?.call_id, data?.id].filter((v) => typeof v === "string" && v)
+  for (const key of keys) {
+    const hit = state.byId?.get?.(key)
+    if (hit != null) return hit
+  }
+  if (!create) return state.tools.length ? state.tools.length - 1 : 0
+  const index = state.tools.length
+  for (const key of keys) state.byId?.set?.(key, index)
+  return index
+}
+
 function responsesEventToDeltas(event, data, state) {
   const type = event || data?.type || ""
+  state.byId ??= new Map()
   const out = []
   if (type === "response.output_text.delta" && data?.delta) out.push({ content: data.delta })
   else if ((type === "response.reasoning_text.delta" || type === "response.reasoning_summary_text.delta") && data?.delta)
     out.push({ reasoning_content: data.delta })
   else if (type === "response.output_item.added" && data?.item?.type === "function_call") {
     const item = data.item
-    const index = state.tools.length
-    state.tools.push({ id: item.call_id ?? item.id ?? `call_${index}` })
-    out.push({ tool_calls: [{ index, id: item.call_id ?? item.id ?? `call_${index}`, type: "function", function: { name: item.name ?? "unknown", arguments: "" } }] })
+    const index = callIndexFor(state, item, true)
+    const id = item.call_id ?? item.id ?? `call_${index}`
+    state.tools[index] = { id }
+    out.push({ tool_calls: [{ index, id, type: "function", function: { name: item.name ?? "unknown", arguments: "" } }] })
   } else if (type === "response.function_call_arguments.delta" && data?.delta) {
-    let index = state.tools.findIndex((t) => t.id === (data.item_id ?? data.call_id ?? data.call_id))
-    if (index < 0) index = 0
+    const index = callIndexFor(state, data)
     if (!state.tools[index]) state.tools[index] = { id: data.call_id ?? `call_${index}` }
     out.push({ tool_calls: [{ index, function: { arguments: data.delta } }] })
   }
@@ -1371,16 +1391,48 @@ function bearer(req) {
   return typeof v === "string" && v.startsWith("Bearer ") ? v.slice(7).trim() : ""
 }
 
+// Constant-time comparison for secrets. Both sides are hashed first so the
+// comparison is length-independent as well: timingSafeEqual throws on unequal
+// lengths, and reading that error is itself an oracle.
+function safeEqual(a, b) {
+  const ha = createHash("sha256").update(String(a ?? "")).digest()
+  const hb = createHash("sha256").update(String(b ?? "")).digest()
+  return timingSafeEqual(ha, hb)
+}
+
+// The Anthropic SDK sends `x-api-key`, the OpenAI SDKs send `Authorization`.
+// Both are named here once so the two routes cannot drift apart.
+function apiKeyHeader(req) {
+  const k = req.headers["x-api-key"]
+  return typeof k === "string" ? k.trim() : ""
+}
+
+// The single place a request's upstream credential is decided. Both the
+// Anthropic and the OpenAI-shaped routes call this, so a token can never be
+// usable on one route and meaningless on the other.
+//
+// With `proxyKey` set the caller must present it — as a bearer token or as
+// `x-api-key` — and the proxy key itself is NEVER an upstream credential: it is
+// the proxy's own secret, and forwarding it would hand that secret to the
+// free-tier gateway (the Claude Code setup sends the proxy key in `x-api-key`,
+// which used to travel upstream verbatim). The upstream credential then comes
+// from `x-zen-key`, `defaultZenKey`, or the anonymous tier.
+//
+// Without `proxyKey` the caller's own credential is forwarded: bearer first,
+// then `x-api-key`, which is how an Anthropic-native client supplies a real Zen
+// key.
 function authForUpstream(req) {
   const incoming = bearer(req)
+  const key = apiKeyHeader(req)
   if (config.proxyKey) {
-    if (incoming !== config.proxyKey) return null
+    if (!safeEqual(incoming, config.proxyKey) && !safeEqual(key, config.proxyKey)) return null
     const zen = req.headers["x-zen-key"]
     if (typeof zen === "string" && zen && zen !== "public") return `Bearer ${zen}`
     if (config.defaultZenKey) return `Bearer ${config.defaultZenKey}`
     return "Bearer public"
   }
-  if (incoming && incoming !== "public") return `Bearer ${incoming}`
+  if (incoming && !safeEqual(incoming, "public")) return `Bearer ${incoming}`
+  if (key && !safeEqual(key, "public")) return `Bearer ${key}`
   if (config.defaultZenKey) return `Bearer ${config.defaultZenKey}`
   return "Bearer public"
 }
@@ -1392,17 +1444,27 @@ function maxBodyBytes() {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : MAX_BODY
 }
 
+// Bodies arrive as Buffers, and `raw += chunk` decodes each chunk on its own.
+// A multi-byte UTF-8 character straddling a TCP read boundary is split by that
+// decode and comes back as U+FFFD — silent corruption of the user's prompt
+// (measured with "héllo 😀 wörld" split inside `é`). Collect Buffers instead and
+// decode once, so the decoder is free to hold an incomplete sequence until the
+// rest arrives. The limit is likewise a byte ceiling (`maxBodyBytes`), not a
+// UTF-16 code-unit count, which used to overshoot by up to 3x.
 async function readBody(req, limit = maxBodyBytes()) {
-  let raw = ""
+  const chunks = []
+  let total = 0
   for await (const chunk of req) {
-    raw += chunk
-    if (raw.length > limit) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(typeof chunk === "string" ? chunk : String(chunk ?? ""))
+    total += buf.length
+    if (total > limit) {
       const err = new Error("request body too large")
       err.statusCode = 413
       throw err
     }
+    chunks.push(buf)
   }
-  return raw
+  return Buffer.concat(chunks).toString("utf8")
 }
 
 function json(res, status, data) {
@@ -1419,14 +1481,7 @@ function json(res, status, data) {
 
 
 // Anthropic clients authenticate with `x-api-key`; the OpenAI-compatible SDKs
-// use `Authorization: Bearer`. Accept either so Claude Code and curl both work.
-function bearerOrKey(req) {
-  const v = req.headers["authorization"]
-  if (typeof v === "string" && v.startsWith("Bearer ")) return v.slice(7).trim()
-  const k = req.headers["x-api-key"]
-  if (typeof k === "string" && k.trim()) return k.trim()
-  return ""
-}
+// use `Authorization: Bearer`. authForUpstream() accepts either, for every route.
 
 async function handleMessages(req, res) {
   const start = Date.now()
@@ -1446,15 +1501,10 @@ async function handleMessages(req, res) {
 
   const { requested, candidates } = resolveModel(body.model)
   const isStream = !!body.stream
-  // Route the credential the client sent. x-api-key is Anthropic's convention
-  // and may legitimately be a real Zen key, so prefer it over the bearer token.
-  const apiKey = bearerOrKey(req)
+  // The credential decision (including `x-api-key`) lives entirely in
+  // authForUpstream(), so this route cannot accept a token the OpenAI-shaped
+  // routes would reject — see the note there about the proxy key.
   let auth = authForUpstream(req)
-  if (typeof req.headers["x-api-key"] === "string" && req.headers["x-api-key"].trim()) {
-    auth = `Bearer ${req.headers["x-api-key"].trim()}`
-  } else if (apiKey && apiKey !== "public" && !config.proxyKey && !config.defaultZenKey) {
-    auth = `Bearer ${apiKey}`
-  }
   if (!auth) {
     recordReq(req, requested, Date.now() - start, 401)
     const e = anthropicError(401, { error: { type: "authentication_error", message: "invalid proxy key" } })
@@ -2020,6 +2070,20 @@ async function collectResponses(upstreamRes) {
 // only ever has to understand one wire format.
 async function* responsesChunksAsChat(upstreamRes) {
   const tools = []
+  // A call's argument deltas reference it by `item_id`, which is not the
+  // `call_id` the added item carried. Both are indexed to the same chat index;
+  // the old hardcoded `index: 0` appended every parallel call's arguments to
+  // the first call, losing the rest.
+  const byId = new Map()
+  const indexFor = (obj, create = false) => {
+    for (const key of [obj?.item_id, obj?.call_id, obj?.id]) {
+      if (typeof key === "string" && byId.has(key)) return byId.get(key)
+    }
+    if (!create) return tools.length ? tools.length - 1 : 0
+    const index = tools.length
+    for (const key of [obj?.item_id, obj?.call_id, obj?.id]) if (typeof key === "string" && key) byId.set(key, index)
+    return index
+  }
   for await (const block of sseChunks(upstreamRes)) {
     let raw = ""
     for (const line of block.split("\n")) {
@@ -2042,11 +2106,12 @@ async function* responsesChunksAsChat(upstreamRes) {
       out.choices[0].delta.reasoning_content = d.delta
       emit = true
     } else if (d.type === "response.output_item.added" && d.item?.type === "function_call") {
-      tools.push({ id: d.item.call_id ?? d.item.id ?? "call_0" })
-      out.choices[0].delta.tool_calls = [{ index: tools.length - 1, id: d.item.call_id ?? d.item.id ?? "call_0", type: "function", function: { name: d.item.name ?? "unknown", arguments: "" } }]
+      const index = indexFor(d.item, true)
+      tools[index] = { id: d.item.call_id ?? d.item.id ?? `call_${index}` }
+      out.choices[0].delta.tool_calls = [{ index, id: tools[index].id, type: "function", function: { name: d.item.name ?? "unknown", arguments: "" } }]
       emit = true
     } else if (d.type === "response.function_call_arguments.delta" && d.delta) {
-      out.choices[0].delta.tool_calls = [{ index: 0, function: { arguments: d.delta } }]
+      out.choices[0].delta.tool_calls = [{ index: indexFor(d), function: { arguments: d.delta } }]
       emit = true
     } else if (d.type === "response.completed" || d.type === "response.incomplete") {
       out.choices[0].finish_reason = d.type === "response.incomplete" ? "length" : tools.length ? "tool_calls" : "stop"
@@ -2126,6 +2191,36 @@ function headersWall(timeoutMs = config.timeoutMs) {
   return { signal: ctrl.signal, release() { clearTimeout(timer) } }
 }
 
+// Body-silence wall for the stream relays. `timeoutMs` is documented (README,
+// config table) as a timeout on *silence*, not on total turn duration, and it
+// has to behave that way: coding agents routinely stream for longer than two
+// minutes, and a single timer armed at request start truncated every one of
+// those with a false "upstream stalled" error. `touch()` re-arms the timer each
+// time a chunk arrives, so only a genuinely silent upstream trips it.
+function relayWall(timeoutMs = config.timeoutMs) {
+  const ctrl = new AbortController()
+  const state = { stalled: false }
+  let timer = null
+  const arm = () => {
+    timer = setTimeout(() => {
+      state.stalled = true
+      ctrl.abort(new Error(`upstream sent nothing for ${timeoutMs}ms (relay wall)`))
+    }, timeoutMs)
+  }
+  arm()
+  return {
+    signal: ctrl.signal,
+    state,
+    touch() {
+      clearTimeout(timer)
+      arm()
+    },
+    release() {
+      clearTimeout(timer)
+    },
+  }
+}
+
 function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = false, pin = null, keepable = null) {
   res.writeHead(200, {
     "content-type": "text/event-stream",
@@ -2165,20 +2260,16 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
     }
   }
 
-  const ctrl = new AbortController()
-  let stalled = false
   // Canceling the chunks generator makes the loop below end cleanly and reach
   // the same mid-reply handling, where the stall is named for what it is.
-  ctrl.signal.addEventListener("abort", () => { chunks.return?.()?.catch?.(() => {}) })
-  const timer = setTimeout(() => {
-    stalled = true
-    ctrl.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
-  }, config.timeoutMs)
-  const cleanup = () => clearTimeout(timer)
+  const wall = relayWall()
+  wall.signal.addEventListener("abort", () => { chunks.return?.()?.catch?.(() => {}) })
+  const cleanup = () => wall.release()
 
   const pump = async () => {
     try {
       for await (const chunkText of chunks) {
+        wall.touch()
         if (chatBlockTerminal(chunkText)) st.finished = true
         {
           for (const line of chunkText.split("\n")) {
@@ -2276,7 +2367,7 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
         // cancelled the generator into done — name the stall for what it is.
         closeThink()
         closeText()
-        emit("error", { error: { type: "api_error", message: stalled ? "upstream stalled past the relay wall" : "upstream stream ended mid-reply" } })
+        emit("error", { error: { type: "api_error", message: wall.state.stalled ? "upstream stalled past the relay wall" : "upstream stream ended mid-reply" } })
         res.end()
         return
       }
@@ -2436,16 +2527,11 @@ function relayStream(req, res, upstreamRes, requested, strip = false, pin = null
   let buffer = ""
   let sawFinish = false
   let upstreamErr = null
-  const ctrl = new AbortController()
-  let stalled = false
-  ctrl.signal.addEventListener("abort", () => {
+  const wall = relayWall()
+  wall.signal.addEventListener("abort", () => {
     reader.cancel().catch(() => {})
   })
-  const timer = setTimeout(() => {
-    stalled = true
-    ctrl.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
-  }, config.timeoutMs)
-  const cleanup = () => clearTimeout(timer)
+  const cleanup = () => wall.release()
   const midReplyError = (message) => {
     // The 200 line is already on the wire — an in-band error chunk plus the
     // [DONE] sentinel is the only honest ending left. SDKs raise on error
@@ -2466,10 +2552,11 @@ function relayStream(req, res, upstreamRes, requested, strip = false, pin = null
           // reply died in flight, and a silent end reads like a successful
           // empty turn (measured against a hostile mid-cut). A wall abort
           // cancels the reader into done — name the stall for what it is.
-          if (!sawFinish) midReplyError(upstreamErr ?? (stalled ? "upstream stalled past the relay wall" : "upstream stream ended mid-reply"))
+          if (!sawFinish) midReplyError(upstreamErr ?? (wall.state.stalled ? "upstream stalled past the relay wall" : "upstream stream ended mid-reply"))
           else res.end()
           return
         }
+        wall.touch()
         buffer += decoder.decode(value, { stream: true })
         let idx
         while ((idx = buffer.indexOf("\n\n")) !== -1) {
@@ -2620,16 +2707,11 @@ function relayResponsesStream(req, res, upstreamRes, requested, strip = false, p
   const reader = upstreamRes.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ""
-  const ctrl = new AbortController()
-  let stalled = false
-  ctrl.signal.addEventListener("abort", () => {
+  const wall = relayWall()
+  wall.signal.addEventListener("abort", () => {
     reader.cancel().catch(() => {})
   })
-  const timer = setTimeout(() => {
-    stalled = true
-    ctrl.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
-  }, config.timeoutMs)
-  const cleanup = () => clearTimeout(timer)
+  const cleanup = () => wall.release()
   const send = (choices, extra) =>
     res.write(`data: ${JSON.stringify({ ...base, choices, ...(extra ?? {}) })}\n\n`)
 
@@ -2638,6 +2720,7 @@ function relayResponsesStream(req, res, upstreamRes, requested, strip = false, p
       for (;;) {
         const { done, value } = await reader.read()
         if (done) break
+        wall.touch()
         buffer += decoder.decode(value, { stream: true })
         let idx
         while ((idx = buffer.indexOf("\n\n")) !== -1) {
@@ -2724,7 +2807,7 @@ function relayResponsesStream(req, res, upstreamRes, requested, strip = false, p
         // Upstream never declared completion: end with the failure instead of
         // a finish_reason the model never reached (measured: hostile mid-cut).
         if (!req.signal?.aborted && !res.writableEnded) {
-          res.write(`data: ${JSON.stringify({ error: { type: "upstream_error", message: upstreamErr ?? (stalled ? "upstream stalled past the relay wall" : "upstream stream ended mid-reply") } })}\n\n`)
+          res.write(`data: ${JSON.stringify({ error: { type: "upstream_error", message: upstreamErr ?? (wall.state.stalled ? "upstream stalled past the relay wall" : "upstream stream ended mid-reply") } })}\n\n`)
           res.write("data: [DONE]\n\n")
         }
       }
@@ -2775,18 +2858,14 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
   // one had NO timer, so a dead upstream stalled the stream forever. Cancelling
   // the generator ends the loop cleanly into the mid-reply handling below.
   const chunksIter = sseChunks(upstreamRes)
-  const wall = new AbortController()
-  let stalled = false
+  const wall = relayWall()
   wall.signal.addEventListener("abort", () => { chunksIter.return?.()?.catch?.(() => {}) })
-  const wallTimer = setTimeout(() => {
-    stalled = true
-    wall.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
-  }, config.timeoutMs)
-  const cleanup = () => clearTimeout(wallTimer)
+  const cleanup = () => wall.release()
 
   const pump = async () => {
     try {
       for await (const chunk of chunksIter) {
+        wall.touch()
         if (chatBlockTerminal(chunk)) st.finished = true
         let raw = ""
         for (const line of chunk.split("\n")) if (line.startsWith("data:")) raw = line.slice(5).trim()
@@ -2857,7 +2936,7 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
         // mid-cut): emitting response.completed would tell the caller a turn
         // ended that upstream never finished. The Responses dialect carries
         // mid-stream failure as an `error` event.
-        if (!req.signal?.aborted && !res.writableEnded) evt("error", { error: { type: "api_error", message: stalled ? "upstream stalled past the relay wall" : "upstream stream ended mid-reply" } })
+        if (!req.signal?.aborted && !res.writableEnded) evt("error", { error: { type: "api_error", message: wall.state.stalled ? "upstream stalled past the relay wall" : "upstream stream ended mid-reply" } })
         res.end()
         return
       }
@@ -2918,29 +2997,30 @@ function relayResponsesPassthrough(req, res, upstreamRes, requested, strip = fal
   })
   const dropped = new Set()
   const allowed = new Set()
+  // A call identity travels under up to three names: `id` (fc_…), `call_id`
+  // (call_…), and, in argument events, `item_id`. The old code recorded a
+  // decision under `call_id` but looked argument deltas up by `item_id`, so the
+  // two never matched and a dropped call still leaked its whole argument JSON.
+  // Every identifier an item carries is remembered under both sets.
+  const idsOf = (item) =>
+    [item?.id, item?.call_id, item?.item_id].filter((v) => typeof v === "string" && v)
   // One decision rule for every shape a call can arrive in: the added item
   // carries the name, the later chunks reference it by id.
   const decide = (item) => {
-    const callId = item?.item_id ?? item?.call_id ?? item?.id
+    const ids = idsOf(item)
     const name = item?.name
     if (name) {
-      if (strip) {
-        dropped.add(callId)
+      if (strip || (pin && name !== pin) || (!pin && keepable && !keepable(name))) {
+        for (const id of ids) dropped.add(id)
         return false
       }
-      if (pin && name !== pin) {
-        dropped.add(callId)
-        return false
-      }
-      if (!pin && keepable && !keepable(name)) {
-        dropped.add(callId)
-        return false
-      }
-      allowed.add(callId)
+      for (const id of ids) allowed.add(id)
       return true
     }
-    if (allowed.has(callId)) return true
-    if (dropped.has(callId)) return false
+    if (ids.some((id) => allowed.has(id))) return true
+    if (ids.some((id) => dropped.has(id))) return false
+    // No name and no prior decision: only pass it when nothing is being
+    // filtered (a pin, a strip or a keepable rule all mean "unknown = drop").
     return !(pin || strip || keepable)
   }
   const reader = upstreamRes.body.getReader()
@@ -2948,16 +3028,11 @@ function relayResponsesPassthrough(req, res, upstreamRes, requested, strip = fal
   let buffer = ""
   let sawFinish = false
   let upstreamErr = null
-  const ctrl = new AbortController()
-  let stalled = false
-  ctrl.signal.addEventListener("abort", () => {
+  const wall = relayWall()
+  wall.signal.addEventListener("abort", () => {
     reader.cancel().catch(() => {})
   })
-  const timer = setTimeout(() => {
-    stalled = true
-    ctrl.abort(new Error(`upstream sent nothing for ${config.timeoutMs}ms (relay wall)`))
-  }, config.timeoutMs)
-  const cleanup = () => clearTimeout(timer)
+  const cleanup = () => wall.release()
   const parseBlock = (block) => {
     let event = ""
     let raw = ""
@@ -2977,6 +3052,7 @@ function relayResponsesPassthrough(req, res, upstreamRes, requested, strip = fal
       for (;;) {
         const { done, value } = await reader.read()
         if (done) break
+        wall.touch()
         buffer += decoder.decode(value, { stream: true })
         let idx
         while ((idx = buffer.indexOf("\n\n")) !== -1) {
@@ -3015,7 +3091,7 @@ function relayResponsesPassthrough(req, res, upstreamRes, requested, strip = fal
       // against a hostile cut). The Responses dialect says failure as an
       // `error` event; silence reads like a successful partial turn.
       if (!sawFinish && !req.signal?.aborted && !res.writableEnded) {
-        res.write(`event: error\ndata: ${JSON.stringify({ type: "error", code: "upstream_error", message: upstreamErr ?? (stalled ? "upstream stalled past the relay wall" : "upstream stream ended mid-reply") })}\n\n`)
+        res.write(`event: error\ndata: ${JSON.stringify({ type: "error", code: "upstream_error", message: upstreamErr ?? (wall.state.stalled ? "upstream stalled past the relay wall" : "upstream stream ended mid-reply") })}\n\n`)
       }
       res.end()
     } catch (err) {
@@ -3329,8 +3405,62 @@ async function handleModels(req, res) {
 }
 
 function adminAuth(req, res) {
-  if (config.proxyKey && bearer(req) !== config.proxyKey) {
+  if (config.proxyKey && !safeEqual(bearer(req), config.proxyKey) && !safeEqual(apiKeyHeader(req), config.proxyKey)) {
     json(res, 401, { error: "unauthorized" })
+    return false
+  }
+  return true
+}
+
+// The admin API changes the upstream the proxy forwards keys to, so a request
+// that a web page could forge is a credential-exfiltration path, not just a
+// config edit: a cross-origin `text/plain` POST (a "simple request", no
+// preflight) would let any site point `upstream` at itself and then read the
+// configured Zen key out of every subsequent Authorization header.
+//
+// Two cheap gates close that: a JSON content type (unforgeable cross-origin
+// without a preflight this server never grants) and a same-origin check on
+// Host/Origin (also covers DNS rebinding, where Origin and Host disagree).
+// Requests with no Host header — raw sockets, HTTP/1.0 clients, the test
+// harness — are not browser-driven and stay allowed.
+function isLoopbackHost(host) {
+  const name = String(host ?? "").trim().toLowerCase().replace(/:\d+$/, "").replace(/^\[|\]$/g, "")
+  if (!name) return false
+  if (name === "localhost" || name === "::1") return true
+  if (/^127\./.test(name)) return true
+  // The configured bind address is ours by definition, even if it is a LAN IP.
+  return name === String(config.host ?? "").trim().toLowerCase()
+}
+
+function originAllowed(req) {
+  const host = req.headers.host
+  if (typeof host !== "string" || !host) return true
+  const bind = String(config.host ?? "").trim().toLowerCase()
+  // A server bound to every interface is deliberately reachable over the
+  // network, so its Host cannot be constrained to loopback — but the Origin
+  // cross-check below still has to hold.
+  const bindAll = bind === "0.0.0.0" || bind === "::" || bind === "[::]"
+  if (!isLoopbackHost(host) && !bindAll) return false
+  const origin = req.headers.origin
+  if (typeof origin !== "string" || !origin) return true
+  try {
+    return new URL(origin).host === host
+  } catch {
+    return false
+  }
+}
+
+// Applied to every mutating /api/* route. Returns true when the caller may
+// proceed; otherwise it answers and the handler returns.
+function adminWriteGuard(req, res) {
+  if (req.method === "GET" || req.method === "HEAD") return true
+  if (!originAllowed(req)) {
+    json(res, 403, { error: "cross-origin admin request refused" })
+    return false
+  }
+  const ct = String(req.headers["content-type"] ?? "").toLowerCase()
+  if (!ct.includes("application/json")) {
+    json(res, 415, { error: "content-type must be application/json" })
     return false
   }
   return true
@@ -3338,6 +3468,7 @@ function adminAuth(req, res) {
 
 async function handleApiConfig(req, res) {
   if (!adminAuth(req, res)) return
+  if (!adminWriteGuard(req, res)) return
   if (req.method === "GET") return json(res, 200, { config: sanitize(config) })
   if (req.method === "POST") {
     // Stop following a pinned list and go back to tracking models.json, so this
@@ -3599,15 +3730,20 @@ async function router(req, res) {
   if (p.startsWith("/api/")) {
     if (p === "/api/config") return handleApiConfig(req, res)
     if (p === "/api/status" && req.method === "GET") return handleStatus(req, res)
-    if (p === "/api/test" && req.method === "POST") return handleTest(req, res)
     if (p === "/api/logs" && req.method === "GET") return handleLogs(req, res)
+    // Mutating admin routes go through the same origin/content-type gate, so a
+    // browser cannot forge a config change or a sync either.
+    if (p === "/api/test" && req.method === "POST") {
+      if (!adminAuth(req, res) || !adminWriteGuard(req, res)) return
+      return handleTest(req, res)
+    }
     if (p === "/api/sync" && req.method === "POST") {
-      if (!adminAuth(req, res)) return
+      if (!adminAuth(req, res) || !adminWriteGuard(req, res)) return
       syncModels().then((s) => json(res, 200, { ok: s.ok, ...s }))
       return
     }
     if (p === "/api/reset" && req.method === "POST") {
-      if (!adminAuth(req, res)) return
+      if (!adminAuth(req, res) || !adminWriteGuard(req, res)) return
       requestStats.total = 0
       requestStats.errors = 0
       requestStats.recent = []
@@ -3777,6 +3913,7 @@ export {
   transientUpstream,
   exhaustedFreeVerdict,
   maxBodyBytes,
+  readBody,
   toBool,
   identityFor,
   sessionFor,
