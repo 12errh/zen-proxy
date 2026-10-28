@@ -9,6 +9,8 @@ import { fileURLToPath } from "node:url"
 import { promisify } from "node:util"
 import { createHash } from "node:crypto"
 
+const isWindows = process.platform === "win32"
+
 // Must be set before importing the module (CONFIG_PATH is computed at load).
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "zen-proxy-test-"))
 process.env.ZEN_PROXY_CONFIG = path.join(tmpDir, "zen-proxy.json")
@@ -5598,7 +5600,10 @@ describe("relays obey client backpressure and disconnects (audit #19/#20)", () =
 })
 
 describe("the config file is written private (audit #23)", () => {
-  test("saveConfig creates it 0600", () => {
+  // The 0600 guarantee is a POSIX property. Windows has no mode bits to carry it:
+  // chmod only toggles the read-only flag and stat reports 0666 for any writable
+  // file, so privacy there rests on the profile directory's inherited ACLs.
+  test("saveConfig creates it 0600", { skip: isWindows && "POSIX mode bits do not exist on windows" }, () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zen-proxy-mode-"))
     const cfg = path.join(dir, "zen-proxy.json")
     const script = `import { saveConfig } from ${JSON.stringify(new URL("../zen-proxy.mjs", import.meta.url).href)}
