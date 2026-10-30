@@ -1001,6 +1001,50 @@ describe("responses API translation", () => {
     assert.equal(out.usage.total_tokens, 14)
   })
 
+  test("a declared tool named \"terminal\" is aliased, because the free tier 429s on the name", () => {
+    const body = {
+      tools: [
+        { type: "function", function: { name: "read_file" } },
+        { type: "function", function: { name: "terminal" } },
+        { type: "function", function: { name: "write_file" } },
+      ],
+      tool_choice: { type: "function", function: { name: "terminal" } },
+    }
+    const map = zp.aliasGatedTools(body)
+    const names = body.tools.map((t) => t.function.name)
+    assert.equal(names.includes("terminal"), false, "the gated name never reaches the wire")
+    assert.deepEqual(names, ["read_file", "run_command", "write_file"])
+    assert.equal(map.get("run_command"), "terminal")
+    assert.equal(body.tool_choice.function.name, "run_command", "tool_choice follows the alias")
+  })
+
+  test("every case and prefix variant of the gated name is aliased, other names untouched", () => {
+    const body = { tools: [{ type: "function", function: { name: "Terminal" } }, { type: "function", function: { name: "my_terminal_thing" } }, { type: "function", function: { name: "shell" } }] }
+    const map = zp.aliasGatedTools(body)
+    const names = body.tools.map((t) => t.function.name)
+    assert.equal(names.some((n) => /terminal/i.test(n)), false)
+    assert.equal(names[2], "shell")
+    assert.equal(map.size, 2)
+  })
+
+  test("an alias never collides with a tool the caller already declared", () => {
+    const body = { tools: [{ type: "function", function: { name: "run_command" } }, { type: "function", function: { name: "terminal" } }] }
+    const map = zp.aliasGatedTools(body)
+    assert.equal(body.tools[0].function.name, "run_command", "the caller's own tool keeps its name")
+    assert.equal(body.tools[1].function.name, "run_command_2")
+    assert.equal(map.get("run_command_2"), "terminal")
+  })
+
+  test("the alias is put back on the bytes written to the client", () => {
+    const written = []
+    const res = { write: (c) => written.push(c), end: (c) => c !== undefined && written.push(c) }
+    zp.restoreToolNames(res, new Map([["run_command", "terminal"]]))
+    res.write('data: {"choices":[{"delta":{"tool_calls":[{"function":{"name":"run_command"}}]}}]}\n\n')
+    res.end('{"choices":[{"message":{"tool_calls":[{"function":{"name":"run_command"}}]}}]}')
+    assert.equal(written.join("").includes("run_command"), false)
+    assert.equal(written.join("").match(/"name":"terminal"/g).length, 2)
+  })
+
   test("responsesRequest maps tools, sampling and token budget", () => {
     const p = zp.responsesRequest(
       {
