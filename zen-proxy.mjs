@@ -1545,12 +1545,15 @@ function json(res, status, data) {
 const GATED_TOOL_RE = /terminal/i
 function aliasGatedTools(body) {
   const map = new Map()
+  // A non-array "tools" ({} from a bad client) would make for-of throw and the
+  // request hang without an answer.
+  const tools = Array.isArray(body?.tools) ? body.tools : []
   const declared = new Set()
-  for (const t of body?.tools ?? []) {
+  for (const t of tools) {
     const f = t?.function ?? t
     if (typeof f?.name === "string") declared.add(f.name)
   }
-  for (const t of body?.tools ?? []) {
+  for (const t of tools) {
     const f = t?.function ?? t
     const name = f?.name
     if (typeof name !== "string" || !GATED_TOOL_RE.test(name)) continue
@@ -1560,9 +1563,22 @@ function aliasGatedTools(body) {
     f.name = alias
   }
   if (!map.size) return map
+  // The pin must follow its own tool: with two gated tools, forcing the first
+  // alias calls whichever tool was declared first, not the one pinned. Every
+  // shape of pin is retargeted — Chat {function:{name}}, Anthropic
+  // {type:"tool",name}, Responses {type:"function",name}.
+  const aliasFor = (name) => {
+    for (const [alias, original] of map) if (original === name) return alias
+    return null
+  }
   const choice = body.tool_choice
-  if (typeof choice === "string" && GATED_TOOL_RE.test(choice)) body.tool_choice = [...map.keys()][0]
-  else if (choice?.function?.name && GATED_TOOL_RE.test(choice.function.name)) choice.function.name = [...map.keys()][0]
+  if (typeof choice === "string" && GATED_TOOL_RE.test(choice)) {
+    body.tool_choice = aliasFor(choice) ?? choice
+  } else if (choice?.function?.name && GATED_TOOL_RE.test(choice.function.name)) {
+    choice.function.name = aliasFor(choice.function.name) ?? choice.function.name
+  } else if (choice?.name && GATED_TOOL_RE.test(choice.name)) {
+    choice.name = aliasFor(choice.name) ?? choice.name
+  }
   return map
 }
 
