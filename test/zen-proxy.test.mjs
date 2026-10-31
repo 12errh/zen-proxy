@@ -1001,6 +1001,97 @@ describe("responses API translation", () => {
     assert.equal(out.usage.total_tokens, 14)
   })
 
+  test("a declared tool named \"terminal\" is aliased, because the free tier 429s on the name", () => {
+    const body = {
+      tools: [
+        { type: "function", function: { name: "read_file" } },
+        { type: "function", function: { name: "terminal" } },
+        { type: "function", function: { name: "write_file" } },
+      ],
+      tool_choice: { type: "function", function: { name: "terminal" } },
+    }
+    const map = zp.aliasGatedTools(body)
+    const names = body.tools.map((t) => t.function.name)
+    assert.equal(names.includes("terminal"), false, "the gated name never reaches the wire")
+    assert.deepEqual(names, ["read_file", "run_command", "write_file"])
+    assert.equal(map.get("run_command"), "terminal")
+    assert.equal(body.tool_choice.function.name, "run_command", "tool_choice follows the alias")
+  })
+
+  test("every case and prefix variant of the gated name is aliased, other names untouched", () => {
+    const body = { tools: [{ type: "function", function: { name: "Terminal" } }, { type: "function", function: { name: "my_terminal_thing" } }, { type: "function", function: { name: "shell" } }] }
+    const map = zp.aliasGatedTools(body)
+    const names = body.tools.map((t) => t.function.name)
+    assert.equal(names.some((n) => /terminal/i.test(n)), false)
+    assert.equal(names[2], "shell")
+    assert.equal(map.size, 2)
+  })
+
+  test("an alias never collides with a tool the caller already declared", () => {
+    const body = { tools: [{ type: "function", function: { name: "run_command" } }, { type: "function", function: { name: "terminal" } }] }
+    const map = zp.aliasGatedTools(body)
+    assert.equal(body.tools[0].function.name, "run_command", "the caller's own tool keeps its name")
+    assert.equal(body.tools[1].function.name, "run_command_2")
+    assert.equal(map.get("run_command_2"), "terminal")
+  })
+
+  test("the alias is put back on the bytes written to the client", () => {
+    const written = []
+    const res = { write: (c) => written.push(c), end: (c) => c !== undefined && written.push(c) }
+    zp.restoreToolNames(res, new Map([["run_command", "terminal"]]))
+    res.write('data: {"choices":[{"delta":{"tool_calls":[{"function":{"name":"run_command"}}]}}]}\n\n')
+    res.end('{"choices":[{"message":{"tool_calls":[{"function":{"name":"run_command"}}]}}]}')
+    assert.equal(written.join("").includes("run_command"), false)
+    assert.equal(written.join("").match(/"name":"terminal"/g).length, 2)
+  })
+
+  test("a forced pin follows its own tool's alias, not the first one declared", () => {
+    const body = {
+      tools: [
+        { type: "function", function: { name: "terminal" } },
+        { type: "function", function: { name: "My_Terminal_Caller" } },
+      ],
+      tool_choice: { type: "function", function: { name: "My_Terminal_Caller" } },
+    }
+    const map = zp.aliasGatedTools(body)
+    assert.equal(body.tool_choice.function.name, "run_command_2", "pinned by name, so the second alias")
+    assert.equal(map.get("run_command_2"), "My_Terminal_Caller", "the reply must get the caller's name back")
+    assert.equal(body.tool_choice.function.name, body.tools[1].function.name, "pin and tool must end up the same alias")
+  })
+
+  test("every flat tool_choice shape follows its own tool", () => {
+    const anthropic = {
+      tools: [{ name: "terminal", input_schema: { type: "object", properties: {} } }],
+      tool_choice: { type: "tool", name: "terminal" },
+    }
+    zp.aliasGatedTools(anthropic)
+    assert.equal(anthropic.tool_choice.name, "run_command", "Anthropic's flat pin")
+
+    const responses = {
+      tools: [{ type: "function", name: "terminal", parameters: { type: "object", properties: {} } }],
+      tool_choice: { type: "function", name: "terminal" },
+    }
+    zp.aliasGatedTools(responses)
+    assert.equal(responses.tool_choice.name, "run_command", "Responses' flat pin")
+  })
+
+  test("a pin whose tool is not declared stays untouched", () => {
+    const body = {
+      tools: [{ type: "function", function: { name: "read_file" } }],
+      tool_choice: { type: "function", function: { name: "terminal" } },
+    }
+    const map = zp.aliasGatedTools(body)
+    assert.equal(map.size, 0)
+    assert.equal(body.tool_choice.function.name, "terminal", "no alias exists to retarget it")
+  })
+
+  test("a non-array tools does not throw, and a forced pin survives it", () => {
+    const body = { tools: "nope", tool_choice: { type: "function", function: { name: "terminal" } } }
+    const map = zp.aliasGatedTools(body)
+    assert.equal(map.size, 0)
+    assert.equal(body.tool_choice.function.name, "terminal")
+  })
+
   test("responsesRequest maps tools, sampling and token budget", () => {
     const p = zp.responsesRequest(
       {
@@ -3691,6 +3782,45 @@ describe("pinned tool calls on the Anthropic route", () => {
     assert.ok(!res.body.includes("tool_use"), `a stray call reached the caller: ${res.body}`)
     assert.match(res.body, /"stop_reason":"end_turn"/)
   })
+
+  test("a forced pin on a gated tool moves with its alias, and the reply gets the caller's name back", async () => {
+    const m = "space-bunny-free"
+    pinCfg(m)
+    let sent = null
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          if (!carriesRead(sent)) return gated()
+          return callsSse([{ index: 0, name: "run_command", args: ['{"command": ', '"ls"}'] }])
+        },
+      ],
+    ])
+    const body = anthroBody(m, {
+      tools: [
+        {
+          name: "My_Terminal_Caller",
+          description: "run it",
+          input_schema: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
+        },
+      ],
+      tool_choice: { type: "tool", name: "My_Terminal_Caller" },
+      stream: true,
+    })
+    const req = mockReq({ url: "/v1/messages", _body: JSON.stringify(body) })
+    const res = mockRes()
+    await zp.handleMessages(req, res)
+    await res.done
+    assert.deepEqual(
+      sent.tool_choice,
+      { type: "function", function: { name: "run_command" } },
+      "the pin names the alias actually declared upstream",
+    )
+    assert.ok(sent.tools.some((t) => t.function.name === "run_command"), "the tool itself is aliased")
+    assert.match(res.body, /"name":"My_Terminal_Caller"/, "the caller sees its own name")
+    assert.ok(!res.body.includes("run_command"), `the alias leaked back: ${res.body}`)
+  })
 })
 
 describe("pinned replies on the OpenAI-shaped routes", () => {
@@ -3860,6 +3990,33 @@ describe("pinned replies on the OpenAI-shaped routes", () => {
     assert.ok(!res.body.includes("filePath"), `a stray responses-family call leaked: ${res.body}`)
     assert.ok(res.body.includes('"name":"set_title"') && res.body.includes('"id":"cs"'))
     assert.match(res.body, /"finish_reason":"tool_calls"/)
+  })
+
+  test("a pinned chat request that names a gated tool pins its alias", async () => {
+    const m = "space-bunny-free"
+    pinCfg(m)
+    let sent = null
+    globalThis.fetch = routeFetch([
+      [
+        "/chat/completions",
+        (u, opts) => {
+          sent = JSON.parse(opts.body)
+          return callsSse([{ index: 0, name: "run_command", args: ['{"command": ', '"ls"}'] }])
+        },
+      ],
+    ])
+    const body = pinnedBody(m, {
+      tools: [
+        { type: "function", function: { name: "terminal", description: "d", parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } } },
+      ],
+      tool_choice: { type: "function", function: { name: "terminal" } },
+    })
+    const req = mockReq({ _body: JSON.stringify(body) })
+    const res = mockRes()
+    await zp.handleChat(req, res)
+    const parsed = JSON.parse(res.body)
+    assert.deepEqual(sent.tool_choice, { type: "function", function: { name: "run_command" } }, "the pin names the declared alias")
+    assert.equal(parsed.choices[0].message.tool_calls[0].function.name, "terminal", "the reply restores the caller's name")
   })
 })
 

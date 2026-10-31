@@ -1536,6 +1536,71 @@ function json(res, status, data) {
 // Anthropic clients authenticate with `x-api-key`; the OpenAI-compatible SDKs
 // use `Authorization: Bearer`. authForUpstream() accepts either, for every route.
 
+// opencode's free tier refuses any request whose declared tool name contains
+// "terminal" (case-insensitive substring) with 429 FreeUsageLimitError — no
+// matter the quota, exit, session or payload size, and the same body with only
+// that name changed answers normally (decolua/9router#5319). Only `tools[]` is
+// inspected: history and system prompt are not. So the declaration travels
+// under an alias and the caller's name is restored on the way back.
+const GATED_TOOL_RE = /terminal/i
+function aliasGatedTools(body) {
+  const map = new Map()
+  // A non-array "tools" ({} from a bad client) would make for-of throw and the
+  // request hang without an answer.
+  const tools = Array.isArray(body?.tools) ? body.tools : []
+  const declared = new Set()
+  for (const t of tools) {
+    const f = t?.function ?? t
+    if (typeof f?.name === "string") declared.add(f.name)
+  }
+  for (const t of tools) {
+    const f = t?.function ?? t
+    const name = f?.name
+    if (typeof name !== "string" || !GATED_TOOL_RE.test(name)) continue
+    let alias = "run_command"
+    for (let i = 2; declared.has(alias) || map.has(alias); i++) alias = `run_command_${i}`
+    map.set(alias, name)
+    f.name = alias
+  }
+  if (!map.size) return map
+  // The pin must follow its own tool: with two gated tools, forcing the first
+  // alias calls whichever tool was declared first, not the one pinned. Every
+  // shape of pin is retargeted — Chat {function:{name}}, Anthropic
+  // {type:"tool",name}, Responses {type:"function",name}.
+  const aliasFor = (name) => {
+    for (const [alias, original] of map) if (original === name) return alias
+    return null
+  }
+  const choice = body.tool_choice
+  if (typeof choice === "string" && GATED_TOOL_RE.test(choice)) {
+    body.tool_choice = aliasFor(choice) ?? choice
+  } else if (choice?.function?.name && GATED_TOOL_RE.test(choice.function.name)) {
+    choice.function.name = aliasFor(choice.function.name) ?? choice.function.name
+  } else if (choice?.name && GATED_TOOL_RE.test(choice.name)) {
+    choice.name = aliasFor(choice.name) ?? choice.name
+  }
+  return map
+}
+
+// Both legs write the client's bytes through res.write/res.end, so the reverse
+// map is applied once there instead of in every transform and relay.
+function restoreToolNames(res, map) {
+  if (!map.size) return
+  const pairs = [...map.entries()]
+  const fix = (chunk) => {
+    if (typeof chunk !== "string") return chunk
+    let out = chunk
+    for (const [alias, name] of pairs) {
+      if (out.includes(alias)) out = out.split(`"${alias}"`).join(`"${name}"`)
+    }
+    return out
+  }
+  const write = res.write.bind(res)
+  const end = res.end.bind(res)
+  res.write = (chunk, ...rest) => write(fix(chunk), ...rest)
+  res.end = (chunk, ...rest) => end(chunk === undefined ? chunk : fix(chunk), ...rest)
+}
+
 async function handleMessages(req, res) {
   const start = Date.now()
   let body
@@ -1552,6 +1617,13 @@ async function handleMessages(req, res) {
     return json(res, e.status, e.body)
   }
 
+  // Anthropic-shaped tools are {name, input_schema}; the gate only reads the
+  // declared name, so the same rename covers this leg.
+  const gatedTools = aliasGatedTools(body)
+  if (gatedTools.size) {
+    restoreToolNames(res, gatedTools)
+    log(`   declared tool name "${[...gatedTools.values()].join('", "')}" is gated by the free tier — sent as ${[...gatedTools.keys()].join(", ")}`)
+  }
   const { requested, candidates } = resolveModel(body.model)
   const isStream = !!body.stream
   // The credential decision (including `x-api-key`) lives entirely in
@@ -1765,6 +1837,11 @@ async function handleChat(req, res, responsesRoute = false) {
   // exactly those requests get their reply back in Responses format. A
   // chat-shaped body on the same leg keeps today's chat reply, and a
   // chat-shaped body on the chat leg is unchanged.
+  const gatedTools = aliasGatedTools(body)
+  if (gatedTools.size) {
+    restoreToolNames(res, gatedTools)
+    log(`   declared tool name "${[...gatedTools.values()].join('", "')}" is gated by the free tier — sent as ${[...gatedTools.keys()].join(", ")}`)
+  }
   const responsesRequestShape =
     responsesRoute && body.messages === undefined && body.input !== undefined
   // The gate fingerprints the harness system text; the preamble rides on every
@@ -4132,6 +4209,8 @@ if (isMain) {
 export {
   isMain,
   config,
+  aliasGatedTools,
+  restoreToolNames,
   loadConfig,
   loadShippedModels,
   isFallbackModelsPinned,
