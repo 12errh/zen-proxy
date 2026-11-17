@@ -1,5 +1,5 @@
 {
-  "updatedAt": "2026-11-16T22:01:10.356Z",
+  "updatedAt": "2026-11-17T07:54:01.843Z",
   "upstream": "https://opencode.ai/inference/v1",
   "models": [
     "mimo-v2.6-flash-free",
@@ -13,7 +13,6 @@
     "iceman-free",
     "inkling-2-small-free",
     "longcat-2.5-free",
-    "minimax-m3.1-flash-free",
     "hy4-flash-free"
   ]
 }
