@@ -1,5 +1,5 @@
 {
-  "updatedAt": "2026-11-17T07:54:01.843Z",
+  "updatedAt": "2026-11-18T07:27:56.500Z",
   "upstream": "https://opencode.ai/inference/v1",
   "models": [
     "mimo-v2.6-flash-free",
@@ -7,7 +7,6 @@
     "nemotron-3.5-lightning-free",
     "deepseek-v4.1-flash-free",
     "nemotron-3.5-super-vl-free",
-    "glm-5.3-flash-free",
     "beam-free",
     "flint-40b-free",
     "iceman-free",
